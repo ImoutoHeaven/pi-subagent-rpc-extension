@@ -65,9 +65,19 @@ const childRequest = (said) =>
 		.filter(Boolean)
 		.map((line) => JSON.parse(line))
 		.find((body) => body.messages?.at(-1)?.role === "user" && JSON.stringify(body.messages.at(-1).content).includes(said));
+const text = (m) => (typeof m.content === "string" ? m.content : (m.content || []).map((p) => p.text || "").join(""));
 const idOf = (text) => text.match(/^\[\w+\] subagent ([0-9a-f]{6})/)?.[1];
 const LIVE = /^\[running\] subagent [0-9a-f]{6}(?: · \S+)? · turn \d+ · .+ · last event \d+s ago · \d+s$/m;
-const notifications = (from = 0) => events.slice(from).filter((e) => e.type === "message_end" && e.message?.customType === "subagent-result");
+// An idle parent gets a message through sendMessage (message_end); a busy one at a turn boundary (entry_appended).
+const asMessage = (e) =>
+	e.type === "message_end" && e.message?.role === "custom"
+		? e.message
+		: e.type === "entry_appended" && e.entry?.type === "custom_message"
+			? e.entry
+			: undefined;
+const subagentMessages = (from = 0) => events.slice(from).map(asMessage).filter((m) => m?.customType?.startsWith("subagent-"));
+const notifications = (from = 0) => subagentMessages(from).filter((m) => m.customType === "subagent-result");
+const waitMessage = (customType, from, ms) => waitEvent((e) => asMessage(e)?.customType === customType, from, ms).then(asMessage);
 
 let failed = 0;
 async function step(name, fn) {
@@ -127,8 +137,8 @@ await step("a result that outlives waitMs arrives once as a message that starts 
 	assert.match(r.text, LIVE);
 	const id = idOf(r.text);
 	const from = events.length;
-	const note = await waitEvent((e) => e.type === "message_end" && e.message?.customType === "subagent-result", from);
-	assert.match(note.message.content, new RegExp(`^\\[settled\\] subagent ${id}.*late$`, "s"));
+	const note = await waitMessage("subagent-result", from);
+	assert.match(note.content, new RegExp(`^\\[settled\\] subagent ${id}.*late$`, "s"));
 	await waitEvent((e) => e.type === "agent_settled", from);
 	assert.equal(notifications(from).length, 1);
 	assert.ok(childRequest("[settled]"), "notification did not reach the model");
@@ -146,16 +156,38 @@ async function until(predicate, ms = 60_000) {
 	for (const end = Date.now() + ms; !predicate(); await sleep(100)) if (Date.now() > end) throw new Error("timed out");
 }
 
-await step("a result reaches a busy parent right after its current tool calls", async () => {
+await step("results that reach a busy parent arrive together right after its current tool calls", async () => {
 	const from = events.length;
-	send({ type: "prompt", streamingBehavior: "followUp", message: `CALLS 12000 ${JSON.stringify({ action: "run", message: "SAY busy", waitMs: 0 })} || ${JSON.stringify({ action: "status" })}` });
-	const started = await waitEvent((e) => e.type === "tool_execution_end" && e.toolName === "subagent", from);
-	const id = idOf(started.result.content[0].text);
-	await waitEvent((e) => e.type === "agent_settled", from);
-	assert.equal(notifications(from).length, 1);
-	// Steered: the model got the result after its next tool result, not after a final answer.
-	const seen = childRequest(`[settled] subagent ${id}`).messages;
-	assert.equal(seen.at(-2).role, "tool");
+	const ids = [];
+	for (const n of [1, 2]) ids.push(idOf((await call({ action: "run", message: `SLOW 4000 SAY busy${n}`, waitMs: 0 })).text));
+	const mark = events.length;
+	send({ type: "prompt", streamingBehavior: "followUp", message: `CALLS 15000 ${JSON.stringify({ action: "run", message: "SLOW 1000 SAY busy3", waitMs: 0 })} || ${JSON.stringify({ action: "status" })}` });
+	const started = await waitEvent((e) => e.type === "tool_execution_end" && e.toolName === "subagent", mark);
+	ids.push(idOf(started.result.content[0].text));
+	await waitEvent((e) => e.type === "agent_settled", events.indexOf(started));
+	assert.equal(notifications(from).length, 3);
+	// All three in the first model request that has any of them, right after the status tool result.
+	const result = (n) => (m) => m.role === "user" && /^\[settled\] subagent [\s\S]*\n\nbusy\d$/.test(text(m)) && text(m).endsWith(`busy${n}`);
+	const seen = fs
+		.readFileSync(REQUESTS, "utf8")
+		.split("\n")
+		.filter(Boolean)
+		.map((line) => JSON.parse(line).messages ?? [])
+		.find((messages) => [1, 2, 3].some((n) => messages.some(result(n))));
+	assert.equal(seen.at(-4).role, "tool");
+	for (const n of [1, 2, 3]) assert.ok(seen.slice(-3).some(result(n)), `busy${n} is not in the same request`);
+});
+
+await step("a tool wait ends early when another subagent sends a message", async () => {
+	const hung = idOf((await call({ action: "run", message: "HANG", waitMs: 0 })).text);
+	const from = events.length;
+	await call({ action: "run", message: "SLOW 2000 REPORT ping", waitMs: 0 });
+	const started = Date.now();
+	const s = await call({ action: "status", id: hung, waitMs: 60_000 });
+	assert.ok(Date.now() - started < 30_000, "the wait was not cut short");
+	assert.match(s.text, /Returned early: subagent messages follow this result\./);
+	assert.ok(subagentMessages(from).some((m) => m.customType === "subagent-report" && /: ping$/.test(m.content)));
+	await call({ action: "abort", id: hung });
 });
 
 await step("a result queued in a turn stopped with Esc is kept without waking the parent", async () => {
@@ -170,8 +202,8 @@ await step("a result queued in a turn stopped with Esc is kept without waking th
 	send({ type: "abort" });
 	const settled = await waitEvent((e) => e.type === "agent_settled", events.indexOf(started));
 	assert.equal(settled.aborted, true);
-	const note = await waitEvent((e) => e.type === "message_end" && e.message?.customType === "subagent-result", from, 5000);
-	assert.match(note.message.content, new RegExp(`^\\[settled\\] subagent ${id}.*esc$`, "s"));
+	const note = await waitMessage("subagent-result", from, 5000);
+	assert.match(note.content, new RegExp(`^\\[settled\\] subagent ${id}.*esc$`, "s"));
 	await sleep(2000);
 	assert.equal(notifications(from).length, 1);
 	assert.ok(!events.slice(events.indexOf(settled)).some((e) => e.type === "agent_start"), "the parent was woken");
@@ -220,15 +252,17 @@ await step("a subagent's report reaches the parent while it works", async () => 
 	const from = events.length;
 	const r = await call({ action: "run", message: "REPORT root cause found", waitMs: 30_000 });
 	const id = idOf(r.text);
-	// The report is queued behind this tool result, so the final result follows it as a message.
-	assert.match(r.text, /^\[settled\].*sent to you as a subagent-result message\.$/s);
-	const messages = events.slice(from).filter((e) => e.type === "message_end" && e.message?.customType?.startsWith("subagent-"));
+	// The report ends the wait; the final result follows it as a message.
+	assert.doesNotMatch(r.text, /reported$/);
+	await waitMessage("subagent-result", from);
+	const messages = subagentMessages(from);
 	assert.deepEqual(
-		messages.map((e) => e.message.customType),
+		messages.map((m) => m.customType),
 		["subagent-report", "subagent-result"],
 	);
-	assert.equal(messages[0].message.content, `[report] subagent ${id}: root cause found`);
-	assert.match(messages[1].message.content, /reported$/);
+	assert.equal(messages[0].content, `[report] subagent ${id}: root cause found`);
+	assert.match(messages[1].content, /reported$/);
+	await waitEvent((e) => e.type === "agent_settled", events.length - 1);
 });
 
 await step("run warns when args remove the report tool", async () => {

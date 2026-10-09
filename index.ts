@@ -8,7 +8,7 @@ import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { StringDecoder } from "node:string_decoder";
 import { StringEnum } from "@earendil-works/pi-ai";
-import { type ExtensionAPI, type ExtensionContext, SessionManager } from "@earendil-works/pi-coding-agent";
+import { type BoundaryState, type ExtensionAPI, type ExtensionContext, SessionManager } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
 
 const CHILD_ENV = "PI_SUBAGENT_CHILD";
@@ -172,8 +172,13 @@ export default function (pi: ExtensionAPI) {
 	const agents = new Map<string, Agent>();
 	let shuttingDown = false;
 	let parent: ExtensionContext | undefined;
-	/** Messages queued into a running parent turn, by nonce, until they are seen in its session. */
-	const queued = new Map<string, { customType: string; agentId: string; content: string; details: object }>();
+	/**
+	 * Messages for a busy parent, in arrival order. They join its session together at the next turn boundary,
+	 * outside Pi's steer queue, which hands over one message per model request and is cleared by Esc.
+	 */
+	let pending: { customType: string; agentId: string; content: string; details: object }[] = [];
+	/** Ends every subagent tool wait, so a new message does not sit behind a long wait. */
+	const waits = new Set<() => void>();
 
 	const isLive = (agent: Agent) => Boolean(agent.proc && !agent.proc.finished);
 
@@ -199,26 +204,14 @@ export default function (pi: ExtensionAPI) {
 		return [header(agent), agent.error, agent.notes.join("\n"), text].filter(Boolean).join("\n\n");
 	};
 
-	/** Nonces of this extension's messages already in the parent's session. */
-	const seenNonces = (ctx: ExtensionContext) =>
-		new Set(
-			ctx.sessionManager
-				.getBranch()
-				.flatMap((entry) => (entry.type === "custom_message" ? [(entry.details as { nonce?: string } | undefined)?.nonce] : [])),
-		);
-
 	/**
 	 * A tool result showing the final state delivers it; a result already sent as a message is not repeated.
-	 * Queued reports reach the parent after the tool result, so the final result then goes out as a message
+	 * Pending reports reach the parent after the tool result, so the final result then goes out as a message
 	 * behind them, keeping it the last word.
 	 */
 	const consume = (agent: Agent) => {
-		if (agent.status === "running") return report(agent);
-		const reports = [...queued].filter(([, note]) => note.customType === "subagent-report" && note.agentId === agent.id);
-		if (!agent.delivered && reports.length && parent) {
-			const seen = seenNonces(parent);
-			if (reports.some(([nonce]) => !seen.has(nonce))) deliver(agent);
-		}
+		if (agent.status === "running") return report(agent) + (pending.length ? "\nReturned early: subagent messages follow this result." : "");
+		if (pending.some((note) => note.customType === "subagent-report" && note.agentId === agent.id)) deliver(agent);
 		if (agent.notified) return `${header(agent)}\n\nIts result was sent to you as a subagent-result message.`;
 		agent.delivered = true;
 		return report(agent);
@@ -237,14 +230,36 @@ export default function (pi: ExtensionAPI) {
 		return `\n\n(Background: ${shown.join(", ")}${more}.)`;
 	};
 
-	// Pi steers a message into a running parent turn, or starts a turn when the parent is idle.
+	// An idle parent starts a turn with the message; a busy one gets it at its next turn boundary.
 	const notify = (customType: string, agent: Agent, content: string) => {
 		if (shuttingDown) return;
-		const nonce = randomBytes(4).toString("hex");
-		const tagged = { id: agent.id, status: agent.status, nonce };
-		if (parent && !parent.isIdle()) queued.set(nonce, { customType, agentId: agent.id, content, details: tagged });
-		pi.sendMessage({ customType, content, display: true, details: tagged }, { triggerTurn: true, deliverAs: "steer" });
+		const details = { id: agent.id, status: agent.status };
+		if (!parent || parent.isIdle()) {
+			pi.sendMessage({ customType, content, display: true, details }, { triggerTurn: true });
+			return;
+		}
+		pending.push({ customType, agentId: agent.id, content, details });
+		for (const wake of [...waits]) wake();
+		// Visible to the user at once, while the parent may still be inside a long tool call.
+		if (parent.hasUI) parent.ui.notify(`subagent ${agent.id}: ${customType === "subagent-report" ? "report" : "result"} waiting for the main agent`, "info");
 	};
+
+	const takePending = () => {
+		const taken = pending;
+		pending = [];
+		return taken;
+	};
+
+	// Every pending message joins the session in the same request. A model error keeps them for agent_settled,
+	// which wakes the parent; an abort (Esc) appends them without asking for another request.
+	// Returned entries replace the drafts earlier handlers proposed, so they are kept in front.
+	const atBoundary = (event: BoundaryState) => {
+		if (!pending.length || event.outcome === "error") return;
+		const entries = takePending().map(({ customType, content, details }) => ({ type: "custom_message" as const, customType, content, display: true, details }));
+		return { entries: [...event.entries, ...entries], continue: event.continue || event.outcome !== "aborted" };
+	};
+	pi.on("turn_end", atBoundary);
+	pi.on("agent_before_settle", atBoundary);
 
 	const deliver = (agent: Agent) => {
 		if (agent.delivered || shuttingDown) return;
@@ -253,17 +268,13 @@ export default function (pi: ExtensionAPI) {
 		notify("subagent-result", agent, report(agent));
 	};
 
-	// Clearing the parent's queue (Esc) drops queued notifications; append the lost ones,
-	// waking the parent only if it was not stopped on purpose.
-	pi.on("agent_settled", (event, ctx) => {
-		if (!queued.size) return;
-		const seen = seenNonces(ctx);
-		const lost = [...queued].filter(([nonce]) => !seen.has(nonce));
-		queued.clear();
-		// shortcut: an abort that leaves Pi's queue intact (RPC abort without clear_queue) can show a message twice.
-		for (const [, note] of lost) {
-			pi.sendMessage({ customType: note.customType, content: note.content, display: true, details: note.details }, { triggerTurn: !event.aborted, deliverAs: "steer" });
-		}
+	// Messages no boundary took, such as those that came during a model error; wake the parent unless it was stopped.
+	// One wake for the whole batch: each triggering message would start its own run, which Esc cannot cancel.
+	pi.on("agent_settled", (event) => {
+		const taken = takePending();
+		taken.forEach(({ customType, content, details }, i) => {
+			pi.sendMessage({ customType, content, display: true, details }, { triggerTurn: !event.aborted && i === taken.length - 1 });
+		});
 	});
 
 	/** Fail commands that will never get a response. */
@@ -501,18 +512,21 @@ export default function (pi: ExtensionAPI) {
 		void send(proc, { type: "prompt", message }, "run");
 	};
 
-	const waitFor = (agent: Agent, ms: number, signal?: AbortSignal) =>
+	/** Waits for the agent to finish; a tool wait (`forTool`) also ends on any message pending for the parent. */
+	const waitFor = (agent: Agent, ms: number, signal?: AbortSignal, forTool = false) =>
 		new Promise<void>((done) => {
-			if (agent.status !== "running" || ms <= 0 || signal?.aborted) return done();
+			if (agent.status !== "running" || ms <= 0 || signal?.aborted || (forTool && pending.length)) return done();
 			const end = () => {
 				clearTimeout(timer);
 				signal?.removeEventListener("abort", end);
 				agent.waiters.delete(end);
+				waits.delete(end);
 				done();
 			};
 			const timer = setTimeout(end, ms);
 			signal?.addEventListener("abort", end, { once: true });
 			agent.waiters.add(end);
+			if (forTool) waits.add(end);
 		});
 
 	const stop = async (agent: Agent, signal?: AbortSignal) => {
@@ -629,7 +643,7 @@ export default function (pi: ExtensionAPI) {
 			if (params.action === "run") {
 				const agent = create(params, ctx);
 				launch(agent, params.context === "fork" ? `${FORK_NOTE}\n\nTask:\n${params.message}` : (params.message as string));
-				await waitFor(agent, waitMs, signal);
+				await waitFor(agent, waitMs, signal, true);
 				const cut = removesReportTool(params.args ?? [])
 					? `\n\nNote: these args remove ${REPORT_TOOL}, so this subagent can reach you only through its final reply.`
 					: "";
@@ -639,7 +653,7 @@ export default function (pi: ExtensionAPI) {
 			if (!agent) throw new Error(`Unknown subagent id: ${params.id}. Known: ${[...agents.keys()].join(", ") || "none"}`);
 			const text = (body: string) => plain(body + footer(agent));
 			if (params.action === "status") {
-				await waitFor(agent, waitMs, signal);
+				await waitFor(agent, waitMs, signal, true);
 				return text(consume(agent));
 			}
 			if (params.action === "abort") {
@@ -664,7 +678,7 @@ export default function (pi: ExtensionAPI) {
 				const response = await within(sent, Math.max(0, deadline - Date.now()), signal);
 				if (response && !response.success) throw new Error(`follow_up rejected: ${response.error}`);
 			} else launch(agent, params.message);
-			await waitFor(agent, deadline - Date.now(), signal);
+			await waitFor(agent, deadline - Date.now(), signal, true);
 			return text(consume(agent));
 		},
 	});

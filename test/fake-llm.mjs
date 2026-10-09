@@ -36,7 +36,6 @@ async function reply(body) {
 	let said = text(last).trim().replace(/^[\s\S]*\n\nTask:\n/, "");
 	const calls = said.match(CALLS);
 	if (calls) return { call: calls[2] };
-	if (said.startsWith("REPORT ")) return { call: JSON.stringify({ message: said.slice(7) }), name: "report_to_main_agent" };
 	if (said.startsWith("CALL ")) return { call: said.slice(5).replace(/ HOLD$/, "") };
 	if (/^\[(settled|aborted|error)\]/.test(said)) return { content: "notified" };
 	const slow = said.match(/^SLOW (\d+) ([\s\S]*)$/);
@@ -45,6 +44,7 @@ async function reply(body) {
 		said = slow[2];
 	}
 	if (said === "HANG") return { hang: true };
+	if (said.startsWith("REPORT ")) return { call: JSON.stringify({ message: said.slice(7) }), name: "report_to_main_agent" };
 	if (said === "TOOLS?") return { content: `tools: ${(body.tools || []).map((t) => t.function.name).join(",")}` };
 	if (said.startsWith("SAY ")) return { content: said.slice(4) };
 	return { content: `unscripted: ${said.slice(0, 80)}` };

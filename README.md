@@ -36,7 +36,7 @@ To try it for one run: `pi -e /path/to/pi-subagent-rpc-extension`.
 [t3] Running the full test suite now.
 ```
 
-Each subagent's result reaches the parent once. A result that no tool call returned arrives as a `subagent-result` message: a running parent receives it after its current tool calls, and an idle parent starts a turn with it. A later tool call about that subagent shows only its status line. When the parent's turn is stopped with Esc, a result still waiting in that turn is added to the session without starting a turn, so the parent sees it at the next prompt. Replies over 16000 characters are truncated in the result; `final.md` in the subagent's directory holds the full text.
+Each subagent's result reaches the parent once. A result that no tool call returned arrives as a `subagent-result` message. An idle parent starts a turn with it. A running parent gets every message that arrived meanwhile together, after its current tool calls and before its next model request; the extension adds them to the session itself, so Pi's `steeringMode` does not space them out. A `run`, `status`, or `follow_up` wait ends early when such a message arrives, and the terminal shows a one-line notice while the parent is busy with another tool. A later tool call about that subagent shows only its status line. When the parent's turn is stopped with Esc, waiting messages are added to the session without starting a turn, so the parent sees them at the next prompt. Replies over 16000 characters are truncated in the result; `final.md` in the subagent's directory holds the full text.
 
 Results about one subagent end with the other subagents still running, up to three:
 
@@ -50,7 +50,7 @@ Results about one subagent end with the other subagents still running, up to thr
 
 ## Reports from subagents
 
-Each subagent has one tool of its own, `report_to_main_agent`, for short messages the parent needs before the subagent finishes, such as a finding that changes the plan or a blocker. A report arrives as a `subagent-report` message the same way a result does, and the latest ones appear in progress reports. The parent answers with `steer`. A report still waiting to reach the parent would arrive after a tool result, so a final result returned while one waits is sent as a message behind it instead, and the tool result shows the status line.
+Each subagent has one tool of its own, `report_to_main_agent`, for short messages the parent needs before the subagent finishes, such as a finding that changes the plan or a blocker. A report arrives as a `subagent-report` message the same way a result does, and the latest ones appear in progress reports. The parent answers with `steer`. A final result that a tool call would return while one of that subagent's reports still waits is sent as a message behind the report instead, so the result stays the last word.
 
 Args that keep the tool out of the subagent, such as `--no-extensions`, `--no-tools`, a `--tools` list without it, or a matching `--exclude-tools` pattern, add a note to the `run` result. Such a subagent reaches the parent only through its final reply.
 
