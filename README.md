@@ -22,7 +22,7 @@ To try it for one run: `pi -e /path/to/pi-subagent-rpc-extension`.
 | `follow_up` | `id`, `message`, `waitMs` | Sends the next request. A finished subagent restarts in its own session. |
 | `abort` | `id` | Stops the current run; a child that does not stop within 10 seconds is killed. |
 
-- `context`: `fresh` (default) starts with an empty conversation. `fork` copies the parent conversation's current branch.
+- `context`: `fresh` (default) starts with an empty conversation. `fork` copies the parent conversation's current branch and opens the task with a note telling the subagent that it is a subagent, not the main agent.
 - `model`: a Pi model pattern, `provider/id[:thinking]`. Default: the parent's current model and thinking level.
 - `cwd`: the subagent's working directory, relative to the parent's. Default: the parent's.
 - `args`: extra Pi command-line options, such as `--tools`, `--no-extensions`, `-e`, `--no-mcp`, or `--thinking`. The extension sets the mode, session, and model flags itself and rejects them here.
@@ -36,7 +36,7 @@ To try it for one run: `pi -e /path/to/pi-subagent-rpc-extension`.
 [t3] Running the full test suite now.
 ```
 
-Each subagent's result reaches the parent once. A result that no tool call returned arrives as a `subagent-result` message, which starts a parent turn or follows the current one. Replies over 16000 characters are truncated in the result; `final.md` in the subagent's directory holds the full text.
+Each subagent's result reaches the parent once. A result that no tool call returned arrives as a `subagent-result` message: a running parent receives it after its current tool calls, and an idle parent starts a turn with it. When the parent's turn is stopped with Esc, a result still waiting in that turn is added to the session without starting a turn, so the parent sees it at the next prompt. Replies over 16000 characters are truncated in the result; `final.md` in the subagent's directory holds the full text.
 
 A report with no active tool and an old `last event` points to a stalled subagent. Abort it and run a new one.
 

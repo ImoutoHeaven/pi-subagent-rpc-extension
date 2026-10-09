@@ -102,7 +102,9 @@ await step("children run the default model and do not get the subagent tool", as
 await step("fork gives the child this conversation; fresh does not", async () => {
 	const r = await call({ action: "run", context: "fork", message: "SAY forked" });
 	assert.match(r.text, /^\[settled\].*\n\nforked$/s);
-	const forked = childRequest("SAY forked").messages;
+	// The forked child is told what it is, ahead of its task.
+	const forked = childRequest("You are a subagent").messages;
+	assert.match(JSON.stringify(forked.at(-1).content), /Task:\\nSAY forked/);
 	assert.ok(forked.some((m) => m.tool_calls?.some((c) => c.function.name === "subagent")), "fork lacks the parent's tool calls");
 	assert.ok(!childRequest("SAY hello").messages.some((m) => m.tool_calls), "fresh child saw parent history");
 });
@@ -128,6 +130,45 @@ await step("a result that outlives waitMs arrives once as a message that starts 
 	await waitEvent((e) => e.type === "agent_settled", from);
 	assert.equal(notifications(from).length, 1);
 	assert.ok(childRequest("[settled]"), "notification did not reach the model");
+});
+
+const send = (record) => parent.stdin.write(`${JSON.stringify(record)}\n`);
+const sleep = (ms) => new Promise((done) => setTimeout(done, ms));
+const finalFile = (id) =>
+	fs.readdirSync(join(WORK_DIR, "sessions"), { recursive: true }).some((p) => String(p).replaceAll("\\", "/").endsWith(`subagents/${id}/final.md`));
+async function until(predicate, ms = 60_000) {
+	for (const end = Date.now() + ms; !predicate(); await sleep(100)) if (Date.now() > end) throw new Error("timed out");
+}
+
+await step("a result reaches a busy parent right after its current tool calls", async () => {
+	const from = events.length;
+	send({ type: "prompt", streamingBehavior: "followUp", message: `CALLS 12000 ${JSON.stringify({ action: "run", message: "SAY busy", waitMs: 0 })} || ${JSON.stringify({ action: "status" })}` });
+	const started = await waitEvent((e) => e.type === "tool_execution_end" && e.toolName === "subagent", from);
+	const id = idOf(started.result.content[0].text);
+	await waitEvent((e) => e.type === "agent_settled", from);
+	assert.equal(notifications(from).length, 1);
+	// Steered: the model got the result after its next tool result, not after a final answer.
+	const seen = childRequest(`[settled] subagent ${id}`).messages;
+	assert.equal(seen.at(-2).role, "tool");
+});
+
+await step("a result queued in a turn stopped with Esc is kept without waking the parent", async () => {
+	const from = events.length;
+	send({ type: "prompt", streamingBehavior: "followUp", message: `CALL ${JSON.stringify({ action: "run", message: "SAY esc", waitMs: 0 })} HOLD` });
+	const started = await waitEvent((e) => e.type === "tool_execution_end" && e.toolName === "subagent", from);
+	const id = idOf(started.result.content[0].text);
+	await until(() => finalFile(id));
+	await sleep(300);
+	// What interactive Esc does.
+	send({ type: "clear_queue" });
+	send({ type: "abort" });
+	const settled = await waitEvent((e) => e.type === "agent_settled", events.indexOf(started));
+	assert.equal(settled.aborted, true);
+	const note = await waitEvent((e) => e.type === "message_end" && e.message?.customType === "subagent-result", from, 5000);
+	assert.match(note.message.content, new RegExp(`^\\[settled\\] subagent ${id}.*esc$`, "s"));
+	await sleep(2000);
+	assert.equal(notifications(from).length, 1);
+	assert.ok(!events.slice(events.indexOf(settled)).some((e) => e.type === "agent_start"), "the parent was woken");
 });
 
 await step("a result returned by a call is not delivered again", async () => {

@@ -5,6 +5,8 @@
 set -euo pipefail
 root="$(cd "$(dirname "$0")/.." && (pwd -W 2>/dev/null || pwd))"
 tmp="$(cd "$(mktemp -d)" && (pwd -W 2>/dev/null || pwd))"
+# Run from inside a subagent, the inherited marker would keep the test's parent from registering the tool.
+unset PI_SUBAGENT_CHILD
 export PI_CODING_AGENT_DIR="$tmp/agent" WORK_DIR="$tmp/work" REQUESTS_LOG="$tmp/requests.jsonl" PI_OFFLINE=1 PI_SKIP_VERSION_CHECK=1
 mkdir -p "$PI_CODING_AGENT_DIR" "$WORK_DIR/project"
 # Loaded from settings, as an installed package is, so children load it too and must stay inert.

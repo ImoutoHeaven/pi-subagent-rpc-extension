@@ -1,7 +1,11 @@
 // Scripted OpenAI-compatible endpoint for the end-to-end test; logs every request body.
 // The last message decides the reply:
-//   tool result                      → "ack" (parent turn after a subagent call)
-//   "CALL <json>"                    → a `subagent` tool call with those arguments
+//   tool result                      → "ack" (parent turn after a subagent call), except:
+//                                      after "CALL <json> HOLD" → never answer;
+//                                      first result after "CALLS <ms> <a> || <b>" → wait, then call <b>
+//   "CALL <json>[ HOLD]"              → a `subagent` tool call with those arguments
+//   "CALLS <ms> <a> || <b>"           → a `subagent` call with <a>
+//   "<fork note>\n\nTask:\n<rest>"     → handle <rest>
 //   "[settled|aborted|error] ..."    → "notified" (a delivered subagent result)
 //   "SLOW <ms> <rest>"               → wait, then handle <rest>
 //   "HANG"                           → never answer
@@ -13,12 +17,24 @@ import http from "node:http";
 const [log, port = "8787"] = process.argv.slice(2);
 const text = (m) => (typeof m.content === "string" ? m.content : (m.content || []).map((p) => p.text || "").join(""));
 const sleep = (ms) => new Promise((done) => setTimeout(done, ms));
+const CALLS = /^CALLS (\d+) (\{.*?\}) \|\| (\{.*\})$/s;
 
 async function reply(body) {
 	const last = body.messages.at(-1);
-	if (last.role === "tool") return { content: "ack" };
-	let said = text(last).trim();
-	if (said.startsWith("CALL ")) return { call: said.slice(5) };
+	if (last.role === "tool") {
+		const start = body.messages.findLastIndex((m) => m.role === "user" && text(m).startsWith("CALL"));
+		const call = text(body.messages[start]);
+		const calls = call.match(CALLS);
+		if (calls && body.messages.slice(start).filter((m) => m.role === "tool").length === 1) {
+			await sleep(Number(calls[1]));
+			return { call: calls[3] };
+		}
+		return call.endsWith(" HOLD") ? { hang: true } : { content: "ack" };
+	}
+	let said = text(last).trim().replace(/^[\s\S]*\n\nTask:\n/, "");
+	const calls = said.match(CALLS);
+	if (calls) return { call: calls[2] };
+	if (said.startsWith("CALL ")) return { call: said.slice(5).replace(/ HOLD$/, "") };
 	if (/^\[(settled|aborted|error)\]/.test(said)) return { content: "notified" };
 	const slow = said.match(/^SLOW (\d+) ([\s\S]*)$/);
 	if (slow) {
