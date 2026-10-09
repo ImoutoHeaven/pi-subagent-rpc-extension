@@ -87,14 +87,16 @@ let first;
 await step("run returns the result when the child finishes within waitMs", async () => {
 	const r = await call({ action: "run", message: "SAY hello" });
 	assert.match(r.text, /^\[settled\] subagent [0-9a-f]{6} · fake\/fake-model · 1 turns/);
-	assert.match(r.text, /hello/);
+	assert.match(r.text, /hello$/);
+	assert.doesNotMatch(r.text, /Note:|\(Background:/);
 	first = idOf(r.text);
 });
 
-await step("children run the default model and do not get the subagent tool", async () => {
+await step("children run the default model and get the report tool instead of the subagent tool", async () => {
 	const r = await call({ action: "run", message: "TOOLS?" });
 	const tools = r.text.match(/^tools: (.*)$/m)?.[1].split(",");
 	assert.ok(tools?.includes("read"), r.text);
+	assert.ok(tools.includes("report_to_main_agent"), r.text);
 	assert.ok(!tools.includes("subagent"), r.text);
 	assert.equal(childRequest("TOOLS?").model, "fake-model");
 });
@@ -130,6 +132,10 @@ await step("a result that outlives waitMs arrives once as a message that starts 
 	await waitEvent((e) => e.type === "agent_settled", from);
 	assert.equal(notifications(from).length, 1);
 	assert.ok(childRequest("[settled]"), "notification did not reach the model");
+	// Asking afterwards does not repeat the result.
+	const again = await call({ action: "status", id });
+	assert.match(again.text, /^\[settled\].*sent to you as a subagent-result message\.$/s);
+	assert.doesNotMatch(again.text, /late/);
 });
 
 const send = (record) => parent.stdin.write(`${JSON.stringify(record)}\n`);
@@ -199,11 +205,40 @@ await step("follow_up on a running child returns within waitMs and runs after th
 	assert.match(done.text, /^\[settled\].*two$/s);
 });
 
-await step("abort stops a hung child", async () => {
+await step("abort stops a hung child; other results show it in their footer", async () => {
 	const r = await call({ action: "run", message: "HANG", waitMs: 500 });
 	assert.match(r.text, LIVE);
-	const a = await call({ action: "abort", id: idOf(r.text) });
+	const id = idOf(r.text);
+	const other = await call({ action: "run", message: "SAY side" });
+	assert.match(other.text, new RegExp(`side\\n\\n\\(Background: ${id} running \\d+s\\.\\)$`));
+	const a = await call({ action: "abort", id });
 	assert.match(a.text, /^\[aborted\]/);
+	assert.doesNotMatch(a.text, /Background/);
+});
+
+await step("a subagent's report reaches the parent while it works", async () => {
+	const from = events.length;
+	const r = await call({ action: "run", message: "REPORT root cause found", waitMs: 30_000 });
+	const id = idOf(r.text);
+	// The report is queued behind this tool result, so the final result follows it as a message.
+	assert.match(r.text, /^\[settled\].*sent to you as a subagent-result message\.$/s);
+	const messages = events.slice(from).filter((e) => e.type === "message_end" && e.message?.customType?.startsWith("subagent-"));
+	assert.deepEqual(
+		messages.map((e) => e.message.customType),
+		["subagent-report", "subagent-result"],
+	);
+	assert.equal(messages[0].message.content, `[report] subagent ${id}: root cause found`);
+	assert.match(messages[1].message.content, /reported$/);
+});
+
+await step("run warns when args remove the report tool", async () => {
+	const toolsOf = (text) => text.match(/^tools: (.*)$/m)?.[1].split(",");
+	const cut = await call({ action: "run", message: "TOOLS?", args: ["--tools", "report_to_main_agent", "--tools", "read"] });
+	assert.match(cut.text, /Note: these args remove report_to_main_agent/);
+	assert.deepEqual(toolsOf(cut.text), ["read"]);
+	const kept = await call({ action: "run", message: "TOOLS?", args: ["--no-tools", "--tools", "read,report_*"] });
+	assert.doesNotMatch(kept.text, /Note:/);
+	assert.ok(toolsOf(kept.text)?.includes("report_to_main_agent"), kept.text);
 });
 
 await step("a child that cannot start reports an error with Pi's output", async () => {

@@ -5,6 +5,7 @@
 //                                      first result after "CALLS <ms> <a> || <b>" → wait, then call <b>
 //   "CALL <json>[ HOLD]"              → a `subagent` tool call with those arguments
 //   "CALLS <ms> <a> || <b>"           → a `subagent` call with <a>
+//   "REPORT <text>"                  → a `report_to_main_agent` call, then "reported"
 //   "<fork note>\n\nTask:\n<rest>"     → handle <rest>
 //   "[settled|aborted|error] ..."    → "notified" (a delivered subagent result)
 //   "SLOW <ms> <rest>"               → wait, then handle <rest>
@@ -23,6 +24,7 @@ async function reply(body) {
 	const last = body.messages.at(-1);
 	if (last.role === "tool") {
 		const start = body.messages.findLastIndex((m) => m.role === "user" && text(m).startsWith("CALL"));
+		if (start === -1) return { content: "reported" };
 		const call = text(body.messages[start]);
 		const calls = call.match(CALLS);
 		if (calls && body.messages.slice(start).filter((m) => m.role === "tool").length === 1) {
@@ -34,6 +36,7 @@ async function reply(body) {
 	let said = text(last).trim().replace(/^[\s\S]*\n\nTask:\n/, "");
 	const calls = said.match(CALLS);
 	if (calls) return { call: calls[2] };
+	if (said.startsWith("REPORT ")) return { call: JSON.stringify({ message: said.slice(7) }), name: "report_to_main_agent" };
 	if (said.startsWith("CALL ")) return { call: said.slice(5).replace(/ HOLD$/, "") };
 	if (/^\[(settled|aborted|error)\]/.test(said)) return { content: "notified" };
 	const slow = said.match(/^SLOW (\d+) ([\s\S]*)$/);
@@ -64,7 +67,7 @@ http
 			const chunk = (choices, extra = {}) =>
 				res.write(`data: ${JSON.stringify({ id: "c", object: "chat.completion.chunk", created: 0, model: "fake-model", choices, ...extra })}\n\n`);
 			const delta = answer.call
-				? { role: "assistant", content: null, tool_calls: [{ index: 0, id: `call_${Date.now()}`, type: "function", function: { name: "subagent", arguments: answer.call } }] }
+				? { role: "assistant", content: null, tool_calls: [{ index: 0, id: `call_${Date.now()}`, type: "function", function: { name: answer.name ?? "subagent", arguments: answer.call } }] }
 				: { role: "assistant", content: answer.content };
 			chunk([{ index: 0, delta, finish_reason: null }]);
 			chunk([{ index: 0, delta: {}, finish_reason: answer.call ? "tool_calls" : "stop" }]);

@@ -17,6 +17,10 @@ const MAX_WAIT_MS = 240_000;
 const ABORT_WAIT_MS = 10_000;
 const MAX_RESULT_CHARS = 16_000;
 const NARRATION_LINES = 3;
+const MAX_AGENTS = 32;
+const FOOTER_AGENTS = 3;
+const STALE_MS = 60_000;
+const REPORT_TOOL = "report_to_main_agent";
 const NARRATION_CHARS = 300;
 const STDERR_CHARS = 2_000;
 // The extension owns the child's process mode, session, and model selection.
@@ -64,7 +68,8 @@ interface Agent {
 	lastEventAt: number;
 	turns: number;
 	phase: string;
-	tools: Map<string, { name: string; since: number }>;
+	/** Running tools; `report` holds the message of a report_to_main_agent call. */
+	tools: Map<string, { name: string; since: number; report?: string }>;
 	narration: string[];
 	/** Rejected steer and follow_up requests, which may arrive after the tool call returned. */
 	notes: string[];
@@ -72,7 +77,10 @@ interface Agent {
 	/** provider/id the child actually answered with; Pi matches --model fuzzily. */
 	model: string;
 	error: string | null;
+	/** The final result reached the parent: as a tool result, or as a sent message. */
 	delivered: boolean;
+	/** The final result went out as a message, so tool results show only its header. */
+	notified: boolean;
 	waiters: Set<() => void>;
 	proc?: Proc;
 }
@@ -122,15 +130,50 @@ function within<T>(promise: Promise<T>, ms: number, signal?: AbortSignal) {
 	});
 }
 
+/** Whether Pi options `args` keep report_to_main_agent from loading or being active in a child. */
+function removesReportTool(args: string[]) {
+	const values = (names: string[]) =>
+		args.flatMap((arg, i) => (names.includes(arg) ? [(args[i + 1] ?? "").split(",").map((entry) => entry.trim()).filter(Boolean)] : []));
+	const matches = (pattern: string) => new RegExp(`^${pattern.replace(/[.+?^${}()|[\]\\]/g, "\\$&").replaceAll("*", ".*")}$`).test(REPORT_TOOL);
+	const has = (...names: string[]) => args.some((arg) => names.includes(arg));
+	// --no-extensions still loads explicit -e paths, which may include this extension.
+	if (has("-ne", "--no-extensions") && !has("-e", "--extension")) return true;
+	// The last --exclude-tools and the last --tools win.
+	if (values(["-xt", "--exclude-tools"]).at(-1)?.some(matches)) return true;
+	const noTools = has("-nt", "--no-tools");
+	const tools = values(["-t", "--tools"]).at(-1);
+	if (!tools) return noTools;
+	if (tools.length && tools.every((entry) => /^[+-]/.test(entry))) {
+		// Pi activates extension tools after default-selection edits, so edits only matter over --no-tools,
+		// where the last one naming this tool decides.
+		if (!noTools) return false;
+		const edit = tools.findLast((entry) => entry.slice(1) === REPORT_TOOL);
+		return edit ? edit[0] === "-" : true;
+	}
+	return !tools.some(matches);
+}
+
 export default function (pi: ExtensionAPI) {
-	// Children load this extension too; registering nothing keeps delegation one level deep.
-	if (process.env[CHILD_ENV]) return;
+	if (process.env[CHILD_ENV]) {
+		// Inside a subagent: only the upward channel. No subagent tool keeps delegation one level deep.
+		pi.registerTool({
+			name: REPORT_TOOL,
+			label: "Report to main agent",
+			description:
+				"Send a short message to the main agent that started you, while you keep working. Use it only when the main agent needs to know something before you finish: a finding that changes its plans, a decision you made on its behalf, or a blocker. Do not use it for routine progress or as a log; your final reply already goes to the main agent. Keep it brief and precise.",
+			parameters: Type.Object({ message: Type.String({ description: "What the main agent needs to know." }) }),
+			async execute() {
+				return { content: [{ type: "text" as const, text: "sent" }], details: undefined };
+			},
+		});
+		return;
+	}
 
 	const agents = new Map<string, Agent>();
 	let shuttingDown = false;
 	let parent: ExtensionContext | undefined;
-	/** Notifications queued into a running parent turn, by nonce, until they are seen in its session. */
-	const queued = new Map<string, { agent: Agent; content: string; details: object }>();
+	/** Messages queued into a running parent turn, by nonce, until they are seen in its session. */
+	const queued = new Map<string, { customType: string; agentId: string; content: string; details: object }>();
 
 	const isLive = (agent: Agent) => Boolean(agent.proc && !agent.proc.finished);
 
@@ -156,41 +199,70 @@ export default function (pi: ExtensionAPI) {
 		return [header(agent), agent.error, agent.notes.join("\n"), text].filter(Boolean).join("\n\n");
 	};
 
-	/** A tool result showing the final state delivers it. */
+	/** Nonces of this extension's messages already in the parent's session. */
+	const seenNonces = (ctx: ExtensionContext) =>
+		new Set(
+			ctx.sessionManager
+				.getBranch()
+				.flatMap((entry) => (entry.type === "custom_message" ? [(entry.details as { nonce?: string } | undefined)?.nonce] : [])),
+		);
+
+	/**
+	 * A tool result showing the final state delivers it; a result already sent as a message is not repeated.
+	 * Queued reports reach the parent after the tool result, so the final result then goes out as a message
+	 * behind them, keeping it the last word.
+	 */
 	const consume = (agent: Agent) => {
-		const body = report(agent);
-		if (agent.status !== "running") {
-			agent.delivered = true;
-			for (const [nonce, note] of queued) if (note.agent === agent) queued.delete(nonce);
+		if (agent.status === "running") return report(agent);
+		const reports = [...queued].filter(([, note]) => note.customType === "subagent-report" && note.agentId === agent.id);
+		if (!agent.delivered && reports.length && parent) {
+			const seen = seenNonces(parent);
+			if (reports.some(([nonce]) => !seen.has(nonce))) deliver(agent);
 		}
-		return body;
+		if (agent.notified) return `${header(agent)}\n\nIts result was sent to you as a subagent-result message.`;
+		agent.delivered = true;
+		return report(agent);
+	};
+
+	/** Other running subagents, so a result also shows what is still in flight. */
+	const footer = (except?: Agent) => {
+		const now = Date.now();
+		const running = [...agents.values()].filter((agent) => agent !== except && agent.status === "running");
+		if (!running.length) return "";
+		const shown = running.slice(0, FOOTER_AGENTS).map((agent) => {
+			const quiet = now - agent.lastEventAt;
+			return `${agent.id} running ${duration(now - agent.startedAt)}${quiet > STALE_MS ? ` · no event ${duration(quiet)}` : ""}`;
+		});
+		const more = running.length > FOOTER_AGENTS ? `, +${running.length - FOOTER_AGENTS} more` : "";
+		return `\n\n(Background: ${shown.join(", ")}${more}.)`;
+	};
+
+	// Pi steers a message into a running parent turn, or starts a turn when the parent is idle.
+	const notify = (customType: string, agent: Agent, content: string) => {
+		if (shuttingDown) return;
+		const nonce = randomBytes(4).toString("hex");
+		const tagged = { id: agent.id, status: agent.status, nonce };
+		if (parent && !parent.isIdle()) queued.set(nonce, { customType, agentId: agent.id, content, details: tagged });
+		pi.sendMessage({ customType, content, display: true, details: tagged }, { triggerTurn: true, deliverAs: "steer" });
 	};
 
 	const deliver = (agent: Agent) => {
 		if (agent.delivered || shuttingDown) return;
 		agent.delivered = true;
-		const nonce = randomBytes(4).toString("hex");
-		const content = report(agent);
-		const details = { id: agent.id, status: agent.status, nonce };
-		// Pi steers it into a running parent turn, or starts a turn when the parent is idle.
-		if (parent && !parent.isIdle()) queued.set(nonce, { agent, content, details });
-		pi.sendMessage({ customType: "subagent-result", content, display: true, details }, { triggerTurn: true, deliverAs: "steer" });
+		agent.notified = true;
+		notify("subagent-result", agent, report(agent));
 	};
 
 	// Clearing the parent's queue (Esc) drops queued notifications; append the lost ones,
 	// waking the parent only if it was not stopped on purpose.
 	pi.on("agent_settled", (event, ctx) => {
 		if (!queued.size) return;
-		const seen = new Set(
-			ctx.sessionManager
-				.getBranch()
-				.flatMap((entry) => (entry.type === "custom_message" && entry.customType === "subagent-result" ? [(entry.details as { nonce?: string })?.nonce] : [])),
-		);
+		const seen = seenNonces(ctx);
 		const lost = [...queued].filter(([nonce]) => !seen.has(nonce));
 		queued.clear();
-		// shortcut: an abort that leaves Pi's queue intact (RPC abort without clear_queue) can show a result twice.
+		// shortcut: an abort that leaves Pi's queue intact (RPC abort without clear_queue) can show a message twice.
 		for (const [, note] of lost) {
-			pi.sendMessage({ customType: "subagent-result", content: note.content, display: true, details: note.details }, { triggerTurn: !event.aborted, deliverAs: "steer" });
+			pi.sendMessage({ customType: note.customType, content: note.content, display: true, details: note.details }, { triggerTurn: !event.aborted, deliverAs: "steer" });
 		}
 	});
 
@@ -297,13 +369,21 @@ export default function (pi: ExtensionAPI) {
 				else if (kind === "toolcall_start") agent.phase = "preparing tool call";
 				return;
 			}
-			case "tool_execution_start":
-				agent.tools.set(event.toolCallId, { name: event.toolName, since: Date.now() });
+			case "tool_execution_start": {
+				const message = event.toolName === REPORT_TOOL && typeof event.args?.message === "string" ? event.args.message.trim() : "";
+				agent.tools.set(event.toolCallId, { name: event.toolName, since: Date.now(), ...(message ? { report: message } : {}) });
 				return;
-			case "tool_execution_end":
+			}
+			case "tool_execution_end": {
+				const message = agent.tools.get(event.toolCallId)?.report;
 				agent.tools.delete(event.toolCallId);
+				if (message && !event.isError) {
+					agent.narration = [...agent.narration, `[t${agent.turns + 1}] report: ${oneLine(message, NARRATION_CHARS)}`].slice(-NARRATION_LINES);
+					notify("subagent-report", agent, `[report] subagent ${agent.id}: ${message}`);
+				}
 				agent.phase = "finishing turn";
 				return;
+			}
 			case "message_end": {
 				if (event.message?.role !== "assistant") return;
 				if (event.message.provider && event.message.model) agent.model = `${event.message.provider}/${event.message.model}`;
@@ -352,6 +432,7 @@ export default function (pi: ExtensionAPI) {
 			model: "",
 			error: null,
 			delivered: false,
+			notified: false,
 		});
 		agent.tools.clear();
 		// The parent's own runtime and CLI entry, so the child runs the same Pi build.
@@ -496,9 +577,13 @@ export default function (pi: ExtensionAPI) {
 			model: "",
 			error: null,
 			delivered: false,
+			notified: false,
 			waiters: new Set(),
 		};
 		agents.set(id, agent);
+		// Forget the earliest-finished subagents whose processes are gone; running ones stay.
+		const done = [...agents.values()].filter((other) => other.status !== "running" && !other.proc).sort((a, b) => a.endedAt - b.endedAt);
+		for (const other of done.slice(0, Math.max(0, agents.size - MAX_AGENTS))) agents.delete(other.id);
 		return agent;
 	};
 
@@ -529,26 +614,30 @@ export default function (pi: ExtensionAPI) {
 		description: [
 			"Delegate work to a Pi subagent: a separate Pi process with its own session that loads tools, extensions, skills, and MCP servers like a normal Pi launch.",
 			"run starts one on message. status reports progress or the result (without id: lists subagents). steer redirects a running subagent after its current tool calls. follow_up sends the next request, restarting a finished subagent in its session. abort stops it.",
-			`run, status, and follow_up wait up to waitMs (default ${DEFAULT_WAIT_MS}, max ${MAX_WAIT_MS}) and return the result if it finishes in time, otherwise its progress while it keeps running. A finished result you have not seen arrives later as a message; do not poll for it.`,
+			`run, status, and follow_up wait up to waitMs (default ${DEFAULT_WAIT_MS}, max ${MAX_WAIT_MS}) and return the result if it finishes in time, otherwise its progress while it keeps running. A finished result you have not seen arrives later as a message; do not poll for it. A subagent can also send you short [report] messages while it works; they arrive the same way.`,
 			"args are Pi command-line options: read docs/cli.md in the Pi documentation listed in your system prompt, or run `pi --help`. Session, mode, and model flags are set by this tool.",
 			"Progress showing no active tool and an old last event suggests a stall: abort, then run again. Subagents cannot delegate further and end with this session.",
 		].join("\n\n"),
 		parameters,
 		async execute(_toolCallId, params: Params, signal, _onUpdate, ctx) {
 			parent = ctx;
-			const text = (body: string) => ({ content: [{ type: "text" as const, text: body }], details: undefined });
+			const plain = (body: string) => ({ content: [{ type: "text" as const, text: body }], details: undefined });
 			const waitMs = Math.min(params.waitMs ?? DEFAULT_WAIT_MS, MAX_WAIT_MS);
+			if (params.action === "status" && !params.id) {
+				return plain(agents.size ? [...agents.values()].map(header).join("\n") : "No subagents.");
+			}
 			if (params.action === "run") {
 				const agent = create(params, ctx);
 				launch(agent, params.context === "fork" ? `${FORK_NOTE}\n\nTask:\n${params.message}` : (params.message as string));
 				await waitFor(agent, waitMs, signal);
-				return text(consume(agent));
-			}
-			if (params.action === "status" && !params.id) {
-				return text(agents.size ? [...agents.values()].map(header).join("\n") : "No subagents.");
+				const cut = removesReportTool(params.args ?? [])
+					? `\n\nNote: these args remove ${REPORT_TOOL}, so this subagent can reach you only through its final reply.`
+					: "";
+				return plain(consume(agent) + cut + footer(agent));
 			}
 			const agent = agents.get(params.id ?? "");
 			if (!agent) throw new Error(`Unknown subagent id: ${params.id}. Known: ${[...agents.keys()].join(", ") || "none"}`);
+			const text = (body: string) => plain(body + footer(agent));
 			if (params.action === "status") {
 				await waitFor(agent, waitMs, signal);
 				return text(consume(agent));
@@ -568,7 +657,8 @@ export default function (pi: ExtensionAPI) {
 			}
 			const deadline = Date.now() + waitMs;
 			// Bounded: finish() kills a child that has not exited within seconds.
-			if (!isLive(agent)) await agent.proc?.exited;
+			// Only await a real exit: a needless yield would let a parallel run prune this subagent before relaunch.
+			if (!isLive(agent) && agent.proc) await agent.proc.exited;
 			if (isLive(agent)) {
 				const sent = send(agent.proc as Proc, { type: "prompt", message: params.message, streamingBehavior: "followUp" }, "follow_up");
 				const response = await within(sent, Math.max(0, deadline - Date.now()), signal);
