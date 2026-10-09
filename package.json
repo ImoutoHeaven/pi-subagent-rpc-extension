@@ -1,0 +1,20 @@
+{
+	"name": "pi-subagent-rpc-extension",
+	"version": "0.1.0",
+	"description": "Pi subagents as RPC child processes bound to the parent session",
+	"type": "module",
+	"license": "MIT",
+	"keywords": ["pi-package"],
+	"files": ["index.ts", "README.md", "LICENSE"],
+	"pi": {
+		"extensions": ["./index.ts"]
+	},
+	"peerDependencies": {
+		"@earendil-works/pi-ai": "*",
+		"@earendil-works/pi-coding-agent": "*",
+		"typebox": "*"
+	},
+	"scripts": {
+		"test": "bash test/docker.sh"
+	}
+}
