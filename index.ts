@@ -231,8 +231,10 @@ export default function (pi: ExtensionAPI) {
 	};
 
 	// An idle parent starts a turn with the message; a busy one gets it at its next turn boundary.
-	const notify = (customType: string, agent: Agent, content: string) => {
+	const notify = (customType: string, agent: Agent, text: string) => {
 		if (shuttingDown) return;
+		// Providers join consecutive messages into one text; the blank line keeps them apart.
+		const content = `${text}\n\n`;
 		const details = { id: agent.id, status: agent.status };
 		if (!parent || parent.isIdle()) {
 			pi.sendMessage({ customType, content, display: true, details }, { triggerTurn: true });

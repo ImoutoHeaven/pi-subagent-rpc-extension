@@ -65,7 +65,8 @@ const childRequest = (said) =>
 		.filter(Boolean)
 		.map((line) => JSON.parse(line))
 		.find((body) => body.messages?.at(-1)?.role === "user" && JSON.stringify(body.messages.at(-1).content).includes(said));
-const text = (m) => (typeof m.content === "string" ? m.content : (m.content || []).map((p) => p.text || "").join(""));
+const rawText = (m) => (typeof m.content === "string" ? m.content : (m.content || []).map((p) => p.text || "").join(""));
+const text = (m) => rawText(m).trimEnd();
 const idOf = (text) => text.match(/^\[\w+\] subagent ([0-9a-f]{6})/)?.[1];
 const LIVE = /^\[running\] subagent [0-9a-f]{6}(?: · \S+)? · turn \d+ · .+ · last event \d+s ago · \d+s$/m;
 // An idle parent gets a message through sendMessage (message_end); a busy one at a turn boundary (entry_appended).
@@ -75,9 +76,16 @@ const asMessage = (e) =>
 		: e.type === "entry_appended" && e.entry?.type === "custom_message"
 			? e.entry
 			: undefined;
-const subagentMessages = (from = 0) => events.slice(from).map(asMessage).filter((m) => m?.customType?.startsWith("subagent-"));
+// Messages end with a blank line that separates them; assertions compare the text before it.
+const trimmed = (m) => m && { ...m, content: m.content.trimEnd() };
+const subagentMessages = (from = 0) =>
+	events
+		.slice(from)
+		.map(asMessage)
+		.filter((m) => m?.customType?.startsWith("subagent-"))
+		.map(trimmed);
 const notifications = (from = 0) => subagentMessages(from).filter((m) => m.customType === "subagent-result");
-const waitMessage = (customType, from, ms) => waitEvent((e) => asMessage(e)?.customType === customType, from, ms).then(asMessage);
+const waitMessage = (customType, from, ms) => waitEvent((e) => asMessage(e)?.customType === customType, from, ms).then((e) => trimmed(asMessage(e)));
 
 let failed = 0;
 async function step(name, fn) {
@@ -175,6 +183,8 @@ await step("results that reach a busy parent arrive together right after its cur
 		.map((line) => JSON.parse(line).messages ?? [])
 		.find((messages) => [1, 2, 3].some((n) => messages.some(result(n))));
 	assert.equal(seen.at(-4).role, "tool");
+	// Each ends with a blank line, so the joined messages stay apart.
+	for (const m of seen.slice(-3)) assert.ok(rawText(m).endsWith("\n\n"), JSON.stringify(rawText(m)));
 	for (const n of [1, 2, 3]) assert.ok(seen.slice(-3).some(result(n)), `busy${n} is not in the same request`);
 });
 
