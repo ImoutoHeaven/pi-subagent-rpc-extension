@@ -1,11 +1,15 @@
 // Scripted OpenAI-compatible endpoint for the end-to-end test; logs every request body.
-// The last message decides the reply:
+// Team messages (user messages starting with "[team") are skipped; the last other message decides the reply:
+//   assistant                        → "notified" (only team messages arrived)
 //   tool result                      → "ack" (parent turn after a subagent call), except:
 //                                      after "CALL <json> HOLD" → never answer;
-//                                      first result after "CALLS <ms> <a> || <b>" → wait, then call <b>
+//                                      first result after "CALLS <ms> <a> || <b>" → wait, then call <b>;
+//                                      after "TEAM <json>" → "team: <tool result>";
+//                                      after "REPORT <text>" → "reported"
 //   "CALL <json>[ HOLD]"              → a `subagent` tool call with those arguments
 //   "CALLS <ms> <a> || <b>"           → a `subagent` call with <a>
-//   "REPORT <text>"                  → a `report_to_main_agent` call, then "reported"
+//   "TEAM <json>"                     → a `team` tool call with those arguments
+//   "REPORT <text>"                  → a `report_to_main_agent` call
 //   "<fork note>\n\nTask:\n<rest>"     → handle <rest>
 //   "[settled|aborted|error] ..."    → "notified" (a delivered subagent result)
 //   "SLOW <ms> <rest>"               → wait, then handle <rest>
@@ -17,23 +21,29 @@ import http from "node:http";
 
 const [log, port = "8787"] = process.argv.slice(2);
 const text = (m) => (typeof m.content === "string" ? m.content : (m.content || []).map((p) => p.text || "").join(""));
+const script = (m) => text(m).trim().replace(/^[\s\S]*\n\nTask:\n/, "");
+/** The scripted call a prompt makes, without its delay. */
+const callOf = (m) => script(m).replace(/^SLOW \d+ /, "");
 const sleep = (ms) => new Promise((done) => setTimeout(done, ms));
 const CALLS = /^CALLS (\d+) (\{.*?\}) \|\| (\{.*\})$/s;
 
 async function reply(body) {
-	const last = body.messages.at(-1);
+	const messages = body.messages.filter((m) => !(m.role === "user" && text(m).startsWith("[team")));
+	const last = messages.at(-1);
+	if (last.role === "assistant") return { content: "notified" };
 	if (last.role === "tool") {
-		const start = body.messages.findLastIndex((m) => m.role === "user" && text(m).startsWith("CALL"));
-		if (start === -1) return { content: "reported" };
-		const call = text(body.messages[start]);
+		const start = messages.findLastIndex((m) => m.role === "user" && /^(CALLS?|TEAM|REPORT) /.test(callOf(m)));
+		const call = start === -1 ? "" : callOf(messages[start]);
+		if (call.startsWith("TEAM ")) return { content: `team: ${text(last)}` };
+		if (!call.startsWith("CALL")) return { content: "reported" };
 		const calls = call.match(CALLS);
-		if (calls && body.messages.slice(start).filter((m) => m.role === "tool").length === 1) {
+		if (calls && messages.slice(start).filter((m) => m.role === "tool").length === 1) {
 			await sleep(Number(calls[1]));
 			return { call: calls[3] };
 		}
 		return call.endsWith(" HOLD") ? { hang: true } : { content: "ack" };
 	}
-	let said = text(last).trim().replace(/^[\s\S]*\n\nTask:\n/, "");
+	let said = script(last);
 	const calls = said.match(CALLS);
 	if (calls) return { call: calls[2] };
 	if (said.startsWith("CALL ")) return { call: said.slice(5).replace(/ HOLD$/, "") };
@@ -44,6 +54,7 @@ async function reply(body) {
 		said = slow[2];
 	}
 	if (said === "HANG") return { hang: true };
+	if (said.startsWith("TEAM ")) return { call: said.slice(5), name: "team" };
 	if (said.startsWith("REPORT ")) return { call: JSON.stringify({ message: said.slice(7) }), name: "report_to_main_agent" };
 	if (said === "TOOLS?") return { content: `tools: ${(body.tools || []).map((t) => t.function.name).join(",")}` };
 	if (said.startsWith("SAY ")) return { content: said.slice(4) };

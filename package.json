@@ -5,9 +5,9 @@
 	"type": "module",
 	"license": "MIT",
 	"keywords": ["pi-package"],
-	"files": ["index.ts", "README.md", "LICENSE"],
+	"files": ["src", "README.md", "LICENSE"],
 	"pi": {
-		"extensions": ["./index.ts"]
+		"extensions": ["./src/index.ts"]
 	},
 	"peerDependencies": {
 		"@earendil-works/pi-ai": "*",

@@ -5,7 +5,7 @@ npm i -g --no-audit --no-fund "@earendil-works/pi-coding-agent@$PI_VERSION" > /t
 echo "pi $(pi --version)"
 
 mkdir -p /tmp/types
-cp /ext/index.ts /ext/tsconfig.json /tmp/types/
+cp -r /ext/src /ext/tsconfig.json /tmp/types/
 (cd /tmp/types && npm i --no-save --no-audit --no-fund typescript@5 @types/node@24 "@earendil-works/pi-coding-agent@$PI_VERSION" > /tmp/npm-types.log 2>&1)
 (cd /tmp/types && npx tsc -p tsconfig.json) && echo "typecheck ok"
 
