@@ -2,8 +2,8 @@
  * Team state: the log, routing, history, the main agent's `team` tool, and answers to members' requests.
  * It has no path to a process: it only asks whether a member is running and hands messages for the main agent to the host.
  */
-import { appendFileSync, existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
-import { join } from "node:path";
+import { appendFileSync, existsSync, mkdirSync, readFileSync } from "node:fs";
+import { dirname, join } from "node:path";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import {
 	BODY_CHARS,
@@ -47,11 +47,6 @@ interface MessageRecord {
 	notify: string[];
 	body: string;
 }
-/** The log's first record: the team's id, which is the id of the session that ran /team. */
-interface TeamRecord {
-	t: "team";
-	id: string;
-}
 interface TopicRecord {
 	t: "topic";
 	at: number;
@@ -81,8 +76,9 @@ function render(message: MessageRecord, viewer: string) {
 }
 
 export function createTeam(pi: ExtensionAPI, host: TeamHost) {
-	/** The log path; set exactly when this session is in team mode. */
-	let log: string | undefined;
+	/** `<session base>/team.jsonl`, created by the first record written to it. */
+	let log = "";
+	/** The id of the session that owns the team. */
 	let teamId = "";
 	const members = new Map<string, MemberRecord>();
 	let messages: MessageRecord[] = [];
@@ -90,13 +86,11 @@ export function createTeam(pi: ExtensionAPI, host: TeamHost) {
 	/** Held `wait` requests by member. */
 	const waiters = new Map<string, Set<() => void>>();
 
-	const append = (record: MemberRecord | MessageRecord | TopicRecord) => appendFileSync(log as string, `${JSON.stringify(record)}\n`);
-	const details = (message: MessageRecord) => ({ team: teamId, seq: message.seq, from: message.from });
-
-	const activate = (on: boolean) => {
-		const others = pi.getActiveTools().filter((name) => name !== "team");
-		pi.setActiveTools(on ? [...others, "team"] : others);
+	const append = (record: MemberRecord | MessageRecord | TopicRecord) => {
+		mkdirSync(dirname(log), { recursive: true });
+		appendFileSync(log, `${JSON.stringify(record)}\n`);
 	};
+	const details = (message: MessageRecord) => ({ team: teamId, seq: message.seq, from: message.from });
 
 	const known = (name: string) => {
 		if (name !== MAIN && !members.has(name)) throw new Error(`Unknown member: ${name}. Members: ${[MAIN, ...members.keys()].join(", ")}`);
@@ -243,7 +237,6 @@ export function createTeam(pi: ExtensionAPI, host: TeamHost) {
 		description: TEAM_DESCRIPTION,
 		parameters: teamParameters,
 		async execute(_toolCallId, params, signal) {
-			if (!log) throw new Error("This session is not in team mode.");
 			if (params.action !== "wait") return text(act(MAIN, params));
 			const ms = Math.min(params.ms ?? DEFAULT_WAIT_MS, MAX_WAIT_MS);
 			const count = await host.waitForMain(ms, signal);
@@ -252,19 +245,14 @@ export function createTeam(pi: ExtensionAPI, host: TeamHost) {
 	});
 
 	return {
-		get active() {
-			return Boolean(log);
-		},
-
 		/**
-		 * Loads the team of the session at `base` (its file path without .jsonl), or leaves the session in normal mode.
+		 * Loads the team of the session at `base` (its file path without .jsonl); a missing log means no members yet.
 		 * Delivers, without starting a turn, the messages for the main agent that its session lacks. Returns the members.
 		 */
 		load(base: string, ctx: ExtensionContext): MemberRecord[] {
-			const file = join(base, "team.jsonl");
-			log = existsSync(file) ? file : undefined;
-			activate(Boolean(log));
-			if (!log) return [];
+			log = join(base, "team.jsonl");
+			teamId = ctx.sessionManager.getSessionId();
+			if (!existsSync(log)) return [];
 			const content = readFileSync(log, "utf8");
 			// An interrupted write leaves a partial last line; end it so the next record starts a line of its own.
 			if (content && !content.endsWith("\n")) appendFileSync(log, "\n");
@@ -276,8 +264,7 @@ export function createTeam(pi: ExtensionAPI, host: TeamHost) {
 					try {
 						record = JSON.parse(line);
 					} catch {}
-					if (record?.t === "team" && typeof record.id === "string") teamId = record.id;
-					else if (record?.t === "member" && typeof record.name === "string" && Array.isArray(record.args)) members.set(record.name, record);
+					if (record?.t === "member" && typeof record.name === "string" && Array.isArray(record.args)) members.set(record.name, record);
 					else if (record?.t === "msg" && typeof record.seq === "number" && Array.isArray(record.notify)) messages.push(record);
 					else if (record?.t === "topic" && typeof record.body === "string") topic = record.body;
 					else if (ctx.hasUI) ctx.ui.notify(`team.jsonl line ${i + 1} is not a team record; skipped`, "warning");
@@ -290,15 +277,6 @@ export function createTeam(pi: ExtensionAPI, host: TeamHost) {
 				);
 			}
 			return [...members.values()];
-		},
-
-		/** Starts team mode for the session at `base`, whose session id is `id`. */
-		create(base: string, id: string) {
-			mkdirSync(base, { recursive: true });
-			log = join(base, "team.jsonl");
-			teamId = id;
-			writeFileSync(log, `${JSON.stringify({ t: "team", id } satisfies TeamRecord)}\n`, { flag: "wx" });
-			activate(true);
 		},
 
 		/** Validates a new member's name and records it. */

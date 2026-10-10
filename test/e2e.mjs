@@ -1,16 +1,31 @@
 // Drives parent `pi --mode rpc` processes that load the extension, against test/fake-llm.mjs.
+// Each parent runs through test/sdk-host.mjs, as in an SDK host, so process.argv[1] is not Pi's CLI.
 // Started by test/local.sh, which provides the environment.
 import assert from "node:assert/strict";
 import { execFileSync, spawn } from "node:child_process";
 import fs from "node:fs";
-import { basename, dirname, join } from "node:path";
+import { join } from "node:path";
+import { fileURLToPath } from "node:url";
 
 const { REQUESTS_LOG: REQUESTS, WORK_DIR, PI_CLI } = process.env;
-const [command, ...prefix] = PI_CLI ? [process.execPath, PI_CLI] : ["pi"];
-const commandLines = () =>
-	process.platform === "win32"
-		? execFileSync("pwsh", ["-NoProfile", "-NonInteractive", "-Command", "Get-CimInstance Win32_Process | ForEach-Object CommandLine"], { encoding: "utf8" })
-		: execFileSync("ps", ["-eo", "args"], { encoding: "utf8" });
+const host = fileURLToPath(new URL("sdk-host.mjs", import.meta.url));
+/** The PIDs of the processes whose parent is `pid`. */
+const childPids = (pid) =>
+	(process.platform === "win32"
+		? execFileSync("pwsh", ["-NoProfile", "-NonInteractive", "-Command", `Get-CimInstance Win32_Process -Filter "ParentProcessId=${pid}" | ForEach-Object { "$($_.ProcessId) $($_.ParentProcessId)" }`], { encoding: "utf8" })
+		: execFileSync("ps", ["-A", "-o", "pid=,ppid="], { encoding: "utf8" })
+	)
+		.split(/\r?\n/)
+		.map((row) => row.trim().split(/\s+/).map(Number))
+		.filter(([, ppid]) => ppid === pid)
+		.map(([child]) => child);
+const alive = (pid) => {
+	try {
+		return process.kill(pid, 0);
+	} catch (error) {
+		return error.code === "EPERM";
+	}
+};
 const sleep = (ms) => new Promise((done) => setTimeout(done, ms));
 async function until(predicate, ms = 60_000) {
 	for (const end = Date.now() + ms; !predicate(); await sleep(100)) if (Date.now() > end) throw new Error("timed out");
@@ -25,11 +40,16 @@ const requests = () =>
 		.filter(Boolean)
 		.map((line) => JSON.parse(line))
 		.filter((body) => body.messages);
-/** The first model request whose last message starts with `said`. */
-const requestFor = (said) => requests().find((body) => body.messages.at(-1).role === "user" && rawText(body.messages.at(-1)).startsWith(said));
+const isTeam = (m) => m.role === "user" && rawText(m).startsWith("[team");
+/** The first model request whose last message other than team messages starts with `said`. */
+const requestFor = (said) =>
+	requests().find((body) => {
+		const last = body.messages.findLast((m) => !isTeam(m));
+		return last.role === "user" && rawText(last).startsWith(said);
+	});
 /** The model requests of team member `name`, recognized by its preamble. */
 const requestsBy = (name) => requests().filter((body) => body.messages.some((m) => m.role === "user" && rawText(m).startsWith(`[team] You are ${name},`)));
-const idOf = (text) => text.match(/^\[\w+\] subagent ([0-9a-f]{6})/)?.[1];
+const idOf = (text) => text.match(/^\[\w+\] subagent ([a-z][a-z0-9-]*)/)?.[1];
 const LIVE = /^\[running\] subagent [0-9a-z-]+(?: · \S+)? · turn \d+ · .+ · last event \d+s ago · \d+s$/m;
 // An idle parent gets a message through sendMessage (message_end); a busy one at a turn boundary (entry_appended).
 const asMessage = (e) =>
@@ -42,7 +62,7 @@ const asMessage = (e) =>
 const trimmed = (m) => m && { ...m, content: m.content.trimEnd() };
 
 function startParent(args) {
-	const child = spawn(command, [...prefix, "--mode", "rpc", "--model", "fake/fake-model", ...args], { cwd: join(WORK_DIR, "project"), stdio: "pipe" });
+	const child = spawn(process.execPath, [host, PI_CLI, "--mode", "rpc", "--model", "fake/fake-model", ...args], { cwd: join(WORK_DIR, "project"), stdio: "pipe" });
 	const events = [];
 	const listeners = new Set();
 	let buffer = "";
@@ -94,12 +114,6 @@ function startParent(args) {
 		const settled = await waitEvent((e) => e.type === "agent_settled", from);
 		return events.slice(from, events.indexOf(settled)).findLast((e) => e.type === "message_end" && e.message.role === "assistant").message.content.map((c) => c.text ?? "").join("");
 	};
-	/** Runs a slash command and returns the notice it shows. */
-	const slash = async (line) => {
-		const from = events.length;
-		prompt(line);
-		return waitEvent((e) => e.type === "extension_ui_request" && e.method === "notify", from);
-	};
 	const request = async (record) => {
 		const id = `req-${events.length}`;
 		const from = events.length;
@@ -118,7 +132,7 @@ function startParent(args) {
 		child.stdin.end();
 		await exited;
 	};
-	return { child, events, waitEvent, send, prompt, call, say, slash, request, messages, waitMessage, close };
+	return { child, events, waitEvent, send, prompt, call, say, request, messages, waitMessage, close };
 }
 
 let failed = 0;
@@ -136,7 +150,6 @@ async function step(name, fn) {
 	}
 }
 
-// Normal mode.
 const parent = startParent(["--session-dir", join(WORK_DIR, "sessions")]);
 current = parent;
 const { events, send, call, waitEvent, waitMessage } = parent;
@@ -144,34 +157,26 @@ const notifications = (from = 0) => parent.messages(from).filter((m) => m.custom
 
 let first;
 await step("run returns the result when the child finishes within waitMs", async () => {
-	const r = await call({ action: "run", message: "SAY hello" });
-	assert.match(r.text, /^\[settled\] subagent [0-9a-f]{6} · fake\/fake-model · 1 turns/);
+	const r = await call({ action: "run", name: "first", message: "SAY hello" });
+	assert.match(r.text, /^\[settled\] subagent first · fake\/fake-model · 1 turns/);
 	assert.match(r.text, /hello$/);
-	assert.doesNotMatch(r.text, /Note:|\(Background:/);
+	assert.doesNotMatch(r.text, /\(Background:/);
 	first = idOf(r.text);
 	// A later call does not repeat a returned result.
 	const again = await call({ action: "status", id: first });
-	assert.match(again.text, /^\[settled\] subagent [0-9a-f]{6}.*\n\nIts result was returned to you earlier\. Full reply: .*final\.md$/s);
+	assert.match(again.text, /^\[settled\] subagent first.*\n\nIts result was returned to you earlier\. Full reply: .*final\.md$/s);
 	assert.doesNotMatch(again.text, /hello/);
 });
 
-await step("children run the default model and get the report tool instead of the subagent tool", async () => {
-	const r = await call({ action: "run", message: "TOOLS?" });
+await step("children run the default model and get the team tool instead of the subagent tool; the main agent has both", async () => {
+	const r = await call({ action: "run", name: "tools", message: "TOOLS?" });
 	const tools = r.text.match(/^tools: (.*)$/m)?.[1].split(",");
 	assert.ok(tools?.includes("read"), r.text);
-	assert.ok(tools.includes("report_to_main_agent"), r.text);
-	assert.ok(!tools.includes("subagent") && !tools.includes("team"), r.text);
+	assert.ok(tools.includes("team") && !tools.includes("subagent"), r.text);
 	assert.equal(requestFor("TOOLS?").model, "fake-model");
-});
-
-await step("fork gives the child this conversation; fresh does not", async () => {
-	const r = await call({ action: "run", context: "fork", message: "SAY forked" });
-	assert.match(r.text, /^\[settled\].*\n\nforked$/s);
-	// The forked child is told what it is, ahead of its task.
-	const forked = requestFor("You are a subagent").messages;
-	assert.match(JSON.stringify(forked.at(-1).content), /Task:\\nSAY forked/);
-	assert.ok(forked.some((m) => m.tool_calls?.some((c) => c.function.name === "subagent")), "fork lacks the parent's tool calls");
-	assert.ok(!requestFor("SAY hello").messages.some((m) => m.tool_calls), "fresh child saw parent history");
+	assert.ok(!requestFor("SAY hello").messages.some((m) => m.tool_calls), "a child saw parent history");
+	const own = (await parent.say("TOOLS?")).replace(/^tools: /, "").split(",");
+	assert.ok(own.includes("subagent") && own.includes("team"), own.join(","));
 });
 
 await step("status without id lists subagents", async () => {
@@ -185,19 +190,8 @@ await step("follow_up restarts a finished child in its own session", async () =>
 	assert.ok(requestFor("SAY again").messages.some((m) => m.role === "user" && JSON.stringify(m.content).includes("SAY hello")), "session history missing");
 });
 
-await step("normal mode rejects name and keeps the team tool inactive; /team fails once a subagent exists", async () => {
-	const named = await call({ action: "run", name: "alpha", message: "SAY x" });
-	assert.ok(named.isError);
-	assert.match(named.text, /name is for team mode/);
-	assert.doesNotMatch(await parent.say("TOOLS?"), /\bteam\b/);
-	const notice = await parent.slash("/team");
-	assert.equal(notice.notifyType, "error");
-	assert.match(notice.message, /started subagents/);
-	assert.doesNotMatch(await parent.say("TOOLS?"), /\bteam\b/);
-});
-
 await step("a result that outlives waitMs arrives once as a message that starts a turn", async () => {
-	const r = await call({ action: "run", message: "SLOW 2000 SAY late", waitMs: 300 });
+	const r = await call({ action: "run", name: "slow", message: "SLOW 2000 SAY late", waitMs: 300 });
 	assert.match(r.text, LIVE);
 	const id = idOf(r.text);
 	const from = events.length;
@@ -218,9 +212,9 @@ const finalFile = (id) =>
 await step("results that reach a busy parent arrive together right after its current tool calls", async () => {
 	const from = events.length;
 	const ids = [];
-	for (const n of [1, 2]) ids.push(idOf((await call({ action: "run", message: `SLOW 4000 SAY busy${n}`, waitMs: 0 })).text));
+	for (const n of [1, 2]) ids.push(idOf((await call({ action: "run", name: `busy${n}`, message: `SLOW 4000 SAY busy${n}`, waitMs: 0 })).text));
 	const mark = events.length;
-	send({ type: "prompt", streamingBehavior: "followUp", message: `CALLS 15000 ${JSON.stringify({ action: "run", message: "SLOW 1000 SAY busy3", waitMs: 0 })} || ${JSON.stringify({ action: "status" })}` });
+	send({ type: "prompt", streamingBehavior: "followUp", message: `CALLS 15000 ${JSON.stringify({ action: "run", name: "busy3", message: "SLOW 1000 SAY busy3", waitMs: 0 })} || ${JSON.stringify({ action: "status" })}` });
 	const started = await waitEvent((e) => e.type === "tool_execution_end" && e.toolName === "subagent", mark);
 	ids.push(idOf(started.result.content[0].text));
 	await waitEvent((e) => e.type === "agent_settled", events.indexOf(started));
@@ -237,20 +231,20 @@ await step("results that reach a busy parent arrive together right after its cur
 });
 
 await step("a tool wait ends early when another subagent sends a message", async () => {
-	const hung = idOf((await call({ action: "run", message: "HANG", waitMs: 0 })).text);
+	const hung = idOf((await call({ action: "run", name: "hung", message: "HANG", waitMs: 0 })).text);
 	const from = events.length;
-	await call({ action: "run", message: "SLOW 2000 REPORT ping", waitMs: 0 });
+	await call({ action: "run", name: "pinger", message: `SLOW 2000 TEAM ${JSON.stringify({ action: "send", to: "main", body: "ping" })}`, waitMs: 0 });
 	const started = Date.now();
 	const s = await call({ action: "status", id: hung, waitMs: 60_000 });
 	assert.ok(Date.now() - started < 30_000, "the wait was not cut short");
 	assert.match(s.text, /Returned early: subagent messages follow this result\./);
-	assert.ok(parent.messages(from).some((m) => m.customType === "subagent-report" && /: ping$/.test(m.content)));
+	assert.ok(parent.messages(from).some((m) => m.customType === "team-message" && /\nping$/.test(m.content)));
 	await call({ action: "abort", id: hung });
 });
 
 await step("a result queued in a turn stopped with Esc is kept without waking the parent", async () => {
 	const from = events.length;
-	send({ type: "prompt", streamingBehavior: "followUp", message: `CALL ${JSON.stringify({ action: "run", message: "SAY esc", waitMs: 0 })} HOLD` });
+	send({ type: "prompt", streamingBehavior: "followUp", message: `CALL ${JSON.stringify({ action: "run", name: "esc", message: "SAY esc", waitMs: 0 })} HOLD` });
 	const started = await waitEvent((e) => e.type === "tool_execution_end" && e.toolName === "subagent", from);
 	const id = idOf(started.result.content[0].text);
 	await until(() => finalFile(id));
@@ -269,7 +263,7 @@ await step("a result queued in a turn stopped with Esc is kept without waking th
 
 await step("after Esc, a later result does not start a turn; the next prompt ends that", async () => {
 	const from = events.length;
-	send({ type: "prompt", streamingBehavior: "followUp", message: `CALL ${JSON.stringify({ action: "run", message: "SLOW 3000 SAY after esc", waitMs: 0 })} HOLD` });
+	send({ type: "prompt", streamingBehavior: "followUp", message: `CALL ${JSON.stringify({ action: "run", name: "after-esc", message: "SLOW 3000 SAY after esc", waitMs: 0 })} HOLD` });
 	const started = await waitEvent((e) => e.type === "tool_execution_end" && e.toolName === "subagent", from);
 	await sleep(300);
 	send({ type: "clear_queue" });
@@ -281,7 +275,7 @@ await step("after Esc, a later result does not start a turn; the next prompt end
 	await sleep(2000);
 	assert.ok(!events.slice(events.indexOf(settled)).some((e) => e.type === "agent_start"), "the parent was woken");
 	// A prompt from the user lets later results start turns again.
-	await call({ action: "run", message: "SLOW 2000 SAY woken", waitMs: 0 });
+	await call({ action: "run", name: "woken", message: "SLOW 2000 SAY woken", waitMs: 0 });
 	const mark = events.length;
 	await waitMessage("subagent-result", mark);
 	await waitEvent((e) => e.type === "agent_start", mark);
@@ -290,14 +284,14 @@ await step("after Esc, a later result does not start a turn; the next prompt end
 
 await step("a result returned by a call is not delivered again", async () => {
 	const from = events.length;
-	const r = await call({ action: "run", message: "SLOW 300 SAY quick", waitMs: 10_000 });
+	const r = await call({ action: "run", name: "quick", message: "SLOW 300 SAY quick", waitMs: 10_000 });
 	assert.match(r.text, /quick$/);
 	await sleep(1500);
 	assert.equal(notifications(from).length, 0);
 });
 
 await step("steer redirects a running child", async () => {
-	const r = await call({ action: "run", message: "SLOW 8000 SAY first", waitMs: 200 });
+	const r = await call({ action: "run", name: "steered", message: "SLOW 8000 SAY first", waitMs: 200 });
 	const id = idOf(r.text);
 	const s = await call({ action: "steer", id, message: "SAY steered" });
 	assert.equal(s.text, "steer queued");
@@ -306,7 +300,7 @@ await step("steer redirects a running child", async () => {
 });
 
 await step("follow_up on a running child returns within waitMs and runs after the current request", async () => {
-	const r = await call({ action: "run", message: "SLOW 3000 SAY one", waitMs: 0 });
+	const r = await call({ action: "run", name: "queued", message: "SLOW 3000 SAY one", waitMs: 0 });
 	const id = idOf(r.text);
 	const started = Date.now();
 	const f = await call({ action: "follow_up", id, message: "SAY two", waitMs: 0 });
@@ -317,64 +311,36 @@ await step("follow_up on a running child returns within waitMs and runs after th
 });
 
 await step("abort stops a hung child; other results show it in their footer", async () => {
-	const r = await call({ action: "run", message: "HANG", waitMs: 500 });
+	const r = await call({ action: "run", name: "hanging", message: "HANG", waitMs: 500 });
 	assert.match(r.text, LIVE);
 	const id = idOf(r.text);
-	const other = await call({ action: "run", message: "SAY side" });
+	const other = await call({ action: "run", name: "side", message: "SAY side" });
 	assert.match(other.text, new RegExp(`side\\n\\n\\(Background: ${id} running \\d+s\\.\\)$`));
 	const a = await call({ action: "abort", id });
 	assert.match(a.text, /^\[aborted\]/);
 	assert.doesNotMatch(a.text, /Background/);
 });
 
-await step("a subagent's report reaches the parent while it works", async () => {
-	const from = events.length;
-	const r = await call({ action: "run", message: "REPORT root cause found", waitMs: 30_000 });
-	const id = idOf(r.text);
-	// The report ends the wait; the final result follows it as a message.
-	assert.doesNotMatch(r.text, /reported$/);
-	await waitMessage("subagent-result", from);
-	const messages = parent.messages(from);
-	assert.deepEqual(
-		messages.map((m) => m.customType),
-		["subagent-report", "subagent-result"],
-	);
-	assert.equal(messages[0].content, `[report] subagent ${id}: root cause found`);
-	assert.match(messages[1].content, /reported$/);
-	await waitEvent((e) => e.type === "agent_settled", events.length - 1);
-});
-
-await step("run warns when args remove the report tool", async () => {
-	const toolsOf = (text) => text.match(/^tools: (.*)$/m)?.[1].split(",");
-	const cut = await call({ action: "run", message: "TOOLS?", args: ["--tools", "report_to_main_agent", "--tools", "read"] });
-	assert.match(cut.text, /Note: these args remove report_to_main_agent/);
-	assert.deepEqual(toolsOf(cut.text), ["read"]);
-	const kept = await call({ action: "run", message: "TOOLS?", args: ["--no-tools", "--tools", "read,report_*"] });
-	assert.doesNotMatch(kept.text, /Note:/);
-	assert.ok(toolsOf(kept.text)?.includes("report_to_main_agent"), kept.text);
-});
-
 await step("a child stays a subagent when its extensions reload", async () => {
 	const reloader = join(WORK_DIR, "reload-extension.ts");
 	fs.writeFileSync(reloader, 'export default function (pi) { pi.registerCommand("reload-now", { handler: (_args, ctx) => ctx.reload() }); }\n');
-	const id = idOf((await call({ action: "run", message: "SLOW 6000 SAY before reload", args: ["-e", reloader], waitMs: 0 })).text);
+	const id = idOf((await call({ action: "run", name: "reloaded", message: "SLOW 6000 SAY before reload", args: ["-e", reloader], waitMs: 0 })).text);
 	// Extension commands run at once, even while the child is busy; TOOLS? then runs in the same process.
 	await call({ action: "follow_up", id, message: "/reload-now", waitMs: 2000 });
 	const r = await call({ action: "follow_up", id, message: "TOOLS?", waitMs: 30_000 });
 	const tools = r.text.match(/^tools: (.*)$/m)?.[1].split(",");
-	assert.ok(tools?.includes("report_to_main_agent"), r.text);
-	assert.ok(!tools.includes("subagent"), r.text);
+	assert.ok(tools?.includes("team") && !tools.includes("subagent"), r.text);
 });
 
 await step("a child that cannot start reports an error with Pi's output", async () => {
-	const r = await call({ action: "run", message: "SAY x", args: ["-z"], waitMs: 30_000 });
-	assert.match(r.text, /^\[error\] subagent [0-9a-f]{6} · 0 turns/);
+	const r = await call({ action: "run", name: "broken", message: "SAY x", args: ["-z"], waitMs: 30_000 });
+	assert.match(r.text, /^\[error\] subagent broken · 0 turns/);
 	assert.match(r.text, /Pi exited \(code [1-9]/);
 	assert.match(r.text, /-z/);
 });
 
 await step("owned flags and unknown ids are rejected", async () => {
-	const bad = await call({ action: "run", message: "SAY x", args: ["--session-dir=/tmp/x"] });
+	const bad = await call({ action: "run", name: "owned", message: "SAY x", args: ["--session-dir=/tmp/x"] });
 	assert.ok(bad.isError);
 	assert.match(bad.text, /must not include --session-dir=/);
 	const unknown = await call({ action: "steer", id: "zzzzzz", message: "x" });
@@ -383,23 +349,19 @@ await step("owned flags and unknown ids are rejected", async () => {
 });
 
 await step("children end with the parent session", async () => {
-	await call({ action: "run", message: "HANG", waitMs: 300 });
+	await call({ action: "run", name: "last", message: "HANG", waitMs: 300 });
+	const children = childPids(parent.child.pid);
+	assert.ok(children.length > 0, "no child process found");
 	await parent.close();
 	await sleep(5000);
-	const left = commandLines()
-		.split(/\r?\n/)
-		.filter((l) => l.includes("--mode rpc") && l.includes(basename(dirname(WORK_DIR))));
-	assert.deepEqual(left, []);
+	assert.deepEqual(children.filter(alive), []);
 });
 
-// Team mode.
-await step("/team needs a session file", async () => {
+await step("a session without a session file hires members", async () => {
 	const bare = startParent(["--no-session"]);
 	current = bare;
 	try {
-		const notice = await bare.slash("/team");
-		assert.equal(notice.notifyType, "error");
-		assert.match(notice.message, /needs a session file/);
+		assert.match((await bare.call({ action: "run", name: "solo", message: "SAY solo" })).text, /^\[settled\] subagent solo.*solo$/s);
 	} finally {
 		await bare.close();
 	}
@@ -411,18 +373,9 @@ const run = (args) => team.call({ action: "run", ...args });
 const teamCall = (args) => team.call(args, "team");
 const TEAM = (args) => `TEAM ${JSON.stringify(args)}`;
 
-await step("/team turns on team mode and the team tool", async () => {
-	assert.doesNotMatch(await team.say("TOOLS?"), /\bteam\b/);
-	const notice = await team.slash("/team");
-	assert.equal(notice.notifyType, "info");
-	assert.match(notice.message, /Team mode is on/);
-	assert.match(await team.say("TOOLS?"), /\bteam\b/);
-});
-
-await step("team mode requires a name, fresh context, and args that keep the team tool", async () => {
+await step("run requires a valid name and args that keep the team tool", async () => {
 	for (const [args, error] of [
 		[{ message: "SAY x" }, /requires name/],
-		[{ name: "forked", context: "fork", message: "SAY x" }, /start fresh/],
 		[{ name: "toolless", args: ["--tools", "read"], message: "SAY x" }, /remove the team tool/],
 		[{ name: "main", message: "SAY x" }, /reserved/],
 		[{ name: "Bad_Name", message: "SAY x" }, /name must match/],
@@ -586,9 +539,10 @@ await step("a team started in a clone restores its own messages despite the orig
 	try {
 		assert.ok((await teamMessages(original)).some((e) => e.details.seq >= 1), "the original team delivered nothing to inherit");
 		assert.equal((await original.request({ type: "clone" })).data.cancelled, false);
-		assert.match((await original.slash("/team")).message, /Team mode is on/);
 		clone = (await original.request({ type: "get_state" })).data;
 		assert.notEqual(clone.sessionFile, teamSession);
+		// alpha belongs to the original team, so hiring it again proves the clone has a team of its own.
+		assert.match((await original.call({ action: "run", name: "alpha", message: "SAY cloned" })).text, /^\[settled\] subagent alpha/);
 	} finally {
 		await original.close();
 	}

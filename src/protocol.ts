@@ -8,7 +8,7 @@ import type { SessionEntry } from "@earendil-works/pi-coding-agent";
 import { type Static, Type } from "typebox";
 
 export const TAG = "pi-subagent/1";
-/** Set in every subagent's environment: "1" in normal mode, "team" in team mode. */
+/** Set in every subagent's environment. */
 export const CHILD_ENV = "PI_SUBAGENT_CHILD";
 /** Custom message type of team messages and of a member's preamble. */
 export const TEAM_MESSAGE = "team-message";
@@ -47,7 +47,6 @@ export interface Delivery {
 }
 
 export type Request =
-	| { op: "report"; message: string }
 	| { op: "start" }
 	| { op: "inbox"; after: number }
 	| { op: "wait"; after: number; ms: number }
@@ -57,7 +56,7 @@ export type Reply = { ok: true; text?: string; team?: string; preamble?: string;
 
 /**
  * The read cursor of a session for `team`: the highest seq of that team's messages it holds.
- * Every team message carries `details: { team, seq }`; `team` is the id of the session that ran /team.
+ * Every team message carries `details: { team, seq }`; `team` is the id of the session that owns the team.
  */
 export const teamCursor = (entries: SessionEntry[], team: string) =>
 	entries.reduce((max, entry) => {

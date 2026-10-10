@@ -4,13 +4,10 @@
 //   tool result                      → "ack" (parent turn after a subagent call), except:
 //                                      after "CALL <json> HOLD" → never answer;
 //                                      first result after "CALLS <ms> <a> || <b>" → wait, then call <b>;
-//                                      after "TEAM <json>" → "team: <tool result>";
-//                                      after "REPORT <text>" → "reported"
+//                                      after "TEAM <json>" → "team: <tool result>"
 //   "CALL <json>[ HOLD]"              → a `subagent` tool call with those arguments
 //   "CALLS <ms> <a> || <b>"           → a `subagent` call with <a>
 //   "TEAM <json>"                     → a `team` tool call with those arguments
-//   "REPORT <text>"                  → a `report_to_main_agent` call
-//   "<fork note>\n\nTask:\n<rest>"     → handle <rest>
 //   "[settled|aborted|error] ..."    → "notified" (a delivered subagent result)
 //   "SLOW <ms> <rest>"               → wait, then handle <rest>
 //   "HANG"                           → never answer
@@ -21,7 +18,7 @@ import http from "node:http";
 
 const [log, port = "8787"] = process.argv.slice(2);
 const text = (m) => (typeof m.content === "string" ? m.content : (m.content || []).map((p) => p.text || "").join(""));
-const script = (m) => text(m).trim().replace(/^[\s\S]*\n\nTask:\n/, "");
+const script = (m) => text(m).trim();
 /** The scripted call a prompt makes, without its delay. */
 const callOf = (m) => script(m).replace(/^SLOW \d+ /, "");
 const sleep = (ms) => new Promise((done) => setTimeout(done, ms));
@@ -32,10 +29,9 @@ async function reply(body) {
 	const last = messages.at(-1);
 	if (last.role === "assistant") return { content: "notified" };
 	if (last.role === "tool") {
-		const start = messages.findLastIndex((m) => m.role === "user" && /^(CALLS?|TEAM|REPORT) /.test(callOf(m)));
+		const start = messages.findLastIndex((m) => m.role === "user" && /^(CALLS?|TEAM) /.test(callOf(m)));
 		const call = start === -1 ? "" : callOf(messages[start]);
 		if (call.startsWith("TEAM ")) return { content: `team: ${text(last)}` };
-		if (!call.startsWith("CALL")) return { content: "reported" };
 		const calls = call.match(CALLS);
 		if (calls && messages.slice(start).filter((m) => m.role === "tool").length === 1) {
 			await sleep(Number(calls[1]));
@@ -55,7 +51,6 @@ async function reply(body) {
 	}
 	if (said === "HANG") return { hang: true };
 	if (said.startsWith("TEAM ")) return { call: said.slice(5), name: "team" };
-	if (said.startsWith("REPORT ")) return { call: JSON.stringify({ message: said.slice(7) }), name: "report_to_main_agent" };
 	if (said === "TOOLS?") return { content: `tools: ${(body.tools || []).map((t) => t.function.name).join(",")}` };
 	if (said.startsWith("SAY ")) return { content: said.slice(4) };
 	return { content: `unscripted: ${said.slice(0, 80)}` };

@@ -1,8 +1,9 @@
 #!/usr/bin/env bash
 # Runs the end-to-end test against the Pi on this machine, with a throwaway agent
 # directory, so the user's settings, credentials, and sessions stay untouched.
-# PI_CLI selects a Pi CLI entry (cli.js); otherwise `pi` from PATH.
+# PI_CLI must name the Pi CLI entry (cli.js) to test against.
 set -euo pipefail
+: "${PI_CLI:?set PI_CLI to a Pi CLI entry (cli.js)}"
 root="$(cd "$(dirname "$0")/.." && (pwd -W 2>/dev/null || pwd))"
 tmp="$(cd "$(mktemp -d)" && (pwd -W 2>/dev/null || pwd))"
 export PI_CODING_AGENT_DIR="$tmp/agent" WORK_DIR="$tmp/work" REQUESTS_LOG="$tmp/requests.jsonl" PI_OFFLINE=1 PI_SKIP_VERSION_CHECK=1

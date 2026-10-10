@@ -4,7 +4,10 @@
  */
 import { type ChildProcessWithoutNullStreams, spawn } from "node:child_process";
 import { randomBytes } from "node:crypto";
+import { readFileSync } from "node:fs";
+import { join } from "node:path";
 import { StringDecoder } from "node:string_decoder";
+import { getPackageDir } from "@earendil-works/pi-coding-agent";
 import { CHILD_ENV, type Reply, type Request, TAG } from "./protocol.ts";
 
 const ABORT_WAIT_MS = 10_000;
@@ -69,14 +72,16 @@ export function within<T>(promise: Promise<T>, ms: number, signal?: AbortSignal)
 	});
 }
 
-/** Starts a child on `message`. `mode` is the child's PI_SUBAGENT_CHILD value. */
-export function startRun(options: { cwd: string; args: string[]; mode: "1" | "team"; message: string; owner: RunOwner }): Run {
+/** Starts a child on `message`. */
+export function startRun(options: { cwd: string; args: string[]; message: string; owner: RunOwner }): Run {
 	const { owner } = options;
-	// The parent's own runtime and CLI entry, so the child runs the same Pi build.
-	const command = process.argv[1] ? [process.execPath, process.argv[1]] : ["pi"];
-	const child = spawn(command[0], [...command.slice(1), "--mode", "rpc", ...options.args], {
+	// The host's runtime and Pi package, so the child runs the same Pi build even when the host is an SDK app.
+	// shortcut: a Bun-compiled Pi binary has no rpc-entry file; add a path for it if such hosts need subagents.
+	const pkg = getPackageDir();
+	const entry = join(pkg, JSON.parse(readFileSync(join(pkg, "package.json"), "utf8")).exports["./rpc-entry"].import);
+	const child = spawn(process.execPath, [entry, ...options.args], {
 		cwd: options.cwd,
-		env: { ...process.env, [CHILD_ENV]: options.mode },
+		env: { ...process.env, [CHILD_ENV]: "1" },
 		stdio: "pipe",
 		windowsHide: true,
 	});

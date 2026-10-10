@@ -11,9 +11,9 @@ const ROLE: unique symbol = Symbol.for("pi-subagent-rpc-extension.role");
 export default function (pi: ExtensionAPI) {
 	// The role leaves the environment so nothing the child starts, such as a Pi launched from bash, takes itself
 	// for a subagent; it stays in process-global state because a reload runs this factory again in the same process.
-	const global = globalThis as { [ROLE]?: string };
-	global[ROLE] ??= process.env[CHILD_ENV] ?? "";
+	const global = globalThis as { [ROLE]?: boolean };
+	global[ROLE] ??= Boolean(process.env[CHILD_ENV]);
 	delete process.env[CHILD_ENV];
-	if (global[ROLE]) setupChild(pi, global[ROLE] === "team");
+	if (global[ROLE]) setupChild(pi);
 	else setupParent(pi);
 }

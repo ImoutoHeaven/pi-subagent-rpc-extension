@@ -1,9 +1,8 @@
 /**
- * Inside a subagent: the tool that talks to the parent and, in team mode, inbox pulls at safe points.
+ * Inside a subagent: the team tool and inbox pulls at safe points, both answered by the parent.
  * There is no subagent tool here, which keeps delegation one level deep.
  */
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
-import { Type } from "typebox";
 import { DEFAULT_WAIT_MS, type Delivery, MAX_WAIT_MS, type Reply, type Request, TAG, TEAM_DESCRIPTION, TEAM_MESSAGE, teamCursor, teamParameters } from "./protocol.ts";
 
 const REQUEST_TIMEOUT_MS = 10_000;
@@ -20,22 +19,7 @@ async function ask(ctx: ExtensionContext, request: Request, signal?: AbortSignal
 
 const text = (body: string) => ({ content: [{ type: "text" as const, text: body }], details: undefined });
 
-export default function setupChild(pi: ExtensionAPI, team: boolean) {
-	if (!team) {
-		pi.registerTool({
-			name: "report_to_main_agent",
-			label: "Report to main agent",
-			description:
-				"Send a short message to the main agent that started you, while you keep working. Use it only when the main agent needs to know something before you finish: a finding that changes its plans, a decision you made on its behalf, or a blocker. Do not use it for routine progress or as a log; your final reply already goes to the main agent. Keep it brief and precise.",
-			parameters: Type.Object({ message: Type.String({ description: "What the main agent needs to know." }) }),
-			async execute(_toolCallId, params, signal, _onUpdate, ctx) {
-				await ask(ctx, { op: "report", message: params.message }, signal);
-				return text("sent");
-			},
-		});
-		return;
-	}
-
+export default function setupChild(pi: ExtensionAPI) {
 	/** The team's id, from the start reply. */
 	let teamId = "";
 	/** The highest team message seq this member has received. */

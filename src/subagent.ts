@@ -1,13 +1,12 @@
 /**
- * The parent side: the `subagent` tool, the agent registry, waits, delivery of results, reports, and team
- * messages to the main agent, and the /team command.
+ * The parent side: the `subagent` tool, the agent registry, waits, and delivery of results and team messages
+ * to the main agent.
  */
-import { randomBytes } from "node:crypto";
 import { existsSync, mkdirSync, statSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { StringEnum } from "@earendil-works/pi-ai";
-import { type BoundaryState, type ExtensionAPI, type ExtensionContext, SessionManager } from "@earendil-works/pi-coding-agent";
+import type { BoundaryState, ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
 import { DEFAULT_WAIT_MS, MAX_WAIT_MS, type Reply, type Request } from "./protocol.ts";
 import { type Run, type RunStatus, startRun, within } from "./rpc.ts";
@@ -16,17 +15,12 @@ import { createTeam } from "./team.ts";
 const MAX_RESULT_CHARS = 16_000;
 const NARRATION_LINES = 3;
 const NARRATION_CHARS = 300;
-const MAX_AGENTS = 32;
 const FOOTER_AGENTS = 3;
 const STALE_MS = 60_000;
-const REPORT_TOOL = "report_to_main_agent";
 // The extension owns the child's process mode, session, and model selection.
 const OWNED_FLAGS = ["--mode", "--print", "-p", "--no-session", "--session", "--session-id", "--session-dir", "--continue", "-c", "--resume", "-r", "--fork", "--export", "--model"];
-// A forked child sees the parent's whole conversation and would otherwise take itself for the parent.
-const FORK_NOTE =
-	"You are a subagent: a separate Pi process started by the main agent's `subagent` tool, with a copy of the conversation above. You are not the main agent. The `subagent` call that started you has no result in your copy; that is expected. Do only the task below. Your final reply is returned to the main agent.";
 
-/** `stopped`: a team member restored from the log that has not run in this session yet. */
+/** `stopped`: a member restored from the log that has not run in this session yet. */
 type Status = RunStatus | "running" | "stopped";
 
 interface Agent {
@@ -52,7 +46,7 @@ interface Agent {
 	delivered: boolean;
 	/** The final result went out as a message, so tool results show only its header. */
 	notified: boolean;
-	/** A team member sent its start request in this run, so the extension loaded in it. */
+	/** The child sent its start request in this run, so the extension loaded in it. */
 	greeted: boolean;
 	waiters: Set<() => void>;
 	run?: Run;
@@ -270,14 +264,6 @@ export default function setupParent(pi: ExtensionAPI) {
 
 	const answer = async (agent: Agent, request: Request, signal: AbortSignal): Promise<Reply> => {
 		if (shuttingDown) return { error: "the main agent's session is ending" };
-		if (request.op === "report") {
-			const message = typeof request.message === "string" ? request.message.trim() : "";
-			if (!message) return { error: "report requires message" };
-			agent.narration = [...agent.narration, `[t${agent.turns + 1}] report: ${oneLine(message, NARRATION_CHARS)}`].slice(-NARRATION_LINES);
-			notify("subagent-report", agent.id, `[report] subagent ${agent.id}: ${message}`, { id: agent.id, status: agent.status });
-			return { ok: true };
-		}
-		if (!team.active) return { error: "this session is not in team mode" };
 		if (request.op === "start") agent.greeted = true;
 		return team.answer(agent.id, request, signal);
 	};
@@ -286,8 +272,8 @@ export default function setupParent(pi: ExtensionAPI) {
 		agent.lastEventAt = Date.now();
 		switch (event.type) {
 			case "agent_start":
-				// A team member asks for its preamble before its first run starts.
-				if (team.active && !agent.greeted) agent.run?.fail("the team extension did not load in the subagent; it needs this extension and its team tool");
+				// A member asks for its preamble before its first run starts.
+				if (!agent.greeted) agent.run?.fail("the team extension did not load in the subagent; it needs this extension and its team tool");
 				return;
 			case "turn_start":
 				agent.tools.clear();
@@ -364,7 +350,6 @@ export default function setupParent(pi: ExtensionAPI) {
 		const run = startRun({
 			cwd: agent.cwd,
 			args: agent.launchArgs,
-			mode: team.active ? "team" : "1",
 			message,
 			owner: {
 				onEvent: (event) => onEvent(agent, event),
@@ -414,49 +399,21 @@ export default function setupParent(pi: ExtensionAPI) {
 		if (owned) throw new Error(`args must not include ${owned}; the extension sets the mode, session, and model (use the model parameter)`);
 		const model = params.model ?? (ctx.model ? `${ctx.model.provider}/${ctx.model.id}:${pi.getThinkingLevel()}` : undefined);
 		const modelArgs = model ? ["--model", model] : [];
-		const base = sessionBase(ctx);
-		if (team.active) {
-			if (!params.name) throw new Error("in team mode, run requires name: the new member's name");
-			if (params.context === "fork") throw new Error("team members start fresh; put the context they need in message");
-			if (removesTool(args, "team")) throw new Error("these args remove the team tool, which every team member needs");
-			const dir = join(base, "subagents", params.name);
-			const launchArgs = ["--session-dir", dir, "--session-id", params.name, ...modelArgs, ...args];
-			team.hire(params.name, cwd, launchArgs);
-			mkdirSync(dir, { recursive: true });
-			return register(params.name, cwd, dir, launchArgs, "running");
-		}
-		if (params.name) throw new Error("name is for team mode; subagents get a random id");
-		let id: string;
-		do id = randomBytes(3).toString("hex");
-		while (agents.has(id));
-		const parentFile = ctx.sessionManager.getSessionFile();
-		const dir = join(base, "subagents", id);
-		let session = ["--session-dir", dir, "--session-id", id];
-		if (params.context === "fork") {
-			const leaf = ctx.sessionManager.getLeafId();
-			if (!parentFile || !existsSync(parentFile) || !leaf) throw new Error("fork needs a saved parent session; this session has no session file yet");
-			mkdirSync(dir, { recursive: true });
-			const forked = SessionManager.open(parentFile, dir, cwd).createBranchedSession(leaf);
-			if (!forked) throw new Error("fork failed: Pi did not write a session file");
-			session = ["--session", forked];
-		}
+		if (!params.name) throw new Error("run requires name: the new member's name");
+		if (removesTool(args, "team")) throw new Error("these args remove the team tool, which every member needs");
+		const dir = join(sessionBase(ctx), "subagents", params.name);
+		const launchArgs = ["--session-dir", dir, "--session-id", params.name, ...modelArgs, ...args];
+		team.hire(params.name, cwd, launchArgs);
 		mkdirSync(dir, { recursive: true });
-		const agent = register(id, cwd, dir, [...session, ...modelArgs, ...args], "running");
-		// Forget the earliest-finished subagents whose processes are gone; running ones stay.
-		const done = [...agents.values()].filter((other) => other.status !== "running" && !other.run).sort((a, b) => a.endedAt - b.endedAt);
-		for (const other of done.slice(0, Math.max(0, agents.size - MAX_AGENTS))) agents.delete(other.id);
-		return agent;
+		return register(params.name, cwd, dir, launchArgs, "running");
 	};
 
 	const parameters = Type.Object({
 		action: StringEnum(["run", "status", "steer", "follow_up", "abort"] as const),
-		id: Type.Optional(Type.String({ description: "Subagent id (all actions except run). A team member's id is its name." })),
+		id: Type.Optional(Type.String({ description: "Subagent id, which is the member's name (all actions except run)." })),
 		message: Type.Optional(Type.String({ description: "Task for run; text for steer and follow_up." })),
-		name: Type.Optional(Type.String({ description: "run, team mode only (required there): the new member's name, 2-24 lowercase letters, digits, or hyphens." })),
-		context: Type.Optional(
-			StringEnum(["fresh", "fork"] as const, {
-				description: "run: fresh (default) starts empty; fork copies this conversation's current branch and tells the subagent it is one. Team mode allows only fresh.",
-			}),
+		name: Type.Optional(
+			Type.String({ description: "run (required): the new member's name, 2-24 lowercase letters, digits, or hyphens, starting with a letter. Each name is used once." }),
 		),
 		model: Type.Optional(Type.String({ description: "run: Pi model pattern, provider/id[:thinking]. Default: your current model and thinking level." })),
 		cwd: Type.Optional(Type.String({ description: "run: working directory. Default: yours." })),
@@ -468,7 +425,6 @@ export default function setupParent(pi: ExtensionAPI) {
 		id?: string;
 		message?: string;
 		name?: string;
-		context?: "fresh" | "fork";
 		model?: string;
 		cwd?: string;
 		args?: string[];
@@ -480,11 +436,11 @@ export default function setupParent(pi: ExtensionAPI) {
 		label: "Subagent",
 		description: [
 			"Delegate work to a Pi subagent: a separate Pi process with its own session that loads tools, extensions, skills, and MCP servers like a normal Pi launch.",
-			"run starts one on message. status reports progress or the result (without id: lists subagents). steer redirects a running subagent after its current tool calls. follow_up sends the next request, restarting a finished subagent in its session. abort stops it.",
-			`run, status, and follow_up wait up to waitMs (default ${DEFAULT_WAIT_MS}, max ${MAX_WAIT_MS}) and return the result if it finishes in time, otherwise its progress while it keeps running. A finished result you have not seen arrives later as a message; do not poll for it. A subagent can also send you short [report] messages while it works; they arrive the same way.`,
-			"In team mode (started by the user with /team), each subagent is a named team member that talks with you and the others through the team tool. run then requires name and starts fresh; team messages never start a member, only run and follow_up do.",
+			"run hires a named team member and starts it on message; its name is its id. status reports progress or the result (without id: lists subagents). steer redirects a running subagent after its current tool calls. follow_up sends the next request, restarting a finished subagent in its session. abort stops it.",
+			`run, status, and follow_up wait up to waitMs (default ${DEFAULT_WAIT_MS}, max ${MAX_WAIT_MS}) and return the result if it finishes in time, otherwise its progress while it keeps running. A finished result you have not seen arrives later as a message; do not poll for it. Team messages for you arrive the same way.`,
+			"Members talk with you and each other through the team tool. A member starts with an empty conversation, so put the context it needs in message. Team messages never start a member; only run and follow_up do.",
 			"args are Pi command-line options: read docs/cli.md in the Pi documentation listed in your system prompt, or run `pi --help`. Session, mode, and model flags are set by this tool.",
-			"Progress showing no active tool and an old last event suggests a stall: abort, then run again. Subagents cannot delegate further and end with this session.",
+			"Progress showing no active tool and an old last event suggests a stall: abort, then resume it with follow_up. Subagents cannot delegate further and end with this session.",
 		].join("\n\n"),
 		parameters,
 		async execute(_toolCallId, params: Params, signal, _onUpdate, ctx) {
@@ -496,13 +452,9 @@ export default function setupParent(pi: ExtensionAPI) {
 			}
 			if (params.action === "run") {
 				const agent = create(params, ctx);
-				launch(agent, params.context === "fork" ? `${FORK_NOTE}\n\nTask:\n${params.message}` : (params.message as string));
+				launch(agent, params.message as string);
 				await waitFor(agent, waitMs, signal, true);
-				const cut =
-					!team.active && removesTool(params.args ?? [], REPORT_TOOL)
-						? `\n\nNote: these args remove ${REPORT_TOOL}, so this subagent can reach you only through its final reply.`
-						: "";
-				return plain(consume(agent) + cut + footer(agent));
+				return plain(consume(agent) + footer(agent));
 			}
 			const agent = agents.get(params.id ?? "");
 			if (!agent) throw new Error(`Unknown subagent id: ${params.id}. Known: ${[...agents.keys()].join(", ") || "none"}`);
@@ -539,27 +491,13 @@ export default function setupParent(pi: ExtensionAPI) {
 			}
 			const deadline = Date.now() + waitMs;
 			// Bounded: a concluded run kills a child that has not exited within seconds.
-			// Only await a real exit: a needless yield would let a parallel run prune this subagent before relaunch.
-			if (!isLive(agent) && agent.run) await agent.run.exited;
+			if (!isLive(agent)) await agent.run?.exited;
 			if (agent.run && isLive(agent)) {
 				const response = await within(prompt(agent.run, "followUp"), Math.max(0, deadline - Date.now()), signal);
 				if (response && !response.success) throw new Error(`follow_up rejected: ${response.error}`);
 			} else launch(agent, params.message);
 			await waitFor(agent, deadline - Date.now(), signal, true);
 			return text(consume(agent));
-		},
-	});
-
-	pi.registerCommand("team", {
-		description: "Switch this session to team mode: named subagents that talk with you and each other",
-		handler: async (_args, ctx) => {
-			const file = ctx.sessionManager.getSessionFile();
-			if (!file) return ctx.ui.notify("Team mode needs a session file, and this session has none.", "error");
-			if (team.active) return ctx.ui.notify("This session is already in team mode.", "info");
-			const base = sessionBase(ctx);
-			if (existsSync(join(base, "subagents"))) return ctx.ui.notify("This session has started subagents, so it stays in normal mode.", "error");
-			team.create(base, ctx.sessionManager.getSessionId());
-			ctx.ui.notify("Team mode is on: subagent run now hires named members, and the team tool is active.", "info");
 		},
 	});
 
