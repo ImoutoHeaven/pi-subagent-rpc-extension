@@ -18,11 +18,12 @@ To try it for one run: `pi -e /path/to/pi-subagent-rpc-extension`. Subagents do 
 
 | Action | Parameters | Behavior |
 |---|---|---|
-| `run` | `name`, `message`, `model`, `cwd`, `args`, `waitMs` | Hires a member named `name` and starts it on `message`. |
+| `run` | `name`, `description`, `message`, `model`, `cwd`, `args`, `waitMs` | Hires a member named `name`, announces it on the board, and starts it on `message`. |
 | `status` | `id`, `waitMs` | Reports progress or the result. Without `id`, lists every member. |
 | `abort` | `id` | Stops the current run. A run that Pi has not started yet, or that does not stop within 10 seconds, is killed; a wake still waiting for the previous process never starts. The member then wakes only for a direct message from the main agent. |
 
 - `name`: required, and the member's id. Names are 2 to 24 lowercase letters, digits, or hyphens, start with a letter, and do not end with a hyphen. `main`, `all`, and `team` are reserved, and a name is used once per team: `run` on an existing member fails, and a direct message gives it more work.
+- `description`: required, the member's lasting role rather than its current task, in one line of at most 100 characters, such as `runs the e2e suite and reports failures`. The team roster shows it, and hiring posts `joined: <name> — <description>` to the board from `main`.
 - `message`: the task. A member starts with an empty conversation, so `message` carries the context it needs.
 - `model`: a Pi model pattern, `provider/id[:thinking]`. Default: the parent's current model and thinking level.
 - `cwd`: the member's working directory, relative to the parent's. Default: the parent's.
@@ -64,7 +65,7 @@ The main agent (`main`) and every member have it.
 | `send` | `body`, `to`, `mentions`, `replyTo` | Posts to the board (no `to`) or sends a direct message to `to`. Returns `#seq` and what happened for each recipient. |
 | `history` | `with`, `query`, `before`, `limit` | Reads the board, or the caller's direct messages with `with`. `query` matches text case-insensitively. Oldest first, at most `limit` messages (default 20, maximum 50) and 16000 characters; `before=<seq>` pages back. |
 | `wait` | `ms` | Returns once a message for the caller is pending, or after `ms` (default 30000, maximum 240000). The messages follow the tool result. |
-| `members` | | Members, their states, and the topic. |
+| `members` | | Members with their states and roles, such as `- tester: running — runs the e2e suite and reports failures`, and the topic. |
 | `topic` | `body` | Sets the topic (main agent only). |
 
 `body` holds up to 4000 characters and `topic` up to 2000. Larger content belongs in files in the shared working tree, with the path in the message.
@@ -77,7 +78,7 @@ Every member sees the whole board and the direct messages it sent or received. A
 | Board post that mentions the recipient or replies to its message, or the main agent's post mentioning `all` | The full text at its next safe point | No |
 | Any other board post by someone else | A line in the board digest | No |
 
-Only the main agent can mention `all`.
+Only the main agent can mention `all`. A join announcement mentions no one, so the other members get it in their board digest.
 
 The board digest is one line about the board posts the recipient has not seen: the latest three, each cut to about 80 characters, and a count of the earlier ones.
 
@@ -87,7 +88,7 @@ The board digest is one line about the board posts the recipient has not seen: t
 
 A member gets the digest at the start of a run and after tool results. The main agent gets it as a `team-notice` after a turn with tool calls and at the start of each run. `history` on the board without `query` or `before` also marks every board post seen. A new member, and every agent of a reopened session, starts with the whole board seen. A digest never counts for `team wait`, never wakes anyone, and never continues a run by itself.
 
-A member reads its messages at safe points: at the start of each run along with a preamble that names the team, after tool results, and when its run would end, in which case the run continues with them.
+A member reads its messages at safe points: at the start of each run along with a preamble that names the team and lists its members, after tool results, and when its run would end, in which case the run continues with them.
 
 A direct message to a stopped member wakes it: the member runs again in its own session, and its messages arrive at the start of that run. Board posts never wake. The `send` result shows each recipient as `main`, `running`, `woken`, or stopped and why:
 

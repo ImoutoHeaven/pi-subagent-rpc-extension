@@ -33,10 +33,13 @@ const MAX_HISTORY_LIMIT = 50;
 const HISTORY_CHARS = 16_000;
 const DIGEST_POSTS = 3;
 const DIGEST_CHARS = 80;
+export const DESCRIPTION_CHARS = 100;
 
 export interface MemberRecord {
 	t: "member";
 	name: string;
+	/** The member's lasting role, in one line. */
+	description: string;
 	cwd: string;
 	args: string[];
 }
@@ -113,9 +116,9 @@ export function createTeam(pi: ExtensionAPI, host: TeamHost) {
 		for (const wake of [...(waiters.get(name) ?? [])]) wake();
 	};
 
-	const append = (record: MemberRecord | MessageRecord | TopicRecord) => {
+	const append = (...records: (MemberRecord | MessageRecord | TopicRecord)[]) => {
 		mkdirSync(dirname(log), { recursive: true });
-		appendFileSync(log, `${JSON.stringify(record)}\n`);
+		appendFileSync(log, records.map((record) => `${JSON.stringify(record)}\n`).join(""));
 	};
 	const details = (message: MessageRecord) => ({ team: teamId, seq: message.seq, from: message.from });
 
@@ -129,7 +132,8 @@ export function createTeam(pi: ExtensionAPI, host: TeamHost) {
 	const roster = () =>
 		[
 			"Members:",
-			...[MAIN, ...members.keys()].map((name) => `- ${name}: ${state(name)}`),
+			`- ${MAIN}: ${state(MAIN)}`,
+			...[...members.values()].map((member) => `- ${member.name}: ${state(member.name)} — ${member.description}`),
 			`Topic: ${topic || "(none)"}`,
 		].join("\n");
 
@@ -341,7 +345,7 @@ export function createTeam(pi: ExtensionAPI, host: TeamHost) {
 					try {
 						record = JSON.parse(line);
 					} catch {}
-					if (record?.t === "member" && typeof record.name === "string" && Array.isArray(record.args)) members.set(record.name, record);
+					if (record?.t === "member" && typeof record.name === "string" && typeof record.description === "string" && Array.isArray(record.args)) members.set(record.name, record);
 					else if (record?.t === "msg" && typeof record.seq === "number" && Array.isArray(record.notify)) messages.push(record);
 					else if (record?.t === "topic" && typeof record.body === "string") topic = record.body;
 					else if (ctx.hasUI) ctx.ui.notify(`team.jsonl line ${i + 1} is not a team record; skipped`, "warning");
@@ -357,15 +361,22 @@ export function createTeam(pi: ExtensionAPI, host: TeamHost) {
 			return [...members.values()];
 		},
 
-		/** Validates a new member's name and records it. */
-		hire(name: string, cwd: string, args: string[]) {
+		/** Validates a new member's name and description, records it, and announces it on the board. */
+		hire(name: string, description: string, cwd: string, args: string[]) {
 			if (!NAME.test(name)) throw new Error(`name must match ${NAME.source}`);
 			if (RESERVED.has(name)) throw new Error(`${name} is reserved`);
 			if (members.has(name)) throw new Error(`${name} is already a member; send it a direct message with team send`);
-			const member: MemberRecord = { t: "member", name, cwd, args };
-			append(member);
+			const role = description.trim();
+			if (!role) throw new Error("run requires description: the member's lasting role, in one line");
+			if (role.length > DESCRIPTION_CHARS || /[\r\n\u2028\u2029]/.test(role)) throw new Error(`description must be one line of at most ${DESCRIPTION_CHARS} characters`);
+			const member: MemberRecord = { t: "member", name, description: role, cwd, args };
+			// A board post that notifies no one; one write with the member record, so a failed write leaves neither.
+			const post: MessageRecord = { t: "msg", seq: lastSeq() + 1, at: Date.now(), from: MAIN, to: BOARD, notify: [], body: `joined: ${name} — ${role}` };
+			append(member, post);
 			members.set(name, member);
-			boardSeen.set(name, lastSeq());
+			messages.push(post);
+			// After the announcement, so the new member starts with its own join post seen.
+			boardSeen.set(name, post.seq);
 		},
 
 		/** The main agent's board digest as a notice entry, or undefined when there is nothing new. */

@@ -10,7 +10,7 @@ import type { BoundaryState, ExtensionAPI, ExtensionContext } from "@earendil-wo
 import { Type } from "typebox";
 import { BODY_CHARS, DEFAULT_WAIT_MS, MAX_WAIT_MS, type Reply, type Request } from "./protocol.ts";
 import { type Run, type RunStatus, startRun } from "./rpc.ts";
-import { createTeam } from "./team.ts";
+import { createTeam, DESCRIPTION_CHARS } from "./team.ts";
 
 const MAX_RESULT_CHARS = 16_000;
 const NARRATION_LINES = 3;
@@ -488,7 +488,7 @@ export default function setupParent(pi: ExtensionAPI) {
 		if (removesTool(args, "team")) throw new Error("these args remove the team tool, which every member needs");
 		const dir = join(sessionBase(ctx), "subagents", params.name);
 		const launchArgs = ["--session-dir", dir, "--session-id", params.name, ...modelArgs, ...args];
-		team.hire(params.name, cwd, launchArgs);
+		team.hire(params.name, params.description ?? "", cwd, launchArgs);
 		mkdirSync(dir, { recursive: true });
 		return register(params.name, cwd, dir, launchArgs, "running");
 	};
@@ -500,6 +500,11 @@ export default function setupParent(pi: ExtensionAPI) {
 		name: Type.Optional(
 			Type.String({ description: "run (required): the new member's name, 2-24 lowercase letters, digits, or hyphens, starting with a letter. Each name is used once." }),
 		),
+		description: Type.Optional(
+			Type.String({
+				description: `run (required): the member's lasting role in one line of up to ${DESCRIPTION_CHARS} characters, not its current task; for example "runs the e2e suite and reports failures".`,
+			}),
+		),
 		model: Type.Optional(Type.String({ description: "run: Pi model pattern, provider/id[:thinking]. Default: your current model and thinking level." })),
 		cwd: Type.Optional(Type.String({ description: "run: working directory. Default: yours." })),
 		args: Type.Optional(Type.Array(Type.String(), { description: "run: extra Pi CLI options, for example tools, extensions, skills, or MCP." })),
@@ -510,6 +515,7 @@ export default function setupParent(pi: ExtensionAPI) {
 		id?: string;
 		message?: string;
 		name?: string;
+		description?: string;
 		model?: string;
 		cwd?: string;
 		args?: string[];
@@ -521,7 +527,7 @@ export default function setupParent(pi: ExtensionAPI) {
 		label: "Subagent",
 		description: [
 			"Delegate work to a Pi subagent: a separate Pi process with its own session that loads tools, extensions, skills, and MCP servers like a normal Pi launch.",
-			"run hires a named team member and starts it on message; its name is its id. status reports progress or the result (without id: lists subagents). abort stops the current run; a member you aborted wakes only for your direct message.",
+			"run hires a named team member, announces it on the board, and starts it on message; its name is its id, and its description is the role the team roster shows. status reports progress or the result (without id: lists subagents). abort stops the current run; a member you aborted wakes only for your direct message.",
 			`run and status wait up to waitMs (default ${DEFAULT_WAIT_MS}, max ${MAX_WAIT_MS}) and return the result if it finishes in time, otherwise its progress while it keeps running. A finished result you have not seen arrives later as a message; do not poll for it. Team messages for you arrive the same way.`,
 			"Members talk with you and each other through the team tool. A member starts with an empty conversation, so put the context it needs in message. A direct team message to a stopped member wakes it in its own session. A run woken by a member's message sends its final reply to that member, or to you when that member has stopped.",
 			"args are Pi command-line options: read docs/cli.md in the Pi documentation listed in your system prompt, or run `pi --help`. Session, mode, and model flags are set by this tool.",
