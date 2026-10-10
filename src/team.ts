@@ -1,6 +1,6 @@
 /**
  * Team state: the log, routing, history, the main agent's `team` tool, and answers to members' requests.
- * It has no path to a process: it only asks whether a member is running and hands messages for the main agent to the host.
+ * It has no path to a process: it asks the host about members' runs, wakes members through it, and hands it messages for the main agent.
  */
 import { appendFileSync, existsSync, mkdirSync, readFileSync } from "node:fs";
 import { dirname, join } from "node:path";
@@ -22,6 +22,8 @@ import {
 
 const MAIN = "main";
 const BOARD = "team";
+/** Custom message type of the one-line notices that tell the main agent about a message no one could wake for. */
+const TEAM_NOTICE = "team-notice";
 const NAME = /^[a-z][a-z0-9-]{0,22}[a-z0-9]$/;
 // `team` marks the board in the log's `to` field.
 const RESERVED = new Set([MAIN, "all", BOARD]);
@@ -46,6 +48,8 @@ interface MessageRecord {
 	mentions?: string[];
 	notify: string[];
 	body: string;
+	/** The sender's run was started by a member's message, so the message cannot wake anyone. */
+	hop1?: true;
 }
 interface TopicRecord {
 	t: "topic";
@@ -55,8 +59,16 @@ interface TopicRecord {
 
 export interface TeamHost {
 	isRunning(name: string): boolean;
+	/** Who started the member's current or last run: main, or the member whose message woke it. Main itself: main. */
+	startedBy(name: string): string;
+	/** The main agent aborted the member, so only its direct message wakes it. */
+	locked(name: string): boolean;
+	/** Starts a stopped member's next run for a direct message from `by`. */
+	wake(name: string, by: string): void;
 	/** Delivers a message to the main agent. */
 	notify(customType: string, from: string, text: string, details: object): void;
+	/** Tells the main agent something without starting a turn. */
+	notice(customType: string, text: string, details: object): void;
 	/** Resolves with the number of messages pending for the main agent once there is one, or after `ms`. */
 	waitForMain(ms: number, signal?: AbortSignal): Promise<number>;
 }
@@ -85,6 +97,17 @@ export function createTeam(pi: ExtensionAPI, host: TeamHost) {
 	let topic = "";
 	/** Held `wait` requests by member. */
 	const waiters = new Map<string, Set<() => void>>();
+	// shortcut: inbox cursors and sender notices live in memory; reopening a session forgets them, and every member is stopped then anyway.
+	/** Per member, the highest seq its inbox returned. */
+	const seen = new Map<string, number>();
+	/** Per member, the seq of the message that woke its current or last run; it never wakes the member again. */
+	const wokeBy = new Map<string, number>();
+	/** Notices for running senders about messages their recipient never read; not log records. */
+	const notices = new Map<string, string[]>();
+	const lastSeq = () => messages.at(-1)?.seq ?? 0;
+	const ping = (name: string) => {
+		for (const wake of [...(waiters.get(name) ?? [])]) wake();
+	};
 
 	const append = (record: MemberRecord | MessageRecord | TopicRecord) => {
 		mkdirSync(dirname(log), { recursive: true });
@@ -107,16 +130,55 @@ export function createTeam(pi: ExtensionAPI, host: TeamHost) {
 		].join("\n");
 
 	const due = (name: string, after: number) => messages.filter((message) => message.seq > after && message.notify.includes(name));
+	const pendingCount = (name: string, after: number) => due(name, after).length + (notices.get(name)?.length ?? 0);
 
 	const inbox = (name: string, after: number): Delivery[] => {
 		const pending = due(name, after);
 		const shown = pending.slice(0, INBOX_SIZE);
 		const more = pending.length - shown.length;
-		return shown.map((message, i) => ({
-			seq: message.seq,
-			from: message.from,
-			text: render(message, name) + (more && i === shown.length - 1 ? `(${more} more team messages for you are pending; they arrive after your next tool call.)\n\n` : ""),
-		}));
+		if (shown.length) seen.set(name, Math.max(seen.get(name) ?? 0, shown[shown.length - 1].seq));
+		const notes = notices.get(name) ?? [];
+		notices.delete(name);
+		return [
+			...shown.map((message, i) => ({
+				seq: message.seq,
+				from: message.from,
+				text:
+					render(message, name) +
+					(more && i === shown.length - 1 ? `(${more} more team messages for you are pending; they arrive after your next tool results or before your run ends.)\n\n` : ""),
+			})),
+			...notes.map((text) => ({ seq: 0, from: BOARD, text })),
+		];
+	};
+
+	const wake = (name: string, message: MessageRecord) => {
+		wokeBy.set(name, message.seq);
+		host.wake(name, message.from);
+	};
+
+	type Block = "hop" | "abort";
+	const tellMain = (message: MessageRecord, name: string, block: Block) => {
+		const why = block === "hop" ? `${name} is stopped, and ${message.from}'s run cannot wake it` : `you stopped ${name} with abort, so ${message.from}'s message cannot wake it`;
+		host.notice(
+			TEAM_NOTICE,
+			`[team] #${message.seq} ${message.from} → ${name} is waiting in ${name}'s inbox: ${why}. A direct message from you would wake ${name}, if and when you think it should run.`,
+			{ team: teamId },
+		);
+	};
+
+	/** Routes `message` to one recipient; returns the state its sender sees. */
+	const route = (message: MessageRecord, name: string) => {
+		if (name === MAIN) return MAIN;
+		if (host.isRunning(name)) return `${name} (running)`;
+		if (message.to === BOARD) return `${name} (stopped; board posts do not wake)`;
+		const block: Block | undefined = message.hop1 ? "hop" : message.from !== MAIN && host.locked(name) ? "abort" : undefined;
+		if (!block) {
+			wake(name, message);
+			return `${name} (woken)`;
+		}
+		tellMain(message, name, block);
+		const why = block === "hop" ? `your run was started by ${host.startedBy(message.from)}'s message, so it cannot start others` : "the main agent stopped it";
+		return `${name} (stopped, not woken: ${why}; the main agent was told)`;
 	};
 
 	const preamble = (name: string) =>
@@ -162,18 +224,14 @@ export function createTeam(pi: ExtensionAPI, host: TeamHost) {
 			...(params.mentions?.length ? { mentions: params.mentions } : {}),
 			notify,
 			body,
+			...(host.startedBy(from) !== MAIN ? { hop1: true as const } : {}),
 		};
 		append(message);
 		messages.push(message);
-		for (const name of notify) for (const wake of [...(waiters.get(name) ?? [])]) wake();
+		for (const name of notify) ping(name);
 		if (notify.includes(MAIN)) host.notify(TEAM_MESSAGE, from, render(message, MAIN), details(message));
 		if (!notify.length) return `Posted #${message.seq}. It notified nobody; members see it in history.`;
-		const stopped = notify.filter((name) => state(name) === "stopped");
-		const resume =
-			from === MAIN
-				? "A stopped member sees it when you resume it with subagent follow_up."
-				: "A stopped member sees it when the main agent resumes it; ask the main agent if it needs to act.";
-		return [`Sent #${message.seq} to ${notify.map((name) => `${name} (${state(name)})`).join(", ")}.`, stopped.length ? resume : ""].filter(Boolean).join(" ");
+		return `Sent #${message.seq} to ${notify.map((name) => route(message, name)).join(", ")}.`;
 	};
 
 	const history = (caller: string, params: TeamParams) => {
@@ -217,14 +275,14 @@ export function createTeam(pi: ExtensionAPI, host: TeamHost) {
 	/** Holds a member's `wait` until a message for it is pending, `ms` pass, or its run ends. */
 	const wait = (name: string, after: number, ms: number, signal: AbortSignal) =>
 		new Promise<number>((done) => {
-			if (due(name, after).length || ms <= 0 || signal.aborted) return done(due(name, after).length);
+			if (pendingCount(name, after) || ms <= 0 || signal.aborted) return done(pendingCount(name, after));
 			const held = waiters.get(name) ?? new Set();
 			waiters.set(name, held);
 			const end = () => {
 				clearTimeout(timer);
 				signal.removeEventListener("abort", end);
 				held.delete(end);
-				done(due(name, after).length);
+				done(pendingCount(name, after));
 			};
 			const timer = setTimeout(end, ms);
 			signal.addEventListener("abort", end, { once: true });
@@ -283,10 +341,40 @@ export function createTeam(pi: ExtensionAPI, host: TeamHost) {
 		hire(name: string, cwd: string, args: string[]) {
 			if (!NAME.test(name)) throw new Error(`name must match ${NAME.source}`);
 			if (RESERVED.has(name)) throw new Error(`${name} is reserved`);
-			if (members.has(name)) throw new Error(`${name} is already a member; resume it with follow_up`);
+			if (members.has(name)) throw new Error(`${name} is already a member; send it a direct message with team send`);
 			const member: MemberRecord = { t: "member", name, cwd, args };
 			append(member);
 			members.set(name, member);
+		},
+
+		/** Sends a woken member's final reply to the running member that woke it; returns the message's seq. */
+		reply(from: string, to: string, body: string) {
+			send(from, { action: "send", to, body });
+			return lastSeq();
+		},
+
+		/**
+		 * Once a member's run is over, routes again the direct messages that reached it after its last inbox pull:
+		 * one from a sender that can wake it starts its next run; the others wait, and their senders and the main agent are told.
+		 */
+		afterRun(name: string) {
+			const unread = messages.filter((message) => message.to === name && message.seq > (seen.get(name) ?? 0));
+			if (!unread.length) return;
+			// A member the main agent aborted stays stopped; only the main agent hears about its unread messages.
+			const locked = host.locked(name);
+			// The waking message and those before it never wake the member again; their senders learn the outcome from its result.
+			const waker = locked ? undefined : unread.find((message) => !message.hop1 && message.seq > (wokeBy.get(name) ?? 0));
+			if (waker) return wake(name, waker);
+			for (const message of unread) {
+				if (message.from === MAIN || !(locked || message.hop1)) continue;
+				tellMain(message, name, locked ? "abort" : "hop");
+				if (locked || !host.isRunning(message.from)) continue;
+				notices.set(message.from, [
+					...(notices.get(message.from) ?? []),
+					`[team] #${message.seq} to ${name} was not delivered: ${name} stopped before reading it, and your run cannot wake it. It waits in ${name}'s inbox; the main agent was told.\n\n`,
+				]);
+				ping(message.from);
+			}
 		},
 
 		/** Answers a member's request. */

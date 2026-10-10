@@ -8,15 +8,17 @@ import { join, resolve } from "node:path";
 import { StringEnum } from "@earendil-works/pi-ai";
 import type { BoundaryState, ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
-import { DEFAULT_WAIT_MS, MAX_WAIT_MS, type Reply, type Request } from "./protocol.ts";
-import { type Run, type RunStatus, startRun, within } from "./rpc.ts";
+import { BODY_CHARS, DEFAULT_WAIT_MS, MAX_WAIT_MS, type Reply, type Request } from "./protocol.ts";
+import { type Run, type RunStatus, startRun } from "./rpc.ts";
 import { createTeam } from "./team.ts";
 
 const MAX_RESULT_CHARS = 16_000;
 const NARRATION_LINES = 3;
 const NARRATION_CHARS = 300;
+const NOTICES = 3;
 const FOOTER_AGENTS = 3;
 const STALE_MS = 60_000;
+const MAIN = "main";
 // The extension owns the child's process mode, session, and model selection.
 const OWNED_FLAGS = ["--mode", "--print", "-p", "--no-session", "--session", "--session-id", "--session-dir", "--continue", "-c", "--resume", "-r", "--fork", "--export", "--model"];
 
@@ -36,18 +38,25 @@ interface Agent {
 	phase: string;
 	tools: Map<string, { name: string; since: number }>;
 	narration: string[];
-	/** Rejected steer and follow_up requests, which may arrive after the tool call returned. */
-	notes: string[];
+	/** The last ctx.ui.notify texts of the run's extensions, such as why a watchdog stopped it. */
+	notices: string[];
 	lastText: string;
 	/** provider/id the child actually answered with; Pi matches --model fuzzily. */
 	model: string;
 	error: string | null;
-	/** The final result reached the parent: as a tool result, or as a sent message. */
-	delivered: boolean;
-	/** The final result went out as a message, so tool results show only its header. */
-	notified: boolean;
+	/** Where the final result went, completing "Its result …"; null until it went somewhere. */
+	delivered: string | null;
 	/** The child sent its start request in this run, so the extension loaded in it. */
 	greeted: boolean;
+	/** main, or the member whose direct message started this run; a run started by a member cannot wake others. */
+	startedBy: string;
+	/** Why the final result of a run a member started reached the main agent instead. */
+	woken: string;
+	// shortcut: the abort lock lives in memory; reopening a session forgets it, and every member is stopped then anyway.
+	/** The main agent aborted this member, so only its direct message wakes it. */
+	locked: boolean;
+	/** Identifies a launch that waits for the previous run's process to exit; null once it started or was cancelled. */
+	launching: object | null;
 	waiters: Set<() => void>;
 	run?: Run;
 }
@@ -57,6 +66,8 @@ interface Pending {
 	agentId: string;
 	content: string;
 	details: object;
+	/** Information only: it joins the session but never starts a turn. */
+	quiet: boolean;
 }
 
 const oneLine = (text: string, limit: number) => {
@@ -113,7 +124,7 @@ export default function setupParent(pi: ExtensionAPI) {
 	const agents = new Map<string, Agent>();
 	let shuttingDown = false;
 	let parent: ExtensionContext | undefined;
-	/** The user stopped the main agent with Esc; deliveries wait for the next prompt instead of starting a turn. */
+	/** The main agent's last run was aborted, as with Esc; deliveries start no turn until a run starts again. */
 	let suspended = false;
 	/**
 	 * Messages for a busy parent, in arrival order. They join its session together at the next turn boundary,
@@ -122,8 +133,8 @@ export default function setupParent(pi: ExtensionAPI) {
 	let pending: Pending[] = [];
 	/** Ends every tool wait, so a new message does not sit behind a long wait. */
 	const waits = new Set<() => void>();
-
-	const isLive = (agent: Agent) => Boolean(agent.run && !agent.run.finished);
+	/** Pending messages that wake the parent. */
+	const loud = () => pending.filter((message) => !message.quiet).length;
 
 	const header = (agent: Agent) => {
 		const now = Date.now();
@@ -136,16 +147,18 @@ export default function setupParent(pi: ExtensionAPI) {
 		return `[running] ${id} · turn ${agent.turns + 1} · ${activity} · last event ${duration(now - agent.lastEventAt)} ago · ${duration(now - agent.startedAt)}`;
 	};
 
+	const noticeLine = (agent: Agent) => (agent.notices.length ? `Notices: ${agent.notices.join(" | ")}` : "");
+
 	/** The model-facing report. */
 	const report = (agent: Agent) => {
 		if (agent.status === "running") {
-			return [header(agent), ...agent.narration, ...agent.notes, "Still running: wait with status, steer, or abort."].join("\n");
+			return [header(agent), ...agent.narration, noticeLine(agent), "Still running: wait with status, or abort."].filter(Boolean).join("\n");
 		}
 		const text =
 			agent.lastText.length > MAX_RESULT_CHARS
 				? `${agent.lastText.slice(0, MAX_RESULT_CHARS)}\n…[truncated; full reply: ${join(agent.dir, "final.md")}]`
 				: agent.lastText;
-		return [header(agent), agent.error, agent.notes.join("\n"), text].filter(Boolean).join("\n\n");
+		return [header(agent), agent.woken, agent.error, noticeLine(agent), text].filter(Boolean).join("\n\n");
 	};
 
 	/**
@@ -154,14 +167,11 @@ export default function setupParent(pi: ExtensionAPI) {
 	 * behind that subagent's own, keeping it the last word.
 	 */
 	const consume = (agent: Agent) => {
-		if (agent.status === "running") return report(agent) + (pending.length ? "\nReturned early: subagent messages follow this result." : "");
+		if (agent.status === "running") return report(agent) + (loud() ? "\nReturned early: subagent messages follow this result." : "");
 		if (agent.status === "stopped") return header(agent);
 		if (pending.some((message) => message.agentId === agent.id)) deliver(agent);
-		if (agent.delivered) {
-			const where = agent.notified ? "was sent to you as a subagent-result message" : "was returned to you earlier";
-			return `${header(agent)}\n\nIts result ${where}. Full reply: ${join(agent.dir, "final.md")}`;
-		}
-		agent.delivered = true;
+		if (agent.delivered) return `${header(agent)}\n\nIts result ${agent.delivered}. Full reply: ${join(agent.dir, "final.md")}`;
+		agent.delivered = "was returned to you earlier";
 		return report(agent);
 	};
 
@@ -178,18 +188,19 @@ export default function setupParent(pi: ExtensionAPI) {
 		return `\n\n(Background: ${shown.join(", ")}${more}.)`;
 	};
 
-	// An idle parent starts a turn with the message; a busy one gets it at its next turn boundary.
-	const notify = (customType: string, agentId: string, text: string, details: object) => {
+	// An idle parent starts a turn with the message; a busy one gets it at its next turn boundary. A quiet message never starts a turn.
+	const notify = (customType: string, agentId: string, text: string, details: object, quiet = false) => {
 		if (shuttingDown) return;
 		// Providers join consecutive messages into one text; the blank line keeps them apart.
 		const content = `${text.trimEnd()}\n\n`;
 		const label = `subagent ${agentId}: ${customType.replace(/^subagent-/, "").replace("-", " ")}`;
 		if (!parent || parent.isIdle()) {
-			pi.sendMessage({ customType, content, display: true, details }, { triggerTurn: !suspended });
-			if (suspended && parent?.hasUI) parent.ui.notify(`${label} added; the main agent sees it at your next prompt`, "info");
+			pi.sendMessage({ customType, content, display: true, details }, { triggerTurn: !suspended && !quiet });
+			if (suspended && !quiet && parent?.hasUI) parent.ui.notify(`${label} added; the main agent sees it when it runs again`, "info");
 			return;
 		}
-		pending.push({ customType, agentId, content, details });
+		pending.push({ customType, agentId, content, details, quiet });
+		if (quiet) return;
 		for (const wake of [...waits]) wake();
 		// Visible to the user at once, while the parent may still be inside a long tool call.
 		if (parent.hasUI) parent.ui.notify(`${label} waiting for the main agent`, "info");
@@ -206,8 +217,9 @@ export default function setupParent(pi: ExtensionAPI) {
 	// Returned entries replace the drafts earlier handlers proposed, so they are kept in front.
 	const atBoundary = (event: BoundaryState) => {
 		if (!pending.length || event.outcome === "error") return;
+		const wakes = loud() > 0;
 		const entries = takePending().map(({ customType, content, details }) => ({ type: "custom_message" as const, customType, content, display: true, details }));
-		return { entries: [...event.entries, ...entries], continue: event.continue || event.outcome !== "aborted" };
+		return { entries: [...event.entries, ...entries], continue: event.continue || (wakes && event.outcome !== "aborted") };
 	};
 	pi.on("turn_end", atBoundary);
 	pi.on("agent_before_settle", atBoundary);
@@ -216,20 +228,21 @@ export default function setupParent(pi: ExtensionAPI) {
 	// One wake for the whole batch: each triggering message would start its own run, which Esc cannot cancel.
 	pi.on("agent_settled", (event) => {
 		if (event.aborted) suspended = true;
+		const wakes = !event.aborted && loud() > 0;
 		const taken = takePending();
 		taken.forEach(({ customType, content, details }, i) => {
-			pi.sendMessage({ customType, content, display: true, details }, { triggerTurn: !event.aborted && i === taken.length - 1 });
+			pi.sendMessage({ customType, content, display: true, details }, { triggerTurn: wakes && i === taken.length - 1 });
 		});
 	});
 
-	pi.on("input", (event) => {
-		if (event.source !== "extension") suspended = false;
+	// Whoever starts the next run, the user or an extension that continues after its own abort, ends the suspension.
+	pi.on("agent_start", () => {
+		suspended = false;
 	});
 
 	const deliver = (agent: Agent) => {
 		if (agent.delivered || shuttingDown) return;
-		agent.delivered = true;
-		agent.notified = true;
+		agent.delivered = "was sent to you as a subagent-result message";
 		notify("subagent-result", agent.id, report(agent), { id: agent.id, status: agent.status });
 	};
 
@@ -239,7 +252,7 @@ export default function setupParent(pi: ExtensionAPI) {
 	 */
 	const waitFor = (agent: Agent | undefined, ms: number, signal?: AbortSignal, forTool = false) =>
 		new Promise<void>((done) => {
-			if ((agent && agent.status !== "running") || ms <= 0 || signal?.aborted || (forTool && pending.length)) return done();
+			if ((agent && agent.status !== "running") || ms <= 0 || signal?.aborted || (forTool && loud())) return done();
 			const end = () => {
 				clearTimeout(timer);
 				signal?.removeEventListener("abort", end);
@@ -255,10 +268,23 @@ export default function setupParent(pi: ExtensionAPI) {
 
 	const team = createTeam(pi, {
 		isRunning: (name) => agents.get(name)?.status === "running",
+		startedBy: (name) => agents.get(name)?.startedBy ?? MAIN,
+		locked: (name) => Boolean(agents.get(name)?.locked),
+		wake: (name, by) => {
+			const agent = agents.get(name) as Agent;
+			if (by === MAIN) agent.locked = false;
+			const note =
+				by === MAIN
+					? "The main agent sent you a team message. Act on your team messages."
+					: `${by} sent you a team message. Act on your team messages; your final reply is sent to ${by}.`;
+			launch(agent, note, by);
+		},
 		notify,
+		// Information for the main agent's judgment, so it never starts a turn.
+		notice: (customType, text, details) => notify(customType, "team", text, details, true),
 		waitForMain: async (ms, signal) => {
 			await waitFor(undefined, ms, signal, true);
-			return pending.length;
+			return loud();
 		},
 	});
 
@@ -313,6 +339,9 @@ export default function setupParent(pi: ExtensionAPI) {
 			case "compaction_start":
 				agent.phase = "compacting";
 				return;
+			case "extension_ui_request":
+				if (event.method === "notify") agent.notices = [...agent.notices, oneLine(String(event.message ?? ""), NARRATION_CHARS)].slice(-NOTICES);
+				return;
 		}
 	};
 
@@ -324,43 +353,75 @@ export default function setupParent(pi: ExtensionAPI) {
 		} catch {
 			// The report still carries the reply.
 		}
+		const starter = agent.startedBy;
+		// A finished run started by a member reaches the main agent only when that member had stopped.
+		if (starter !== MAIN) agent.woken = `(woken by ${starter}; ${starter} had stopped)`;
+		if (starter !== MAIN && agents.get(starter)?.status === "running" && !shuttingDown) {
+			const path = join(agent.dir, "final.md");
+			const reply = [agent.error, noticeLine(agent), agent.lastText].filter(Boolean).join("\n\n");
+			const intro = `Final reply of ${agent.id} (${status}); full text: ${path}\n\n`;
+			const room = BODY_CHARS - intro.length;
+			try {
+				const seq = team.reply(agent.id, starter, intro + (reply.length > room ? `${reply.slice(0, room - 1)}…` : reply));
+				agent.delivered = `was sent to ${starter} as team message #${seq}`;
+			} catch (error) {
+				// Such as a failed team log write; the main agent gets the result instead.
+				agent.woken = `(woken by ${starter}; sending the final reply to ${starter} failed: ${error instanceof Error ? error.message : String(error)})`;
+			}
+		}
 		const waiting = agent.waiters.size > 0;
 		for (const wake of [...agent.waiters]) wake();
 		if (!waiting) deliver(agent);
 	};
 
-	const launch = (agent: Agent, message: string) => {
+	/** Starts a run on `message` once the previous run's process has exited; the member counts as running at once. */
+	const launch = (agent: Agent, message: string, startedBy: string) => {
 		if (shuttingDown) throw new Error("the session is ending; no new subagent processes start");
+		// A finished result no one took yet, such as one an abort call still waits to return, would be lost to the reset.
+		if (agent.status !== "running" && agent.status !== "stopped") deliver(agent);
 		Object.assign(agent, {
 			status: "running",
+			startedBy,
 			startedAt: Date.now(),
 			lastEventAt: Date.now(),
 			turns: 0,
 			phase: "starting",
 			narration: [],
-			notes: [],
+			notices: [],
 			lastText: "",
 			model: "",
 			error: null,
-			delivered: false,
-			notified: false,
+			delivered: null,
 			greeted: false,
+			woken: "",
 		});
 		agent.tools.clear();
-		const run = startRun({
-			cwd: agent.cwd,
-			args: agent.launchArgs,
-			message,
-			owner: {
-				onEvent: (event) => onEvent(agent, event),
-				onRequest: (request, signal) => answer(agent, request, signal),
-				onEnd: (status, error) => onEnd(agent, status, error),
-			},
-		});
-		agent.run = run;
-		void run.exited.then(() => {
-			if (agent.run === run) agent.run = undefined;
-		});
+		const launching = {};
+		agent.launching = launching;
+		const start = () => {
+			// abort cancelled this launch, or a later one replaced it.
+			if (agent.launching !== launching) return;
+			agent.launching = null;
+			if (shuttingDown) return void (agent.status = "stopped");
+			const run = startRun({
+				cwd: agent.cwd,
+				args: agent.launchArgs,
+				message,
+				owner: {
+					onEvent: (event) => onEvent(agent, event),
+					onRequest: (request, signal) => answer(agent, request, signal),
+					onEnd: (status, error) => onEnd(agent, status, error),
+				},
+			});
+			agent.run = run;
+			// After exit, so a tool call waiting on this run has taken its result before a wake starts the next run.
+			void run.exited.then(() => {
+				if (agent.run === run) agent.run = undefined;
+				if (agent.status !== "running" && !shuttingDown) team.afterRun(agent.id);
+			});
+		};
+		if (agent.run) void agent.run.exited.then(start);
+		else start();
 	};
 
 	const register = (id: string, cwd: string, dir: string, launchArgs: string[], status: Status) => {
@@ -377,13 +438,16 @@ export default function setupParent(pi: ExtensionAPI) {
 			phase: "",
 			tools: new Map(),
 			narration: [],
-			notes: [],
+			notices: [],
 			lastText: "",
 			model: "",
 			error: null,
-			delivered: false,
-			notified: false,
+			delivered: null,
 			greeted: false,
+			startedBy: MAIN,
+			woken: "",
+			locked: false,
+			launching: null,
 			waiters: new Set(),
 		};
 		agents.set(id, agent);
@@ -409,19 +473,19 @@ export default function setupParent(pi: ExtensionAPI) {
 	};
 
 	const parameters = Type.Object({
-		action: StringEnum(["run", "status", "steer", "follow_up", "abort"] as const),
-		id: Type.Optional(Type.String({ description: "Subagent id, which is the member's name (all actions except run)." })),
-		message: Type.Optional(Type.String({ description: "Task for run; text for steer and follow_up." })),
+		action: StringEnum(["run", "status", "abort"] as const),
+		id: Type.Optional(Type.String({ description: "status, abort: the subagent id, which is the member's name." })),
+		message: Type.Optional(Type.String({ description: "run: the task." })),
 		name: Type.Optional(
 			Type.String({ description: "run (required): the new member's name, 2-24 lowercase letters, digits, or hyphens, starting with a letter. Each name is used once." }),
 		),
 		model: Type.Optional(Type.String({ description: "run: Pi model pattern, provider/id[:thinking]. Default: your current model and thinking level." })),
 		cwd: Type.Optional(Type.String({ description: "run: working directory. Default: yours." })),
 		args: Type.Optional(Type.Array(Type.String(), { description: "run: extra Pi CLI options, for example tools, extensions, skills, or MCP." })),
-		waitMs: Type.Optional(Type.Integer({ minimum: 0, maximum: MAX_WAIT_MS, description: `run, status, follow_up: wait up to this long. Default ${DEFAULT_WAIT_MS}.` })),
+		waitMs: Type.Optional(Type.Integer({ minimum: 0, maximum: MAX_WAIT_MS, description: `run, status: wait up to this long. Default ${DEFAULT_WAIT_MS}.` })),
 	});
 	type Params = {
-		action: "run" | "status" | "steer" | "follow_up" | "abort";
+		action: "run" | "status" | "abort";
 		id?: string;
 		message?: string;
 		name?: string;
@@ -436,11 +500,11 @@ export default function setupParent(pi: ExtensionAPI) {
 		label: "Subagent",
 		description: [
 			"Delegate work to a Pi subagent: a separate Pi process with its own session that loads tools, extensions, skills, and MCP servers like a normal Pi launch.",
-			"run hires a named team member and starts it on message; its name is its id. status reports progress or the result (without id: lists subagents). steer redirects a running subagent after its current tool calls. follow_up sends the next request, restarting a finished subagent in its session. abort stops it.",
-			`run, status, and follow_up wait up to waitMs (default ${DEFAULT_WAIT_MS}, max ${MAX_WAIT_MS}) and return the result if it finishes in time, otherwise its progress while it keeps running. A finished result you have not seen arrives later as a message; do not poll for it. Team messages for you arrive the same way.`,
-			"Members talk with you and each other through the team tool. A member starts with an empty conversation, so put the context it needs in message. Team messages never start a member; only run and follow_up do.",
+			"run hires a named team member and starts it on message; its name is its id. status reports progress or the result (without id: lists subagents). abort stops the current run; a member you aborted wakes only for your direct message.",
+			`run and status wait up to waitMs (default ${DEFAULT_WAIT_MS}, max ${MAX_WAIT_MS}) and return the result if it finishes in time, otherwise its progress while it keeps running. A finished result you have not seen arrives later as a message; do not poll for it. Team messages for you arrive the same way.`,
+			"Members talk with you and each other through the team tool. A member starts with an empty conversation, so put the context it needs in message. A direct team message to a stopped member wakes it in its own session. A run woken by a member's message sends its final reply to that member, or to you when that member has stopped.",
 			"args are Pi command-line options: read docs/cli.md in the Pi documentation listed in your system prompt, or run `pi --help`. Session, mode, and model flags are set by this tool.",
-			"Progress showing no active tool and an old last event suggests a stall: abort, then resume it with follow_up. Subagents cannot delegate further and end with this session.",
+			"Progress showing no active tool and an old last event suggests a stall. Subagents cannot delegate further and end with this session.",
 		].join("\n\n"),
 		parameters,
 		async execute(_toolCallId, params: Params, signal, _onUpdate, ctx) {
@@ -452,7 +516,7 @@ export default function setupParent(pi: ExtensionAPI) {
 			}
 			if (params.action === "run") {
 				const agent = create(params, ctx);
-				launch(agent, params.message as string);
+				launch(agent, params.message as string, MAIN);
 				await waitFor(agent, waitMs, signal, true);
 				return plain(consume(agent) + footer(agent));
 			}
@@ -463,40 +527,19 @@ export default function setupParent(pi: ExtensionAPI) {
 				await waitFor(agent, waitMs, signal, true);
 				return text(consume(agent));
 			}
-			if (params.action === "abort") {
-				// This call returns the final state, so hold a waiter to keep it from also being delivered.
-				const hold = () => {};
-				agent.waiters.add(hold);
-				try {
-					await agent.run?.stop(signal);
-				} finally {
-					agent.waiters.delete(hold);
-				}
-				return text(consume(agent));
+			// This call returns the final state, so hold a waiter to keep it from also being delivered.
+			const hold = () => {};
+			agent.waiters.add(hold);
+			try {
+				if (agent.status === "running") agent.locked = true;
+				if (agent.launching) {
+					// A wake still waiting for the previous process to exit: it never starts.
+					agent.launching = null;
+					onEnd(agent, "aborted", null);
+				} else await agent.run?.stop(signal);
+			} finally {
+				agent.waiters.delete(hold);
 			}
-			if (!params.message) throw new Error(`${params.action} requires message`);
-			const prompt = (run: Run, streamingBehavior: "steer" | "followUp") => {
-				const sent = run.prompt(params.message as string, streamingBehavior);
-				void sent.then((response) => {
-					if (!response.success) agent.notes.push(`${params.action} rejected: ${response.error}`);
-				});
-				return sent;
-			};
-			if (params.action === "steer") {
-				if (!agent.run || !isLive(agent)) throw new Error(`${agent.id} is not running (${agent.status}); use follow_up`);
-				const response = await within(prompt(agent.run, "steer"), DEFAULT_WAIT_MS, signal);
-				if (!response) return text(`steer queued until ${agent.id} accepts input`);
-				if (!response.success) throw new Error(`steer rejected: ${response.error}`);
-				return text(`steer ${response.disposition ?? "sent"}`);
-			}
-			const deadline = Date.now() + waitMs;
-			// Bounded: a concluded run kills a child that has not exited within seconds.
-			if (!isLive(agent)) await agent.run?.exited;
-			if (agent.run && isLive(agent)) {
-				const response = await within(prompt(agent.run, "followUp"), Math.max(0, deadline - Date.now()), signal);
-				if (response && !response.success) throw new Error(`follow_up rejected: ${response.error}`);
-			} else launch(agent, params.message);
-			await waitFor(agent, deadline - Date.now(), signal, true);
 			return text(consume(agent));
 		},
 	});

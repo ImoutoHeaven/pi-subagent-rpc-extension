@@ -16,13 +16,6 @@ const STDERR_CHARS = 2_000;
 const DIALOGS = new Set(["select", "confirm", "input", "editor"]);
 
 export type RunStatus = "settled" | "aborted" | "error";
-export type Response = { success: boolean; disposition?: string; error?: string };
-interface Command {
-	id: string;
-	type: "prompt" | "clear_queue" | "abort";
-	message?: string;
-	streamingBehavior?: "steer" | "followUp";
-}
 
 export interface RunOwner {
 	/** Every record the child writes, before the run's own bookkeeping. */
@@ -34,13 +27,11 @@ export interface RunOwner {
 }
 
 export interface Run {
-	readonly finished: boolean;
 	/** Resolves once the process has exited. */
 	readonly exited: Promise<void>;
-	prompt(message: string, streamingBehavior: "steer" | "followUp"): Promise<Response>;
 	/** Ends the run as an error and kills the process. */
 	fail(error: string): void;
-	/** Clears the queue and aborts; kills the process if the run does not conclude within 10 seconds. */
+	/** Aborts; kills the process if its run has not started, or does not conclude within 10 seconds. */
 	stop(signal?: AbortSignal): Promise<void>;
 	/** Ends the process whatever its state, for the end of the parent session. */
 	shutdown(): Promise<void>;
@@ -57,7 +48,7 @@ function killTree(child: ChildProcessWithoutNullStreams) {
 }
 
 /** The promise's value, or undefined once `ms` pass or `signal` aborts. */
-export function within<T>(promise: Promise<T>, ms: number, signal?: AbortSignal) {
+function within<T>(promise: Promise<T>, ms: number, signal?: AbortSignal) {
 	return new Promise<T | undefined>((done) => {
 		const settle = (value: T | undefined) => {
 			clearTimeout(timer);
@@ -86,11 +77,13 @@ export function startRun(options: { cwd: string; args: string[]; message: string
 		windowsHide: true,
 	});
 	const launchId = `run-${hex()}`;
-	let queue: Command[] = [];
-	const replies = new Map<string, (response: Response) => void>();
+	/** The launch prompt got its response. */
+	let replied = false;
 	let busy = false;
-	/** A prompt that reached idle Pi; later commands wait until its run starts. */
-	let gate: string | null = null;
+	/** Pi started the run (agent_start). */
+	let begun = false;
+	/** The launch prompt started a run whose agent_start has not arrived yet. */
+	let gate = false;
 	let probe: string | null = null;
 	let lastStop: string | null = null;
 	let lastError: string | null = null;
@@ -106,18 +99,9 @@ export function startRun(options: { cwd: string; args: string[]; message: string
 		if (child.stdin.writable) child.stdin.write(`${JSON.stringify(record)}\n`);
 	};
 
-	/** Fail commands that will never get a response. */
-	const dropPending = (error: string, all: boolean) => {
-		const ids = all ? [...replies.keys()] : queue.map((queued) => queued.id);
-		for (const id of ids) replies.get(id)?.({ success: false, error });
-		for (const id of ids) replies.delete(id);
-		queue = [];
-	};
-
 	const finish = (status: RunStatus, error: string | null) => {
 		if (finished) return;
 		finished = true;
-		dropPending(`subagent ${status}`, true);
 		concluded.abort();
 		child.stdin.end();
 		setTimeout(() => killTree(child), KILL_AFTER_MS).unref();
@@ -137,27 +121,10 @@ export function startRun(options: { cwd: string; args: string[]; message: string
 
 	// Pi's events can lag its state, so Pi's own isStreaming confirms a run is over.
 	const maybeFinish = () => {
-		if (finished || busy || gate || probe || queue.length || replies.size) return;
+		if (finished || busy || gate || probe || !replied) return;
 		probe = `probe-${hex()}`;
 		write({ id: probe, type: "get_state" });
 	};
-
-	// A prompt reaching idle Pi starts a run; later prompts wait until it starts so they queue behind it.
-	const pump = () => {
-		while (!finished && queue.length && !gate) {
-			const next = queue.shift() as Command;
-			write(next);
-			if (next.type === "prompt" && !busy) gate = next.id;
-		}
-		maybeFinish();
-	};
-
-	const send = (record: Omit<Command, "id">, id = `${record.type}-${hex()}`) =>
-		new Promise<Response>((done) => {
-			replies.set(id, done);
-			queue.push({ ...record, id });
-			pump();
-		});
 
 	const answer = async (event: { id: string; placeholder?: string }) => {
 		let reply: Reply | undefined;
@@ -179,28 +146,23 @@ export function startRun(options: { cwd: string; args: string[]; message: string
 					probe = null;
 					if (!event.success || typeof event.data?.isStreaming !== "boolean") finish("error", `state check failed: ${event.error ?? "no isStreaming"}`);
 					// While streaming, the coming agent_settled checks again.
-					else if (!event.data.isStreaming && !busy && !gate && !queue.length && !replies.size) conclude();
+					else if (!event.data.isStreaming && !busy && !gate) conclude();
 					return;
 				}
-				const reply = replies.get(event.id);
-				if (!reply) return;
-				replies.delete(event.id);
-				const response: Response = { success: Boolean(event.success), disposition: event.data?.disposition, error: event.error };
-				if (event.id === launchId && !response.success) {
+				if (event.id !== launchId) return;
+				replied = true;
+				if (!event.success) {
 					lastStop = "error";
-					lastError = response.error ?? "prompt rejected";
-				}
-				if (response.disposition === "started") gate = event.id;
-				else if (event.id === gate) gate = null;
-				reply(response);
-				pump();
+					lastError = event.error ?? "prompt rejected";
+				} else if (event.data?.disposition === "started") gate = true;
+				maybeFinish();
 				return;
 			}
 			case "agent_start":
 				busy = true;
-				gate = null;
+				begun = true;
+				gate = false;
 				lastStop = null;
-				pump();
 				return;
 			case "message_end":
 				if (event.message?.role !== "assistant") return;
@@ -209,8 +171,8 @@ export function startRun(options: { cwd: string; args: string[]; message: string
 				return;
 			case "agent_settled":
 				busy = false;
-				gate = null;
-				pump();
+				gate = false;
+				maybeFinish();
 				return;
 			case "extension_ui_request":
 				if (event.method === "input" && event.title === TAG) void answer(event);
@@ -245,7 +207,7 @@ export function startRun(options: { cwd: string; args: string[]; message: string
 		if (ended) return;
 		ended = true;
 		if (aborting) finish("aborted", null);
-		else if (clean && !busy && !gate && !queue.length) conclude();
+		else if (clean && !busy && !gate) conclude();
 		else finish("error", `${reason}${stderr.trim() ? `\n${stderr.trim()}` : ""}`);
 		markExited();
 	};
@@ -255,21 +217,21 @@ export function startRun(options: { cwd: string; args: string[]; message: string
 	const onExit = (code: number | null, signal: NodeJS.Signals | null) => closed(`Pi exited (code ${code}, signal ${signal})`, code === 0);
 	child.on("close", onExit);
 	child.on("exit", (code, signal) => setTimeout(() => onExit(code, signal), 2_000).unref());
-	void send({ type: "prompt", message: options.message }, launchId);
+	write({ id: launchId, type: "prompt", message: options.message });
 
 	return {
-		get finished() {
-			return finished;
-		},
 		exited,
-		prompt: (message, streamingBehavior) => send({ type: "prompt", message, streamingBehavior }),
 		fail,
 		async stop(signal) {
 			if (finished) return;
-			dropPending("subagent aborted", false);
-			write({ type: "clear_queue" });
-			write({ type: "abort" });
 			aborting = true;
+			// Pi drops an abort that arrives before its run starts, so a run that has not started ends with its process.
+			if (!begun) {
+				finish("aborted", null);
+				killTree(child);
+				return exited;
+			}
+			write({ type: "abort" });
 			await within(new Promise((done) => concluded.signal.addEventListener("abort", done)), ABORT_WAIT_MS, signal);
 			if (finished) return;
 			killTree(child);
@@ -279,7 +241,6 @@ export function startRun(options: { cwd: string; args: string[]; message: string
 			if (!finished) {
 				// Abort first: Pi in RPC mode finishes an active run before honouring stdin EOF.
 				aborting = true;
-				write({ type: "clear_queue" });
 				write({ type: "abort" });
 			}
 			child.stdin.end();

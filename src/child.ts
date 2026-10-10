@@ -25,6 +25,13 @@ export default function setupChild(pi: ExtensionAPI) {
 	/** The highest team message seq this member has received. */
 	let after = 0;
 
+	/** Pulls the inbox and advances the cursor; notices carry seq 0. */
+	const pull = async (ctx: ExtensionContext) => {
+		const { messages = [] } = await ask(ctx, { op: "inbox", after }, ctx.signal);
+		after = messages.reduce((max, m) => Math.max(max, m.seq), after);
+		return messages;
+	};
+
 	const draft = (message: Delivery) => ({
 		type: "custom_message" as const,
 		customType: TEAM_MESSAGE,
@@ -52,8 +59,7 @@ export default function setupChild(pi: ExtensionAPI) {
 		const { team: id = "", preamble = "" } = await ask(ctx, { op: "start" }, ctx.signal);
 		teamId = id;
 		after = teamCursor(ctx.sessionManager.getEntries(), teamId);
-		const { messages = [] } = await ask(ctx, { op: "inbox", after }, ctx.signal);
-		after = messages.at(-1)?.seq ?? after;
+		const messages = await pull(ctx);
 		return {
 			message: { customType: TEAM_MESSAGE, content: [preamble, ...messages.map((m) => m.text)].join(""), display: true, details: { team: teamId, seq: after } },
 		};
@@ -62,9 +68,14 @@ export default function setupChild(pi: ExtensionAPI) {
 	// Messages ride on a request the model makes anyway: one that follows tool results.
 	pi.on("turn_end", async (event, ctx) => {
 		if (event.outcome !== "completed" || !event.toolResults.length) return;
-		const { messages = [] } = await ask(ctx, { op: "inbox", after }, ctx.signal);
-		if (!messages.length) return;
-		after = messages[messages.length - 1].seq;
-		return { entries: [...event.entries, ...messages.map(draft)] };
+		const messages = await pull(ctx);
+		if (messages.length) return { entries: [...event.entries, ...messages.map(draft)] };
+	});
+
+	// A message that arrived while the member wrote its final reply continues the same run.
+	pi.on("agent_before_settle", async (event, ctx) => {
+		if (event.outcome !== "completed") return;
+		const messages = await pull(ctx);
+		if (messages.length) return { entries: [...event.entries, ...messages.map(draft)], continue: true };
 	});
 }

@@ -1,13 +1,19 @@
 // Scripted OpenAI-compatible endpoint for the end-to-end test; logs every request body.
-// Team messages (user messages starting with "[team") are skipped; the last other message decides the reply:
+// Team messages (user messages starting with "[team") are skipped, except that a woken member's launch note
+// ("... sent you a team message. Act on ...") is replaced by the body of the last team message its run starts with.
+// The last other message decides the reply:
 //   assistant                        → "notified" (only team messages arrived)
 //   tool result                      → "ack" (parent turn after a subagent call), except:
 //                                      after "CALL <json> HOLD" → never answer;
 //                                      first result after "CALLS <ms> <a> || <b>" → wait, then call <b>;
-//                                      after "TEAM <json>" → "team: <tool result>"
+//                                      after "TEAM <json>" → "team: <tool result>";
+//                                      nth result after "TEAMS <a> || <b> ..." → the next `team` call, or after the last "team: <tool result>";
+//                                      after "RELOAD" → the declared tool names
 //   "CALL <json>[ HOLD]"              → a `subagent` tool call with those arguments
 //   "CALLS <ms> <a> || <b>"           → a `subagent` call with <a>
 //   "TEAM <json>"                     → a `team` tool call with those arguments
+//   "TEAMS <a> || <b> ..."            → a `team` call with <a>
+//   "RELOAD"                         → a `reload_now` tool call
 //   "[settled|aborted|error] ..."    → "notified" (a delivered subagent result)
 //   "SLOW <ms> <rest>"               → wait, then handle <rest>
 //   "HANG"                           → never answer
@@ -23,15 +29,27 @@ const script = (m) => text(m).trim();
 const callOf = (m) => script(m).replace(/^SLOW \d+ /, "");
 const sleep = (ms) => new Promise((done) => setTimeout(done, ms));
 const CALLS = /^CALLS (\d+) (\{.*?\}) \|\| (\{.*\})$/s;
+const WOKEN = /sent you a team message\. Act on your team messages/;
+const isTeam = (m) => m.role === "user" && text(m).startsWith("[team");
+/** The body of the last team message in a run's start message. */
+const lastBody = (start) => text(start).split(/\[team #\d+\][^\n]*:\n/).at(-1).trim();
 
 async function reply(body) {
-	const messages = body.messages.filter((m) => !(m.role === "user" && text(m).startsWith("[team")));
+	const messages = body.messages.flatMap((m, i, all) =>
+		m.role === "user" && WOKEN.test(text(m)) ? [{ role: "user", content: lastBody(all[i + 1]) }] : isTeam(m) ? [] : [m],
+	);
 	const last = messages.at(-1);
 	if (last.role === "assistant") return { content: "notified" };
 	if (last.role === "tool") {
-		const start = messages.findLastIndex((m) => m.role === "user" && /^(CALLS?|TEAM) /.test(callOf(m)));
+		const start = messages.findLastIndex((m) => m.role === "user" && /^(CALLS?|TEAMS?) |^RELOAD$/.test(callOf(m)));
 		const call = start === -1 ? "" : callOf(messages[start]);
 		if (call.startsWith("TEAM ")) return { content: `team: ${text(last)}` };
+		if (call === "RELOAD") return { content: `tools: ${(body.tools || []).map((t) => t.function.name).join(",")}` };
+		if (call.startsWith("TEAMS ")) {
+			const steps = call.slice(6).split(" || ");
+			const done = messages.slice(start).filter((m) => m.role === "tool").length;
+			return done < steps.length ? { call: steps[done], name: "team" } : { content: `team: ${text(last)}` };
+		}
 		const calls = call.match(CALLS);
 		if (calls && messages.slice(start).filter((m) => m.role === "tool").length === 1) {
 			await sleep(Number(calls[1]));
@@ -51,6 +69,8 @@ async function reply(body) {
 	}
 	if (said === "HANG") return { hang: true };
 	if (said.startsWith("TEAM ")) return { call: said.slice(5), name: "team" };
+	if (said.startsWith("TEAMS ")) return { call: said.slice(6).split(" || ")[0], name: "team" };
+	if (said === "RELOAD") return { call: "{}", name: "reload_now" };
 	if (said === "TOOLS?") return { content: `tools: ${(body.tools || []).map((t) => t.function.name).join(",")}` };
 	if (said.startsWith("SAY ")) return { content: said.slice(4) };
 	return { content: `unscripted: ${said.slice(0, 80)}` };
