@@ -527,14 +527,14 @@ await step("a member the main agent aborted wakes only for the main agent's dire
 	assert.match((await team.call({ action: "status", id: "locked", waitMs: 30_000 })).text, /^\[settled\] subagent locked.*unlocked$/s);
 });
 
-await step("abort stops a woken member before its run starts; extension notices show in its result", async () => {
+await step("abort stops a woken member before its run starts; extension notices from the run show in its result", async () => {
 	const slow = join(WORK_DIR, "slow-start-extension.ts");
 	fs.writeFileSync(
 		slow,
-		'export default function (pi) { pi.on("before_agent_start", async (_event, ctx) => { ctx.ui.notify("starting slowly", "warning"); await new Promise((done) => setTimeout(done, 3000)); }); }\n',
+		'export default function (pi) { pi.on("before_agent_start", async (_event, ctx) => { ctx.ui.notify("starting slowly", "warning"); await new Promise((done) => setTimeout(done, 3000)); }); pi.on("turn_start", (_event, ctx) => ctx.ui.notify("turn started", "info")); }\n',
 	);
 	const ready = await run({ name: "late", message: "SAY late ready", args: ["-e", slow] });
-	assert.match(ready.text, /^\[settled\] subagent late[^\n]*\n\nNotices: starting slowly\n\nlate ready/);
+	assert.match(ready.text, /^\[settled\] subagent late[^\n]*\n\nNotices: turn started\n\nlate ready/);
 	const before = requestsBy("late").length;
 	assert.match((await teamCall({ action: "send", to: "late", body: "SAY should not run" })).text, /\(woken\)\.$/);
 	const started = Date.now();

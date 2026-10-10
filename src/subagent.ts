@@ -300,6 +300,7 @@ export default function setupParent(pi: ExtensionAPI) {
 			case "agent_start":
 				// A member asks for its preamble before its first run starts.
 				if (!agent.greeted) agent.run?.fail("the team extension did not load in the subagent; it needs this extension and its team tool");
+				agent.phase = "started";
 				return;
 			case "turn_start":
 				agent.tools.clear();
@@ -340,7 +341,8 @@ export default function setupParent(pi: ExtensionAPI) {
 				agent.phase = "compacting";
 				return;
 			case "extension_ui_request":
-				if (event.method === "notify") agent.notices = [...agent.notices, oneLine(String(event.message ?? ""), NARRATION_CHARS)].slice(-NOTICES);
+				// Startup notices, such as an extension announcing itself, say nothing about this run.
+				if (event.method === "notify" && agent.phase !== "starting") agent.notices = [...agent.notices, oneLine(String(event.message ?? ""), NARRATION_CHARS)].slice(-NOTICES);
 				return;
 		}
 	};

@@ -53,7 +53,7 @@ Results about one member end with the other members still running, up to three:
 
 `no event` appears after a minute without activity. A progress report or footer entry with no active tool and an old last event points to a stalled member.
 
-Progress reports and results also show a `Notices:` line with the last three `ctx.ui.notify` texts that the member's extensions sent during the run, such as the reason an extension stopped it.
+Progress reports and results also show a `Notices:` line with the last three `ctx.ui.notify` texts that the member's extensions sent after the run started, such as the reason an extension stopped it.
 
 ## The `team` tool
 
