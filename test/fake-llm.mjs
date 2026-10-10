@@ -1,6 +1,7 @@
 // Scripted OpenAI-compatible endpoint for the end-to-end test; logs every request body.
 // Team messages (user messages starting with "[team") are skipped, except that a woken member's launch note
-// ("... sent you a team message. Act on ...") is replaced by the body of the last team message its run starts with.
+// ("... sent you a team message. Act on ...") is replaced by the body of the last team message its run starts with,
+// without the board digest that may follow it.
 // The last other message decides the reply:
 //   assistant                        → "notified" (only team messages arrived)
 //   tool result                      → "ack" (parent turn after a subagent call), except:
@@ -32,7 +33,7 @@ const CALLS = /^CALLS (\d+) (\{.*?\}) \|\| (\{.*\})$/s;
 const WOKEN = /sent you a team message\. Act on your team messages/;
 const isTeam = (m) => m.role === "user" && text(m).startsWith("[team");
 /** The body of the last team message in a run's start message. */
-const lastBody = (start) => text(start).split(/\[team #\d+\][^\n]*:\n/).at(-1).trim();
+const lastBody = (start) => text(start).split(/\[team #\d+\][^\n]*:\n/).at(-1).split("\n[team] Board: ")[0].trim();
 
 async function reply(body) {
 	const messages = body.messages.flatMap((m, i, all) =>

@@ -35,7 +35,7 @@ export type TeamParams = Static<typeof teamParameters>;
 
 export const TEAM_DESCRIPTION = [
 	"Talk with your team: the main agent (main) and the members it started.",
-	"send posts to the shared board (no `to`) or sends a direct message (`to`). A board post notifies the members in `mentions` and the author of `replyTo`; others see it in history. A running member reads its messages after its next tool results, or before its run ends. A direct message wakes a stopped member, which then runs in its own session; board posts never wake. A run started by a member's message cannot wake others, and a member the main agent aborted wakes only for the main agent. The send result shows each recipient's state. A run started by a member's message sends its final reply to that member.",
+	"send posts to the shared board (no `to`) or sends a direct message (`to`). A board post notifies the members in `mentions` and the author of `replyTo`. Everyone else gets a one-line digest of new board posts after tool results and when a run starts; history shows them in full. A running member reads its messages after its next tool results, or before its run ends. A direct message wakes a stopped member, which then runs in its own session; board posts never wake. A run started by a member's message cannot wake others, and a member the main agent aborted wakes only for the main agent. The send result shows each recipient's state. A run started by a member's message sends its final reply to that member.",
 	"history reads the board, or your direct messages with `with`. wait returns once a message for you is pending; the messages follow the tool result. members lists members, their states, and the topic. topic sets the topic (main agent only).",
 ].join("\n\n");
 
@@ -48,7 +48,8 @@ export interface Delivery {
 
 export type Request =
 	| { op: "start" }
-	| { op: "inbox"; after: number }
+	/** `digest`: also return a one-line digest of unseen board posts. */
+	| { op: "inbox"; after: number; digest?: boolean }
 	| { op: "wait"; after: number; ms: number }
 	| ({ op: "team" } & TeamParams);
 

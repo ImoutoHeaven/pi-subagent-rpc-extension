@@ -31,6 +31,8 @@ const INBOX_SIZE = 10;
 const HISTORY_LIMIT = 20;
 const MAX_HISTORY_LIMIT = 50;
 const HISTORY_CHARS = 16_000;
+const DIGEST_POSTS = 3;
+const DIGEST_CHARS = 80;
 
 export interface MemberRecord {
 	t: "member";
@@ -97,9 +99,11 @@ export function createTeam(pi: ExtensionAPI, host: TeamHost) {
 	let topic = "";
 	/** Held `wait` requests by member. */
 	const waiters = new Map<string, Set<() => void>>();
-	// shortcut: inbox cursors and sender notices live in memory; reopening a session forgets them, and every member is stopped then anyway.
+	// shortcut: inbox and board cursors and sender notices live in memory; reopening a session forgets them, and every member is stopped then anyway.
 	/** Per member, the highest seq its inbox returned. */
 	const seen = new Map<string, number>();
+	/** Per agent, the seq up to which it has seen the board, in full, in a digest, or in history. */
+	const boardSeen = new Map<string, number>();
 	/** Per member, the seq of the message that woke its current or last run; it never wakes the member again. */
 	const wokeBy = new Map<string, number>();
 	/** Notices for running senders about messages their recipient never read; not log records. */
@@ -132,7 +136,21 @@ export function createTeam(pi: ExtensionAPI, host: TeamHost) {
 	const due = (name: string, after: number) => messages.filter((message) => message.seq > after && message.notify.includes(name));
 	const pendingCount = (name: string, after: number) => due(name, after).length + (notices.get(name)?.length ?? 0);
 
-	const inbox = (name: string, after: number): Delivery[] => {
+	/** One line about the board posts `name` has not seen and was not notified of; empty when there are none. Marks them seen. */
+	const digest = (name: string) => {
+		const unseen = messages.filter((message) => message.to === BOARD && message.seq > (boardSeen.get(name) ?? 0) && message.from !== name && !message.notify.includes(name));
+		boardSeen.set(name, lastSeq());
+		if (!unseen.length) return "";
+		const cut = (body: string) => {
+			const flat = body.replace(/\s+/g, " ").trim();
+			return flat.length > DIGEST_CHARS ? `${flat.slice(0, DIGEST_CHARS)}…` : flat;
+		};
+		const shown = unseen.slice(-DIGEST_POSTS).map((message) => `#${message.seq} ${message.from}: ${cut(message.body)}`);
+		const earlier = unseen.length > shown.length ? `; +${unseen.length - shown.length} earlier` : "";
+		return `[team] Board: ${unseen.length} new post${unseen.length === 1 ? "" : "s"} — ${shown.join("; ")}${earlier} (team history).\n\n`;
+	};
+
+	const inbox = (name: string, after: number, withDigest: boolean): Delivery[] => {
 		const pending = due(name, after);
 		const shown = pending.slice(0, INBOX_SIZE);
 		const more = pending.length - shown.length;
@@ -147,7 +165,7 @@ export function createTeam(pi: ExtensionAPI, host: TeamHost) {
 					render(message, name) +
 					(more && i === shown.length - 1 ? `(${more} more team messages for you are pending; they arrive after your next tool results or before your run ends.)\n\n` : ""),
 			})),
-			...notes.map((text) => ({ seq: 0, from: BOARD, text })),
+			...[...notes, withDigest ? digest(name) : ""].filter(Boolean).map((text) => ({ seq: 0, from: BOARD, text })),
 		];
 	};
 
@@ -248,6 +266,7 @@ export function createTeam(pi: ExtensionAPI, host: TeamHost) {
 		);
 		let shown = found.slice(-limit).map((message) => ({ seq: message.seq, text: render(message, caller) }));
 		while (shown.length > 1 && shown.reduce((sum, message) => sum + message.text.length, 0) > HISTORY_CHARS) shown = shown.slice(1);
+		if (params.with === undefined && !query && params.before === undefined) boardSeen.set(caller, lastSeq());
 		if (!shown.length) return "No messages.";
 		const older = found.length > shown.length ? `Older messages exist: history before=${shown[0].seq}.\n\n` : "";
 		return older + shown.map((message) => message.text).join("").trimEnd();
@@ -327,6 +346,7 @@ export function createTeam(pi: ExtensionAPI, host: TeamHost) {
 					else if (record?.t === "topic" && typeof record.body === "string") topic = record.body;
 					else if (ctx.hasUI) ctx.ui.notify(`team.jsonl line ${i + 1} is not a team record; skipped`, "warning");
 				});
+			for (const name of [MAIN, ...members.keys()]) boardSeen.set(name, lastSeq());
 			const cursor = teamCursor(ctx.sessionManager.getEntries(), teamId);
 			for (const message of due(MAIN, cursor)) {
 				pi.sendMessage(
@@ -345,6 +365,13 @@ export function createTeam(pi: ExtensionAPI, host: TeamHost) {
 			const member: MemberRecord = { t: "member", name, cwd, args };
 			append(member);
 			members.set(name, member);
+			boardSeen.set(name, lastSeq());
+		},
+
+		/** The main agent's board digest as a notice entry, or undefined when there is nothing new. */
+		mainDigest() {
+			const content = digest(MAIN);
+			return content ? { type: "custom_message" as const, customType: TEAM_NOTICE, content, display: true, details: { team: teamId } } : undefined;
 		},
 
 		/** Sends a woken member's final reply to the running member that woke it; returns the message's seq. */
@@ -382,7 +409,7 @@ export function createTeam(pi: ExtensionAPI, host: TeamHost) {
 			const after = "after" in request && typeof request.after === "number" ? request.after : 0;
 			try {
 				if (request.op === "start") return { ok: true, team: teamId, preamble: preamble(name) };
-				if (request.op === "inbox") return { ok: true, messages: inbox(name, after) };
+				if (request.op === "inbox") return { ok: true, messages: inbox(name, after, request.digest === true) };
 				if (request.op === "wait") return { ok: true, count: await wait(name, after, Math.min(Number(request.ms) || 0, MAX_WAIT_MS), signal) };
 				if (request.op === "team" && request.action !== "wait") return { ok: true, text: act(name, request) };
 				return { error: `unsupported request: ${request.op}` };

@@ -69,7 +69,23 @@ The main agent (`main`) and every member have it.
 
 `body` holds up to 4000 characters and `topic` up to 2000. Larger content belongs in files in the shared working tree, with the path in the message.
 
-A direct message notifies its recipient. A board post notifies the members in `mentions` and the author of `replyTo`; others see it in `history`. Only the main agent can mention `all`. Every member sees the whole board and the direct messages it sent or received.
+Every member sees the whole board and the direct messages it sent or received. A message reaches the main agent and the members at one of three levels:
+
+| Message | Recipient gets | Wakes a stopped member |
+|---|---|---|
+| Direct message | The full text at its next safe point | Yes, by the rules below |
+| Board post that mentions the recipient or replies to its message, or the main agent's post mentioning `all` | The full text at its next safe point | No |
+| Any other board post by someone else | A line in the board digest | No |
+
+Only the main agent can mention `all`.
+
+The board digest is one line about the board posts the recipient has not seen: the latest three, each cut to about 80 characters, and a count of the earlier ones.
+
+```text
+[team] Board: 5 new posts — #14 tester: Fixture 7 fails on Windows paths; #15 reviewer: The parser change looks right; #16 main: Freeze the API; +2 earlier (team history).
+```
+
+A member gets the digest at the start of a run and after tool results. The main agent gets it as a `team-notice` after a turn with tool calls and at the start of each run. `history` on the board without `query` or `before` also marks every board post seen. A new member, and every agent of a reopened session, starts with the whole board seen. A digest never counts for `team wait`, never wakes anyone, and never continues a run by itself.
 
 A member reads its messages at safe points: at the start of each run along with a preamble that names the team, after tool results, and when its run would end, in which case the run continues with them.
 

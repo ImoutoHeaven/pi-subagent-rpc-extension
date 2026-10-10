@@ -188,6 +188,12 @@ export default function setupParent(pi: ExtensionAPI) {
 		return `\n\n(Background: ${shown.join(", ")}${more}.)`;
 	};
 
+	// Pi runs before_agent_start only for prompts, so a run that a message starts gets the board digest just ahead of that message.
+	const digestFirst = () => {
+		const digest = team.mainDigest();
+		if (digest) pi.sendMessage(digest, { triggerTurn: false });
+	};
+
 	// An idle parent starts a turn with the message; a busy one gets it at its next turn boundary. A quiet message never starts a turn.
 	const notify = (customType: string, agentId: string, text: string, details: object, quiet = false) => {
 		if (shuttingDown) return;
@@ -195,7 +201,9 @@ export default function setupParent(pi: ExtensionAPI) {
 		const content = `${text.trimEnd()}\n\n`;
 		const label = `subagent ${agentId}: ${customType.replace(/^subagent-/, "").replace("-", " ")}`;
 		if (!parent || parent.isIdle()) {
-			pi.sendMessage({ customType, content, display: true, details }, { triggerTurn: !suspended && !quiet });
+			const triggers = !suspended && !quiet;
+			if (triggers) digestFirst();
+			pi.sendMessage({ customType, content, display: true, details }, { triggerTurn: triggers });
 			if (suspended && !quiet && parent?.hasUI) parent.ui.notify(`${label} added; the main agent sees it when it runs again`, "info");
 			return;
 		}
@@ -221,7 +229,12 @@ export default function setupParent(pi: ExtensionAPI) {
 		const entries = takePending().map(({ customType, content, details }) => ({ type: "custom_message" as const, customType, content, display: true, details }));
 		return { entries: [...event.entries, ...entries], continue: event.continue || (wakes && event.outcome !== "aborted") };
 	};
-	pi.on("turn_end", atBoundary);
+	// The board digest rides on a request that follows tool results anyway, so it never makes a run continue.
+	pi.on("turn_end", (event) => {
+		const result = atBoundary(event);
+		const digest = event.outcome === "completed" && event.toolResults.length ? team.mainDigest() : undefined;
+		return digest ? { ...result, entries: [...(result?.entries ?? event.entries), digest] } : result;
+	});
 	pi.on("agent_before_settle", atBoundary);
 
 	// Messages no boundary took, such as those that came during a model error; wake the parent unless it was stopped.
@@ -230,9 +243,15 @@ export default function setupParent(pi: ExtensionAPI) {
 		if (event.aborted) suspended = true;
 		const wakes = !event.aborted && loud() > 0;
 		const taken = takePending();
+		if (wakes) digestFirst();
 		taken.forEach(({ customType, content, details }, i) => {
 			pi.sendMessage({ customType, content, display: true, details }, { triggerTurn: wakes && i === taken.length - 1 });
 		});
+	});
+
+	pi.on("before_agent_start", () => {
+		const digest = team.mainDigest();
+		if (digest) return { message: digest };
 	});
 
 	// Whoever starts the next run, the user or an extension that continues after its own abort, ends the suspension.

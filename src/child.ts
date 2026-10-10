@@ -25,9 +25,9 @@ export default function setupChild(pi: ExtensionAPI) {
 	/** The highest team message seq this member has received. */
 	let after = 0;
 
-	/** Pulls the inbox and advances the cursor; notices carry seq 0. */
-	const pull = async (ctx: ExtensionContext) => {
-		const { messages = [] } = await ask(ctx, { op: "inbox", after }, ctx.signal);
+	/** Pulls the inbox and advances the cursor; notices and the board digest carry seq 0. */
+	const pull = async (ctx: ExtensionContext, digest = false) => {
+		const { messages = [] } = await ask(ctx, { op: "inbox", after, digest }, ctx.signal);
 		after = messages.reduce((max, m) => Math.max(max, m.seq), after);
 		return messages;
 	};
@@ -59,7 +59,7 @@ export default function setupChild(pi: ExtensionAPI) {
 		const { team: id = "", preamble = "" } = await ask(ctx, { op: "start" }, ctx.signal);
 		teamId = id;
 		after = teamCursor(ctx.sessionManager.getEntries(), teamId);
-		const messages = await pull(ctx);
+		const messages = await pull(ctx, true);
 		return {
 			message: { customType: TEAM_MESSAGE, content: [preamble, ...messages.map((m) => m.text)].join(""), display: true, details: { team: teamId, seq: after } },
 		};
@@ -68,11 +68,11 @@ export default function setupChild(pi: ExtensionAPI) {
 	// Messages ride on a request the model makes anyway: one that follows tool results.
 	pi.on("turn_end", async (event, ctx) => {
 		if (event.outcome !== "completed" || !event.toolResults.length) return;
-		const messages = await pull(ctx);
+		const messages = await pull(ctx, true);
 		if (messages.length) return { entries: [...event.entries, ...messages.map(draft)] };
 	});
 
-	// A message that arrived while the member wrote its final reply continues the same run.
+	// A message that arrived while the member wrote its final reply continues the same run; a digest alone never does, so it is not asked for.
 	pi.on("agent_before_settle", async (event, ctx) => {
 		if (event.outcome !== "completed") return;
 		const messages = await pull(ctx);
