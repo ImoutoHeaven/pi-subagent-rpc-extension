@@ -18,6 +18,7 @@ const NARRATION_CHARS = 300;
 const NOTICES = 3;
 const FOOTER_AGENTS = 3;
 const STALE_MS = 60_000;
+const IDLE_POLL_MS = 250;
 const MAIN = "main";
 // The extension owns the child's process mode, session, and model selection.
 const OWNED_FLAGS = ["--mode", "--print", "-p", "--no-session", "--session", "--session-id", "--session-dir", "--continue", "-c", "--resume", "-r", "--fork", "--export", "--model"];
@@ -131,6 +132,10 @@ export default function setupParent(pi: ExtensionAPI) {
 	 * outside Pi's steer queue, which hands over one message per model request and is cleared by Esc.
 	 */
 	let pending: Pending[] = [];
+	/** From agent_start to this extension's agent_settled handler; Pi reports idle while earlier settle handlers run. */
+	let inRun = false;
+	/** The poll for an idle parent, while messages are pending. */
+	let watch: ReturnType<typeof setTimeout> | undefined;
 	/** Ends every tool wait, so a new message does not sit behind a long wait. */
 	const waits = new Set<() => void>();
 	/** Pending messages that wake the parent. */
@@ -208,6 +213,7 @@ export default function setupParent(pi: ExtensionAPI) {
 			return;
 		}
 		pending.push({ customType, agentId, content, details, quiet });
+		watchIdle();
 		if (quiet) return;
 		for (const wake of [...waits]) wake();
 		// Visible to the user at once, while the parent may still be inside a long tool call.
@@ -239,15 +245,30 @@ export default function setupParent(pi: ExtensionAPI) {
 
 	// Messages no boundary took, such as those that came during a model error; wake the parent unless it was stopped.
 	// One wake for the whole batch: each triggering message would start its own run, which Esc cannot cancel.
-	pi.on("agent_settled", (event) => {
-		if (event.aborted) suspended = true;
-		const wakes = !event.aborted && loud() > 0;
+	const flush = () => {
+		const wakes = !suspended && loud() > 0;
 		const taken = takePending();
 		if (wakes) digestFirst();
 		taken.forEach(({ customType, content, details }, i) => {
 			pi.sendMessage({ customType, content, display: true, details }, { triggerTurn: wakes && i === taken.length - 1 });
 		});
+	};
+	pi.on("agent_settled", (event) => {
+		inRun = false;
+		if (event.aborted) suspended = true;
+		flush();
 	});
+
+	// Compaction and tree navigation keep the parent busy without a run, so no boundary takes what arrives meanwhile.
+	// shortcut: Pi gives extensions no idle event, so this polls until a boundary or an idle parent takes the messages; use such an event once Pi has one.
+	const watchIdle = () => {
+		watch ??= setTimeout(() => {
+			watch = undefined;
+			if (shuttingDown || !pending.length) return;
+			if (!inRun && parent?.isIdle()) flush();
+			else watchIdle();
+		}, IDLE_POLL_MS);
+	};
 
 	pi.on("before_agent_start", () => {
 		const digest = team.mainDigest();
@@ -256,6 +277,7 @@ export default function setupParent(pi: ExtensionAPI) {
 
 	// Whoever starts the next run, the user or an extension that continues after its own abort, ends the suspension.
 	pi.on("agent_start", () => {
+		inRun = true;
 		suspended = false;
 	});
 

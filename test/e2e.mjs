@@ -374,6 +374,64 @@ await step("a session without a session file hires members", async () => {
 	}
 });
 
+const busyExtension = join(WORK_DIR, "busy-extension.ts");
+fs.writeFileSync(
+	busyExtension,
+	`export default function (pi) {
+	// Loaded after the subagent extension, so compaction stays busy after that extension's handler ran.
+	pi.on("session_compact", () => new Promise((done) => setTimeout(done, 1000)));
+	pi.registerCommand("tree-now", { handler: async (_args, ctx) => {
+		const first = ctx.sessionManager.getBranch().find((e) => e.type === "message" && e.message.role === "user");
+		await ctx.navigateTree(first.id, { summarize: true, customInstructions: "SLOW 8000" });
+		ctx.ui.notify("navigated", "info");
+	} });
+}
+`,
+);
+/**
+ * A result that arrives while an idle parent is busy outside a run, from `busy` until the event `done` matches,
+ * wakes the parent afterwards. Returns that event.
+ */
+const wakesAfter = async (busy, done) => {
+	// Pi loads -e extensions in order, ahead of those from settings.
+	const idle = startParent(["--session-dir", join(WORK_DIR, "sessions"), "--no-extensions", "-e", fileURLToPath(new URL("..", import.meta.url)), "-e", busyExtension]);
+	current = idle;
+	try {
+		await idle.say("SAY before");
+		// Past Pi's 20000 kept tokens, so compaction summarizes the message before it.
+		await idle.say("x".repeat(100_000));
+		const id = idOf((await idle.call({ action: "run", name: "late", message: "SLOW 3000 SAY late", waitMs: 0 })).text);
+		const from = idle.events.length;
+		busy(idle);
+		const queued = await idle.waitEvent((e) => e.type === "extension_ui_request" && e.message === `subagent ${id}: result waiting for the main agent`, from);
+		const ended = await idle.waitEvent(done, from);
+		const end = idle.events.indexOf(ended);
+		assert.ok(idle.events.indexOf(queued) < end, "the result came after the parent was done");
+		const note = await idle.waitMessage("subagent-result", end, 5000);
+		assert.match(note.content, /late$/);
+		await idle.waitEvent((e) => e.type === "agent_start", end);
+		await idle.waitEvent((e) => e.type === "agent_settled", end);
+		return ended;
+	} finally {
+		await idle.close();
+	}
+};
+
+await step("a result that arrives while an idle parent compacts wakes it when compaction ends", async () => {
+	const ended = await wakesAfter(
+		(idle) => idle.send({ type: "compact", customInstructions: "SLOW 8000" }),
+		(e) => e.type === "compaction_end",
+	);
+	assert.ok(ended.result, ended.errorMessage);
+});
+
+await step("a result that arrives while an idle parent summarizes a tree branch wakes it when navigation ends", async () => {
+	await wakesAfter(
+		(idle) => idle.prompt("/tree-now"),
+		(e) => e.type === "extension_ui_request" && e.message === "navigated",
+	);
+});
+
 const team = startParent(["--session-dir", join(WORK_DIR, "team-sessions")]);
 current = team;
 const run = (args) => team.call({ action: "run", ...args });

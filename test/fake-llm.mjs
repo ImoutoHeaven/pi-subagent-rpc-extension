@@ -20,6 +20,7 @@
 //   "HANG"                           → never answer
 //   "TOOLS?"                         → the declared tool names
 //   "SAY <text>"                     → <text>
+//   "<conversation>..."              → "summary" (a compaction request); custom instructions "SLOW <ms>" wait first
 import fs from "node:fs";
 import http from "node:http";
 
@@ -59,6 +60,10 @@ async function reply(body) {
 		return call.endsWith(" HOLD") ? { hang: true } : { content: "ack" };
 	}
 	let said = script(last);
+	if (said.startsWith("<conversation>")) {
+		await sleep(Number(said.match(/Additional focus: SLOW (\d+)$/)?.[1] ?? 0));
+		return { content: "summary" };
+	}
 	const calls = said.match(CALLS);
 	if (calls) return { call: calls[2] };
 	if (said.startsWith("CALL ")) return { call: said.slice(5).replace(/ HOLD$/, "") };
