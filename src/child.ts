@@ -17,27 +17,32 @@ async function ask(ctx: ExtensionContext, request: Request, signal?: AbortSignal
 	return reply;
 }
 
-const text = (body: string) => ({ content: [{ type: "text" as const, text: body }], details: undefined });
+const text = (body: string, details?: object) => ({ content: [{ type: "text" as const, text: body }], details });
 
 export default function setupChild(pi: ExtensionAPI) {
 	/** The team's id, from the start reply. */
 	let teamId = "";
 	/** The highest team message seq this member has received. */
 	let after = 0;
+	/** The seq up to which this member has seen the board, in a digest or in history. */
+	let board = 0;
 
-	/** Pulls the inbox and advances the cursor; notices and the board digest carry seq 0. */
+	/** Pulls the inbox and advances the cursors; notices and the board digest carry seq 0. */
 	const pull = async (ctx: ExtensionContext, digest = false) => {
-		const { messages = [] } = await ask(ctx, { op: "inbox", after, digest }, ctx.signal);
+		const reply = await ask(ctx, { op: "inbox", after, ...(digest ? { board } : {}) }, ctx.signal);
+		const { messages = [] } = reply;
 		after = messages.reduce((max, m) => Math.max(max, m.seq), after);
+		board = reply.board ?? board;
 		return messages;
 	};
 
-	const draft = (message: Delivery) => ({
+	// Pi appends a batch entry by entry, and the digest comes last; only that entry carries the board cursor, so an interrupted append never marks the digest seen.
+	const draft = (message: Delivery, i: number, batch: Delivery[]) => ({
 		type: "custom_message" as const,
 		customType: TEAM_MESSAGE,
 		content: message.text,
 		display: true,
-		details: { team: teamId, seq: message.seq, from: message.from },
+		details: { team: teamId, seq: message.seq, from: message.from, ...(i === batch.length - 1 ? { board } : {}) },
 	});
 
 	pi.registerTool({
@@ -51,17 +56,22 @@ export default function setupChild(pi: ExtensionAPI) {
 				const { count } = await ask(ctx, { op: "wait", after, ms }, signal, ms + WAIT_SLACK_MS);
 				return text(count ? `${count} team message(s) for you follow this result.` : `No team messages for you within ${ms}ms.`);
 			}
-			return text((await ask(ctx, { op: "team", ...params }, signal)).text ?? "");
+			const reply = await ask(ctx, { op: "team", ...params }, signal);
+			if (reply.board === undefined) return text(reply.text ?? "");
+			board = reply.board;
+			return text(reply.text ?? "", { team: teamId, board });
 		},
 	});
 
 	pi.on("before_agent_start", async (_event, ctx) => {
 		const { team: id = "", preamble = "" } = await ask(ctx, { op: "start" }, ctx.signal);
 		teamId = id;
-		after = teamCursor(ctx.sessionManager.getEntries(), teamId);
+		const entries = ctx.sessionManager.getBranch();
+		after = teamCursor(entries, teamId, "seq");
+		board = teamCursor(entries, teamId, "board");
 		const messages = await pull(ctx, true);
 		return {
-			message: { customType: TEAM_MESSAGE, content: [preamble, ...messages.map((m) => m.text)].join(""), display: true, details: { team: teamId, seq: after } },
+			message: { customType: TEAM_MESSAGE, content: [preamble, ...messages.map((m) => m.text)].join(""), display: true, details: { team: teamId, seq: after, board } },
 		};
 	});
 

@@ -385,6 +385,11 @@ fs.writeFileSync(
 		await ctx.navigateTree(first.id, { summarize: true, customInstructions: "SLOW 8000" });
 		ctx.ui.notify("navigated", "info");
 	} });
+	pi.registerCommand("tree-back", { handler: async (_args, ctx) => {
+		const digest = ctx.sessionManager.getBranch().findLast((e) => e.type === "custom_message" && e.customType === "team-notice");
+		await ctx.navigateTree(digest.parentId, { summarize: false });
+		ctx.ui.notify("navigated back", "info");
+	} });
 }
 `,
 );
@@ -430,6 +435,26 @@ await step("a result that arrives while an idle parent summarizes a tree branch 
 		(idle) => idle.prompt("/tree-now"),
 		(e) => e.type === "extension_ui_request" && e.message === "navigated",
 	);
+});
+
+await step("after the main agent moves back in the session tree past a digest, the next digest lists those posts again", async () => {
+	const back = startParent(["--session-dir", join(WORK_DIR, "sessions"), "--no-extensions", "-e", fileURLToPath(new URL("..", import.meta.url)), "-e", busyExtension]);
+	current = back;
+	const digests = (from) => back.messages(from).filter((m) => m.customType === "team-notice").map((m) => m.content);
+	try {
+		let from = back.events.length;
+		const r = await back.call({ action: "run", name: "sierra", message: `TEAM ${JSON.stringify({ action: "send", body: "sierra news" })}` });
+		const digest = `[team] Board: 1 new post — #${r.text.match(/team: Posted #(\d+)\./)[1]} sierra: sierra news (team history).`;
+		assert.deepEqual(digests(from), [digest]);
+		from = back.events.length;
+		back.prompt("/tree-back");
+		await back.waitEvent((e) => e.type === "extension_ui_request" && e.message === "navigated back", from);
+		from = back.events.length;
+		await back.call({ action: "members" }, "team");
+		assert.deepEqual(digests(from), [digest]);
+	} finally {
+		await back.close();
+	}
 });
 
 const team = startParent(["--session-dir", join(WORK_DIR, "team-sessions")]);
@@ -749,8 +774,9 @@ await step("the main agent gets a digest of other members' board posts at its tu
 		digests.map((m) => m.content),
 		[`[team] Board: 1 new post — #${seq} november: member news (team history).`],
 	);
-	// Without a seq, so the read cursor on reload ignores it.
-	assert.deepEqual(Object.keys(digests[0].details), ["team"]);
+	// The board cursor, without a seq, so the message cursor on reload ignores it.
+	assert.deepEqual(Object.keys(digests[0].details), ["team", "board"]);
+	assert.equal(digests[0].details.board, Number(seq));
 	const seen = requests().find((body) => body.messages.some((m) => m.role === "user" && text(m) === digests[0].content));
 	assert.equal(seen.messages.at(-2).role, "tool");
 });
@@ -863,6 +889,42 @@ await step("a team started in a clone restores its own messages despite the orig
 		assert.deepEqual(
 			restored.map((e) => [e.details.seq, e.content.trimEnd()]),
 			[[2, "[team #2] alpha → you (direct):\nfirst in the clone"]],
+		);
+	} finally {
+		await reopened.close();
+	}
+});
+
+await step("board posts an agent missed before its session closed show in its digest after the session is reopened", async () => {
+	const opened = startParent(["--session", teamSession]);
+	current = opened;
+	let forRomeo;
+	try {
+		const from = opened.events.length;
+		await opened.call({ action: "run", name: "romeo", message: "SAY romeo ready" });
+		assert.ok(!opened.messages(from).some((m) => m.customType === "team-notice"), "the reopened main agent got a digest of posts it had seen");
+		forRomeo = Number((await opened.call({ action: "send", body: "missed by romeo" }, "team")).text.match(/^Posted #(\d+)\./)[1]);
+	} finally {
+		await opened.close();
+	}
+	const forMain = forRomeo + 1;
+	fs.appendFileSync(logOf(teamSession), `${JSON.stringify({ t: "msg", seq: forMain, at: Date.now(), from: "alpha", to: "team", notify: [], body: "missed by main" })}\n`);
+	const reopened = startParent(["--session", teamSession]);
+	current = reopened;
+	try {
+		const from = reopened.events.length;
+		await reopened.call({ action: "members" }, "team");
+		assert.deepEqual(
+			reopened.messages(from).filter((m) => m.customType === "team-notice").map((m) => m.content),
+			[`[team] Board: 1 new post — #${forMain} alpha: missed by main (team history).`],
+		);
+		const mark = reopened.events.length;
+		assert.match((await reopened.call({ action: "send", to: "romeo", body: "SAY romeo woken" }, "team")).text, /\(woken\)\.$/);
+		const result = await reopened.waitMessage("subagent-result", mark);
+		await reopened.waitEvent((e) => e.type === "agent_settled", result.at);
+		assert.match(
+			text(requestsBy("romeo").at(-1).messages.at(-1)),
+			new RegExp(`main → you \\(direct\\):\\nSAY romeo woken\\n\\n\\[team\\] Board: 2 new posts — #${forRomeo} main: missed by romeo; #${forMain} alpha: missed by main \\(team history\\)\\.$`),
 		);
 	} finally {
 		await reopened.close();

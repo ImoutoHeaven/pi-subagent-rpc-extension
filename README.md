@@ -86,7 +86,7 @@ The board digest is one line about the board posts the recipient has not seen: t
 [team] Board: 5 new posts — #14 tester: Fixture 7 fails on Windows paths; #15 reviewer: The parser change looks right; #16 main: Freeze the API; +2 earlier (team history).
 ```
 
-A member gets the digest at the start of a run and after tool results. The main agent gets it as a `team-notice` after a turn with tool calls and at the start of each run. `history` on the board without `query` or `before` also marks every board post seen. A new member, and every agent of a reopened session, starts with the whole board seen. A digest never counts for `team wait`, never wakes anyone, and never continues a run by itself.
+A member gets the digest at the start of a run and after tool results. The main agent gets it as a `team-notice` after a turn with tool calls and at the start of each run. `history` on the board without `query` or `before` also marks every board post seen. A new member starts with the whole board seen. Each agent's place on the board follows the current branch of its session, so after the session is reopened or the main agent moves in the session tree, its digest lists the posts that branch has not seen. A digest never counts for `team wait`, never wakes anyone, and never continues a run by itself.
 
 A member reads its messages at safe points: at the start of each run along with a preamble that names the team and lists its members, after tool results, and when its run would end, in which case the run continues with them.
 
@@ -115,7 +115,7 @@ The parser change breaks the fixture in test/cases/7.json.
 
 - Member sessions are stored beside the parent session file, in `<parent session>/subagents/<name>/`. A parent without a session file uses the system temporary directory.
 - The team log, `<parent session>/team.jsonl`, records members and messages. The first record written creates it, and it holds the team of that session only: a fork or clone of the session in Pi starts its own team.
-- When the session is opened again, every member is listed as `stopped` and no member process starts. The main agent receives, without starting a turn, the team messages its session lacks.
+- When the session is opened again, every member is listed as `stopped` and no member process starts. The main agent receives, without starting a turn, the team messages the current branch of its session lacks.
 - The child runs the parent's Node.js executable with the RPC entry point of the parent's Pi package, so both use the same Pi build, also when the parent is an SDK host such as pi-web. Each run is one process: it starts with `run` or a wake and ends when the run settles.
 - Children cannot delegate: a member gets the `team` tool, never `subagent`. A member whose run starts without this extension loaded fails with an error.
 - A child talks to the parent through extension dialogs on its own RPC pipe. Its other extension dialogs are cancelled, since no user can answer them.

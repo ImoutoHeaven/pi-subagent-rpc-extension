@@ -48,19 +48,23 @@ export interface Delivery {
 
 export type Request =
 	| { op: "start" }
-	/** `digest`: also return a one-line digest of unseen board posts. */
-	| { op: "inbox"; after: number; digest?: boolean }
+	/** `board`: the member's board cursor; with it, the reply also holds a one-line digest of the board posts after it, and the cursor that digest moves it to. */
+	| { op: "inbox"; after: number; board?: number }
 	| { op: "wait"; after: number; ms: number }
 	| ({ op: "team" } & TeamParams);
 
-export type Reply = { ok: true; text?: string; team?: string; preamble?: string; messages?: Delivery[]; count?: number } | { error: string };
+/** `board`: the caller's board cursor after a digest or a history call that showed the whole board. */
+export type Reply = { ok: true; text?: string; team?: string; preamble?: string; messages?: Delivery[]; count?: number; board?: number } | { error: string };
 
 /**
- * The read cursor of a session for `team`: the highest seq of that team's messages it holds.
- * Every team message carries `details: { team, seq }`; `team` is the id of the session that owns the team.
+ * A read cursor of `entries`, a session's current branch, for `team`: the highest `key` in the details of their custom messages and tool results; `team` is the id of the session that owns the team.
+ * `seq`: every team message carries `details: { team, seq }`. `board`: digests and history calls that show the whole board carry `details: { team, board }`.
  */
-export const teamCursor = (entries: SessionEntry[], team: string) =>
+export const teamCursor = (entries: SessionEntry[], team: string, key: "seq" | "board") =>
 	entries.reduce((max, entry) => {
-		const details = entry.type === "custom_message" && entry.customType === TEAM_MESSAGE ? (entry.details as { team?: unknown; seq?: unknown } | undefined) : undefined;
-		return details?.team === team && typeof details.seq === "number" && details.seq > max ? details.seq : max;
+		const details = (entry.type === "custom_message" ? entry.details : entry.type === "message" && entry.message.role === "toolResult" ? entry.message.details : undefined) as
+			| Record<string, unknown>
+			| undefined;
+		const value = details?.team === team ? details[key] : undefined;
+		return typeof value === "number" && value > max ? value : max;
 	}, 0);
