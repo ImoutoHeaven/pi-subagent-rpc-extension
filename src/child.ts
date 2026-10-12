@@ -4,6 +4,7 @@
  */
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import {
+	boardCursor,
 	DEFAULT_WAIT_MS,
 	type Delivery,
 	detailsOf,
@@ -14,7 +15,6 @@ import {
 	TAG,
 	TEAM_DESCRIPTION,
 	TEAM_MESSAGE,
-	teamCursor,
 	teamParameters,
 } from "./protocol.ts";
 
@@ -35,34 +35,26 @@ const text = (body: string, details?: object) => ({ content: [{ type: "text" as 
 export default function setupChild(pi: ExtensionAPI) {
 	/** The team's id, from the start reply. */
 	let teamId = "";
-	/** The highest team message seq this member has received. */
-	let after = 0;
-	/** The seq up to which this member has seen the board in a digest. */
-	let board = 0;
-	/** The seqs after `board` whose text this member's branch holds, such as those history showed. */
-	let seen = new Set<number>();
-	const advance = (cursor: number) => {
-		board = cursor;
-		for (const seq of seen) if (seq <= board) seen.delete(seq);
-	};
+	// Read state comes from the current branch at every pull: Pi can drop a batch of boundary entries, and the next pull then returns it again.
+	/** The seqs of the team messages the current branch holds. */
+	const seen = (ctx: ExtensionContext) => [...seenIn(ctx.sessionManager.getBranch().map(detailsOf), teamId)];
 
-	/** Pulls the inbox and advances the cursors; notices and the board digest carry seq 0. */
+	/** Pulls the messages the branch lacks and, with `digest`, the board digest and the cursor it moves to; notices and the digest carry seq 0. */
 	const pull = async (ctx: ExtensionContext, digest = false) => {
-		const reply = await ask(ctx, { op: "inbox", after, ...(digest ? { board, seen: [...seen] } : {}) }, ctx.signal);
-		const { messages = [] } = reply;
-		after = messages.reduce((max, m) => Math.max(max, m.seq), after);
-		advance(reply.board ?? board);
-		return messages;
+		const board = digest ? { board: boardCursor(ctx.sessionManager.getBranch(), teamId) } : {};
+		const { messages = [], board: cursor } = await ask(ctx, { op: "inbox", seen: seen(ctx), ...board }, ctx.signal);
+		return { messages, cursor };
 	};
 
 	// Pi appends a batch entry by entry, and the digest comes last; only that entry carries the board cursor, so an interrupted append never marks the digest seen.
-	const draft = (message: Delivery, i: number, batch: Delivery[]) => ({
-		type: "custom_message" as const,
-		customType: TEAM_MESSAGE,
-		content: message.text,
-		display: true,
-		details: { team: teamId, seq: message.seq, from: message.from, ...(i === batch.length - 1 ? { board } : {}) },
-	});
+	const drafts = (messages: Delivery[], cursor?: number) =>
+		messages.map((message, i) => ({
+			type: "custom_message" as const,
+			customType: TEAM_MESSAGE,
+			content: message.text,
+			display: true,
+			details: { team: teamId, seq: message.seq, from: message.from, ...(cursor !== undefined && i === messages.length - 1 ? { board: cursor } : {}) },
+		}));
 
 	pi.registerTool({
 		name: "team",
@@ -72,12 +64,11 @@ export default function setupChild(pi: ExtensionAPI) {
 		async execute(_toolCallId, params, signal, _onUpdate, ctx) {
 			if (params.action === "wait") {
 				const ms = Math.min(params.ms ?? DEFAULT_WAIT_MS, MAX_WAIT_MS);
-				const { count } = await ask(ctx, { op: "wait", after, ms }, signal, ms + WAIT_SLACK_MS);
+				const { count } = await ask(ctx, { op: "wait", seen: seen(ctx), ms }, signal, ms + WAIT_SLACK_MS);
 				return text(count ? `${count} team message(s) for you follow this result.` : `No team messages for you within ${ms}ms.`);
 			}
 			const reply = await ask(ctx, { op: "team", ...params }, signal);
 			if (!reply.covered) return text(reply.text ?? "");
-			for (const seq of reply.covered) if (seq > board) seen.add(seq);
 			return text(reply.text ?? "", { team: teamId, covered: reply.covered });
 		},
 	});
@@ -85,27 +76,24 @@ export default function setupChild(pi: ExtensionAPI) {
 	pi.on("before_agent_start", async (_event, ctx) => {
 		const { team: id = "", preamble = "" } = await ask(ctx, { op: "start" }, ctx.signal);
 		teamId = id;
-		const entries = ctx.sessionManager.getBranch();
-		after = teamCursor(entries, teamId, "seq");
-		seen = seenIn(entries.map(detailsOf), teamId);
-		advance(teamCursor(entries, teamId, "board"));
-		const messages = await pull(ctx, true);
+		const { messages, cursor } = await pull(ctx, true);
+		const covered = messages.flatMap((m) => (m.seq ? [m.seq] : []));
 		return {
-			message: { customType: TEAM_MESSAGE, content: [preamble, ...messages.map((m) => m.text)].join(""), display: true, details: { team: teamId, seq: after, board } },
+			message: { customType: TEAM_MESSAGE, content: [preamble, ...messages.map((m) => m.text)].join(""), display: true, details: { team: teamId, covered, board: cursor } },
 		};
 	});
 
 	// Messages ride on a request the model makes anyway: one that follows tool results.
 	pi.on("turn_end", async (event, ctx) => {
 		if (event.outcome !== "completed" || !event.toolResults.length) return;
-		const messages = await pull(ctx, true);
-		if (messages.length) return { entries: [...event.entries, ...messages.map(draft)] };
+		const { messages, cursor } = await pull(ctx, true);
+		if (messages.length) return { entries: [...event.entries, ...drafts(messages, cursor)] };
 	});
 
 	// A message that arrived while the member wrote its final reply continues the same run; a digest alone never does, so it is not asked for.
 	pi.on("agent_before_settle", async (event, ctx) => {
 		if (event.outcome !== "completed") return;
-		const messages = await pull(ctx);
-		if (messages.length) return { entries: [...event.entries, ...messages.map(draft)], continue: true };
+		const { messages } = await pull(ctx);
+		if (messages.length) return { entries: [...event.entries, ...drafts(messages)], continue: true };
 	});
 }

@@ -49,11 +49,12 @@ export interface Delivery {
 export type Request =
 	| { op: "start" }
 	/**
-	 * `board`: the member's board cursor; with it, the reply also holds a one-line digest of the board posts after it, and the cursor that digest moves it to.
-	 * `seen`: the seqs after `board` that the member's branch already holds; the digest leaves them out.
+	 * `seen`: the seqs of the team messages that the member's current branch holds; the reply holds the messages for the member that it lacks.
+	 * `board`: the branch's board cursor; with it, the reply also holds a one-line digest of the board posts after it that `seen` lacks,
+	 * and the cursor that digest moves it to.
 	 */
-	| { op: "inbox"; after: number; board?: number; seen?: number[] }
-	| { op: "wait"; after: number; ms: number }
+	| { op: "inbox"; seen: number[]; board?: number }
+	| { op: "wait"; seen: number[]; ms: number }
 	| ({ op: "team" } & TeamParams);
 
 /** `board`: the caller's board cursor after a digest. `covered`: the seqs of the messages a history call showed. */
@@ -67,18 +68,18 @@ export type Details = Record<string, unknown> | undefined;
 export const detailsOf = (entry: SessionEntry) =>
 	(entry.type === "custom_message" ? entry.details : entry.type === "message" && entry.message.role === "toolResult" ? entry.message.details : undefined) as Details;
 
-/**
- * A read cursor of `entries`, a session's current branch, for team `team`: the highest `key` in their details.
- * `seq`: every team message carries `details: { team, seq }`. `board`: every digest carries `details: { team, board }`.
- */
-export const teamCursor = (entries: SessionEntry[], team: string, key: "seq" | "board") =>
+/** The board cursor of `entries`, a session's current branch, for team `team`: the highest `board` in their details, which every digest carries. */
+export const boardCursor = (entries: SessionEntry[], team: string) =>
 	entries.reduce((max, entry) => {
 		const details = detailsOf(entry);
-		const value = details?.team === team ? details[key] : undefined;
+		const value = details?.team === team ? details.board : undefined;
 		return typeof value === "number" && value > max ? value : max;
 	}, 0);
 
-/** The seqs of team `team`'s messages whose text the entries with `details` hold: delivered or sent (`seq`), or shown by history or counted by a notice (`covered`). */
+/**
+ * The seqs of team `team`'s messages whose text the entries with `details` hold: delivered or sent (`seq`),
+ * or delivered at a member's run start, shown by history, or counted by a notice (`covered`).
+ */
 export const seenIn = (details: Details[], team: string) => {
 	const seqs = new Set<number>();
 	for (const item of details) {
