@@ -46,6 +46,8 @@ interface Agent {
 	/** The last ctx.ui.notify texts of the run's extensions, such as why a watchdog stopped it. */
 	notices: string[];
 	lastText: string;
+	/** The run's tokens and cost, summed over its assistant messages; `input` includes cache writes. */
+	usage: Usage;
 	/** provider/id the child actually answered with; Pi matches --model fuzzily. */
 	model: string;
 	error: string | null;
@@ -65,6 +67,21 @@ interface Agent {
 	waiters: Set<() => void>;
 	run?: Run;
 }
+
+interface Usage {
+	input: number;
+	output: number;
+	cached: number;
+	cost: number;
+}
+const noUsage = (): Usage => ({ input: 0, output: 0, cached: 0, cost: 0 });
+const tokens = new Intl.NumberFormat("en", { notation: "compact", maximumFractionDigits: 1 });
+/** ` · 12.3K in · 8.1K out · 1.2M cached · $0.42`; cached and cost only when there are any, nothing before the first message. */
+const usageText = ({ input, output, cached, cost }: Usage) => {
+	if (!input && !output && !cached) return "";
+	const price = cost <= 0 ? "" : cost < 0.01 ? " · <$0.01" : ` · $${cost.toFixed(2)}`;
+	return ` · ${tokens.format(input)} in · ${tokens.format(output)} out${cached ? ` · ${tokens.format(cached)} cached` : ""}${price}`;
+};
 
 interface Pending {
 	customType: string;
@@ -158,11 +175,11 @@ export default function setupParent(pi: ExtensionAPI) {
 		const now = Date.now();
 		const id = `subagent ${agent.id}${agent.model ? ` · ${agent.model}` : ""}`;
 		if (agent.status === "stopped") return `[stopped] ${id}`;
-		if (agent.status !== "running") return `[${agent.status}] ${id} · ${agent.turns} turns · ${duration(agent.endedAt - agent.startedAt)}`;
+		if (agent.status !== "running") return `[${agent.status}] ${id} · ${agent.turns} turns · ${duration(agent.endedAt - agent.startedAt)}${usageText(agent.usage)}`;
 		const activity = agent.tools.size
 			? [...agent.tools.values()].map((tool) => `${tool.name} ${duration(now - tool.since)}`).join(", ")
 			: agent.phase;
-		return `[running] ${id} · turn ${agent.turns + 1} · ${activity} · last event ${duration(now - agent.lastEventAt)} ago · ${duration(now - agent.startedAt)}`;
+		return `[running] ${id} · turn ${agent.turns + 1} · ${activity} · last event ${duration(now - agent.lastEventAt)} ago · ${duration(now - agent.startedAt)}${usageText(agent.usage)}`;
 	};
 
 	const noticeLine = (agent: Agent) => (agent.notices.length ? `Notices: ${agent.notices.join(" | ")}` : "");
@@ -376,6 +393,13 @@ export default function setupParent(pi: ExtensionAPI) {
 			case "message_end": {
 				if (event.message?.role !== "assistant") return;
 				if (event.message.provider && event.message.model) agent.model = `${event.message.provider}/${event.message.model}`;
+				const usage = event.message.usage;
+				if (usage) {
+					agent.usage.input += (usage.input ?? 0) + (usage.cacheWrite ?? 0);
+					agent.usage.output += usage.output ?? 0;
+					agent.usage.cached += usage.cacheRead ?? 0;
+					agent.usage.cost += usage.cost?.total ?? 0;
+				}
 				const text = assistantText(event.message);
 				if (text) {
 					agent.lastText = text;
@@ -444,6 +468,7 @@ export default function setupParent(pi: ExtensionAPI) {
 			narration: [],
 			notices: [],
 			lastText: "",
+			usage: noUsage(),
 			model: "",
 			error: null,
 			delivered: null,
@@ -495,6 +520,7 @@ export default function setupParent(pi: ExtensionAPI) {
 			narration: [],
 			notices: [],
 			lastText: "",
+			usage: noUsage(),
 			model: "",
 			error: null,
 			delivered: null,

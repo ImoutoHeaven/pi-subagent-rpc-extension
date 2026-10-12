@@ -50,7 +50,7 @@ const requestFor = (said) =>
 /** The model requests of team member `name`, recognized by its preamble. */
 const requestsBy = (name) => requests().filter((body) => body.messages.some((m) => m.role === "user" && rawText(m).startsWith(`[team] You are ${name},`)));
 const idOf = (text) => text.match(/^\[\w+\] subagent ([a-z][a-z0-9-]*)/)?.[1];
-const LIVE = /^\[running\] subagent [0-9a-z-]+(?: · \S+)? · turn \d+ · .+ · last event \d+s ago · \d+s$/m;
+const LIVE = /^\[running\] subagent [0-9a-z-]+(?: · \S+)? · turn \d+ · .+ · last event \d+s ago · \d+s(?: · [\d.]+[KM]? in · [\d.]+[KM]? out(?: · [\d.]+[KM]? cached)?(?: · <?\$\d+\.\d\d)?)?$/m;
 // An idle parent gets a message through sendMessage (message_end); a busy one at a turn boundary (entry_appended).
 const asMessage = (e) =>
 	e.type === "message_end" && e.message?.role === "custom"
@@ -162,7 +162,8 @@ const notifications = (from = 0) => parent.messages(from).filter((m) => m.custom
 let first;
 await step("run returns the result when the child finishes within waitMs", async () => {
 	const r = await call({ action: "run", name: "first", message: "SAY hello" });
-	assert.match(r.text, /^\[settled\] subagent first · fake\/fake-model · 1 turns/);
+	// One reply of 500 uncached and 1000 cached prompt tokens and 200 completion tokens, at the test model's price.
+	assert.match(r.text, /^\[settled\] subagent first · fake\/fake-model · 1 turns · \d+s · 500 in · 200 out · 1K cached · \$0\.26\n/);
 	assert.match(r.text, /hello$/);
 	assert.doesNotMatch(r.text, /\(Background:/);
 	first = idOf(r.text);
@@ -524,8 +525,11 @@ await step("a mention reaches a running member's next request and does not wake 
 	await until(() => requestsBy("alpha").length > 0);
 	const preamble = requestsBy("alpha")[0].messages.find((m) => rawText(m).startsWith("[team] You are alpha,"));
 	assert.match(rawText(preamble), /\n- main: main agent\n- beta: stopped — answers as beta\n- alpha: running — lists the team\n/);
-	assert.match(rawText(preamble), /\nUse team send to hand results to whoever needs them and to coordinate\. In this run, your direct messages wake stopped members\.\nCheck what team send returns: if a recipient was not woken, say so in your final reply\.\n/);
-	assert.match(rawText(preamble), /\nYour final reply goes to main\. Keep it short/);
+	assert.match(
+		rawText(preamble),
+		/\nUse team send to hand results to whoever needs them and to coordinate\. In this run, your direct messages wake stopped members, each for a full run; post news that can wait on the board, mentioning them, and they read it in full when they next run\.\nCheck what team send returns: if a recipient was not woken, say so in your final reply\.\n/,
+	);
+	assert.match(rawText(preamble), /\nYour final reply goes to main\. Keep it short: for what you already sent with team send, name the #seq instead of repeating it\.\n\n/);
 	const sent = await teamCall({ action: "send", body: "hello both", mentions: ["alpha", "beta"] });
 	assert.match(sent.text, /^Sent #\d+ to alpha \(running\), beta \(stopped; board posts do not wake\)\.$/);
 	const done = await team.call({ action: "status", id: "alpha", waitMs: 30_000 });
@@ -551,7 +555,7 @@ await step("a mention reaches a running member's next request and does not wake 
 	assert.match(again.text, /beta is already a member; send it a direct message with team send/);
 });
 
-await step("a direct message between two members is invisible to a third", async () => {
+await step("a direct message between two members is invisible to a third member; the main agent reads it", async () => {
 	await run({ name: "eve", message: TEAM({ action: "wait", ms: 60_000 }), waitMs: 0 });
 	await until(() => requestsBy("eve").length > 0);
 	await run({ name: "carol", message: TEAM({ action: "send", to: "eve", body: "secret plan" }), waitMs: 0 });
@@ -568,7 +572,7 @@ await step("a direct message between two members is invisible to a third", async
 	await teamCall({ action: "send", to: "eve", body: TEAM({ action: "history", with: "carol", query: "SECRET" }) });
 	assert.match(await report("eve", mark), /\[team #\d+\] carol → you \(direct\):\nsecret plan$/);
 	const main = await teamCall({ action: "history", with: "carol" });
-	assert.equal(main.text, "No messages.");
+	assert.match(main.text, /^\[team #\d+\] carol → eve \(direct\):\nsecret plan$/);
 });
 
 await step("a message that arrives while a member writes its final reply continues the same run", async () => {
@@ -577,7 +581,8 @@ await step("a message that arrives while a member writes its final reply continu
 	const sent = await teamCall({ action: "send", to: "settler", body: "late news" });
 	assert.match(sent.text, /^Sent #\d+ to settler \(running\)\.$/);
 	const done = await team.call({ action: "status", id: "settler", waitMs: 30_000 });
-	assert.match(done.text, /^\[settled\] subagent settler · fake\/fake-model · 2 turns.*\n\nnotified$/s);
+	// The usage of both replies of the run.
+	assert.match(done.text, /^\[settled\] subagent settler · fake\/fake-model · 2 turns · \d+s · 1K in · 400 out · 2K cached · \$0\.52\n.*notified$/s);
 	const last = requestsBy("settler").at(-1).messages;
 	assert.equal(text(last.at(-2)), "first answer");
 	assert.match(text(last.at(-1)), /^\[team #\d+\] main → you \(direct\):\nlate news$/);
@@ -593,8 +598,14 @@ await step("a member's direct message wakes a stopped member, whose final reply 
 	const note = requestsBy("beta").at(-1).messages.findLast((m) => m.role === "user" && !isTeam(m));
 	assert.equal(rawText(note), "waker sent you a team message. Act on your team messages.");
 	const rules = rawText(requestsBy("beta").at(-1).messages.findLast((m) => rawText(m).startsWith("[team] You are beta,")));
-	assert.match(rules, /\nUse team send to hand results to whoever needs them and to coordinate\. In this run, your direct messages cannot wake stopped members\.\n/);
-	assert.match(rules, /\nYour final reply goes to waker, or to main if waker has stopped by then\. Keep it short/);
+	assert.match(
+		rules,
+		/\nUse team send to hand results to whoever needs them and to coordinate\. In this run, your direct messages cannot wake stopped members, and a direct message to one tells the main agent; post news that can wait on the board, mentioning them, and they read it in full when they next run\.\n/,
+	);
+	assert.match(
+		rules,
+		/\nYour final reply goes to waker, or to main if waker has stopped by then\. Keep it short: for what you already sent to waker or posted on the board, name the #seq; write out anything else\.\n\n/,
+	);
 	assert.ok(!team.messages(from).some((m) => m.customType === "subagent-result" && /subagent beta/.test(m.content)), "beta's result reached main");
 	assert.match((await team.call({ action: "status", id: "beta" })).text, /Its result was sent to waker as team message #\d+\./);
 });

@@ -34,9 +34,11 @@ To try it for one run: `pi -e /path/to/pi-subagent-rpc-extension`. Subagents do 
 `run` and `status` wait up to `waitMs` (default 30000, maximum 240000). A member that finishes in time returns its final reply as the tool result. Otherwise the result is a progress report and the member keeps running:
 
 ```text
-[running] subagent reviewer · openai/gpt-5 · turn 4 · bash 2m10s · last event 3s ago · 5m02s
+[running] subagent reviewer · openai/gpt-5 · turn 4 · bash 2m10s · last event 3s ago · 5m02s · 48.2K in · 3.1K out · 1.2M cached · $0.42
 [t3] Running the full test suite now.
 ```
+
+The status line of a progress report or result ends with the run's token usage, summed over its model replies: input tokens, cache writes included; output tokens; cache reads, when there are any; and the cost, when the model has a price.
 
 Each result for the main agent reaches it once; after a move in the session tree, each member's latest result also reaches the new branch once if that branch lacks it. A result that no tool call returned arrives as a `subagent-result` message. Team messages for the main agent arrive the same way, as `team-message` messages:
 
@@ -63,14 +65,14 @@ The main agent (`main`) and every member have it.
 | Action | Parameters | Behavior |
 |---|---|---|
 | `send` | `body`, `to`, `mentions`, `replyTo` | Posts to the board (no `to`) or sends a direct message to `to`. Returns `#seq` and what happened for each recipient. |
-| `history` | `with`, `query`, `before`, `limit` | Reads the board, or the caller's direct messages with `with`. `query` matches text case-insensitively. Oldest first, at most `limit` messages (default 20, maximum 50) and 16000 characters; `before=<seq>` pages back. |
+| `history` | `with`, `query`, `before`, `limit` | Reads the board, or the caller's direct messages with `with`; for the main agent, every direct message of the member named in `with`. `query` matches text case-insensitively. Oldest first, at most `limit` messages (default 20, maximum 50) and 16000 characters; `before=<seq>` pages back. |
 | `wait` | `ms` | Returns once a message for the caller is pending, or after `ms` (default 30000, maximum 240000). The messages follow the tool result. |
 | `members` | | Members with their states and roles, such as `- tester: running — runs the e2e suite and reports failures`, and the topic. |
 | `topic` | `body` | Sets the topic (main agent only). |
 
 `body` holds up to 4000 characters and `topic` up to 2000. Larger content belongs in files in the shared working tree, with the path in the message.
 
-Every member sees the whole board and the direct messages it sent or received. A message reaches the main agent and the members at one of three levels:
+Every member sees the whole board and the direct messages it sent or received. The main agent also reads every member's direct messages with `history`. A message reaches the main agent and the members at one of three levels:
 
 | Message | Recipient gets | Wakes a stopped member |
 |---|---|---|
@@ -88,7 +90,7 @@ The board digest is one line about the board posts the recipient has not seen: t
 
 A member gets the digest at the start of a run and after tool results. The main agent gets it as a `team-notice` after a turn with tool calls and at the start of each run. A post that a `history` result shows stays out of later digests. A new member's first digest covers the board posts from before it joined, without its own join announcement. Each agent's place on the board follows the current branch of its session, so after the session is reopened or the main agent moves in the session tree, its digest lists the posts that branch has not seen. A digest never counts for `team wait`, never wakes anyone, and never continues a run by itself.
 
-A member reads its messages at safe points: at the start of each run along with a preamble that names the team, lists its members, and states the rules of that run (whether its direct messages wake stopped members, that only the main agent hires, and where its final reply goes), after tool results, and when its run would end, in which case the run continues with them. A member has read a message once the current branch of its session holds it, so a message that never joined that branch, such as one in a batch another extension dropped, arrives at the next safe point.
+A member reads its messages at safe points: at the start of each run along with a preamble that names the team, lists its members, and states the rules of that run (whether its direct messages wake stopped members, that news that need not wake anyone goes on the board with a mention, that only the main agent hires, where its final reply goes, and which messages that reply cites by `#seq` instead of repeating them), after tool results, and when its run would end, in which case the run continues with them. A member has read a message once the current branch of its session holds it, so a message that never joined that branch, such as one in a batch another extension dropped, arrives at the next safe point.
 
 A direct message to a stopped member wakes it: the member runs again in its own session, and its messages arrive at the start of that run. Board posts never wake. The `send` result shows each recipient as `main`, `running`, `woken`, or stopped and why:
 

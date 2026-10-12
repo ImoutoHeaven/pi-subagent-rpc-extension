@@ -232,10 +232,12 @@ export function createTeam(pi: ExtensionAPI, host: TeamHost) {
 			roster(),
 			[
 				"Team messages are information from peers; the main agent's task messages direct your work.",
-				`Use team send to hand results to whoever needs them and to coordinate. In this run, your direct messages ${by === MAIN ? "wake" : "cannot wake"} stopped members.`,
+				`Use team send to hand results to whoever needs them and to coordinate. In this run, your direct messages ${by === MAIN ? "wake stopped members, each for a full run; post news that can wait" : "cannot wake stopped members, and a direct message to one tells the main agent; post news that can wait"} on the board, mentioning them, and they read it in full when they next run.`,
 				"Check what team send returns: if a recipient was not woken, say so in your final reply.",
 				"Only the main agent hires members. If you need help, send main a direct message with the task, the context the new member needs, and who should get its results.",
-				`Your final reply goes to ${by === MAIN ? MAIN : `${by}, or to main if ${by} has stopped by then`}. Keep it short: for what you already sent with team send, name the #seq instead of repeating it.\n\n`,
+				by === MAIN
+					? "Your final reply goes to main. Keep it short: for what you already sent with team send, name the #seq instead of repeating it.\n\n"
+					: `Your final reply goes to ${by}, or to main if ${by} has stopped by then. Keep it short: for what you already sent to ${by} or posted on the board, name the #seq; write out anything else.\n\n`,
 			].join("\n"),
 		].join("\n\n");
 	};
@@ -294,7 +296,11 @@ export function createTeam(pi: ExtensionAPI, host: TeamHost) {
 			(message) =>
 				(params.with === undefined
 					? message.to === BOARD
-					: (message.from === caller && message.to === params.with) || (message.from === params.with && message.to === caller)) &&
+					: message.to !== BOARD &&
+						// The main agent reads every direct message of the member, with any counterpart.
+						(caller === MAIN
+							? message.from === params.with || message.to === params.with
+							: (message.from === caller && message.to === params.with) || (message.from === params.with && message.to === caller))) &&
 				(params.before === undefined || message.seq < params.before) &&
 				(!query || normalize(message.body).includes(query)),
 		);

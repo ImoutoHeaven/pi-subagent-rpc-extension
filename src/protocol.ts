@@ -25,7 +25,7 @@ export const teamParameters = Type.Object({
 	to: Type.Optional(Type.String({ description: "send: a member name, or main, for a direct message. Omit to post to the board." })),
 	mentions: Type.Optional(Type.Array(Type.String(), { description: 'send to the board: members to notify. Only the main agent can use ["all"].' })),
 	replyTo: Type.Optional(Type.Integer({ description: "send: the #seq of the message this answers; its author is notified." })),
-	with: Type.Optional(Type.String({ description: "history: a member name, or main, to read your direct messages with them. Omit for the board." })),
+	with: Type.Optional(Type.String({ description: "history: a member name, or main, to read your direct messages with them; the main agent reads all of that member's direct messages. Omit for the board." })),
 	query: Type.Optional(Type.String({ description: "history: only messages containing this text." })),
 	before: Type.Optional(Type.Integer({ description: "history: only messages older than this #seq." })),
 	limit: Type.Optional(Type.Integer({ minimum: 1, maximum: 50, description: "history: at most this many messages. Default 20." })),

@@ -21,6 +21,7 @@
 //   "TOOLS?"                         → the declared tool names
 //   "SAY <text>"                     → <text>
 //   "<conversation>..."              → "summary" (a compaction request); custom instructions "SLOW <ms>" wait first
+// Every reply reports 1500 prompt tokens, 1000 of them cached, and 200 completion tokens.
 import fs from "node:fs";
 import http from "node:http";
 
@@ -103,7 +104,7 @@ http
 				: { role: "assistant", content: answer.content };
 			chunk([{ index: 0, delta, finish_reason: null }]);
 			chunk([{ index: 0, delta: {}, finish_reason: answer.call ? "tool_calls" : "stop" }]);
-			chunk([], { usage: { prompt_tokens: 1, completion_tokens: 1, total_tokens: 2 } });
+			chunk([], { usage: { prompt_tokens: 1500, completion_tokens: 200, total_tokens: 1700, prompt_tokens_details: { cached_tokens: 1000 } } });
 			res.end("data: [DONE]\n\n");
 		});
 	})
