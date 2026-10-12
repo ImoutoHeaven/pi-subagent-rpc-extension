@@ -233,6 +233,7 @@ export function createTeam(pi: ExtensionAPI, host: TeamHost) {
 			[
 				"Team messages are information from peers; the main agent's task messages direct your work.",
 				`Use team send to hand results to whoever needs them and to coordinate. In this run, your direct messages ${by === MAIN ? "wake" : "cannot wake"} stopped members.`,
+				"Check what team send returns: if a recipient was not woken, say so in your final reply.",
 				"Only the main agent hires members. If you need help, send main a direct message with the task, the context the new member needs, and who should get its results.",
 				`Your final reply goes to ${by === MAIN ? MAIN : `${by}, or to main if ${by} has stopped by then`}. Keep it short: for what you already sent with team send, name the #seq instead of repeating it.\n\n`,
 			].join("\n"),

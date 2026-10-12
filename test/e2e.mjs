@@ -524,7 +524,7 @@ await step("a mention reaches a running member's next request and does not wake 
 	await until(() => requestsBy("alpha").length > 0);
 	const preamble = requestsBy("alpha")[0].messages.find((m) => rawText(m).startsWith("[team] You are alpha,"));
 	assert.match(rawText(preamble), /\n- main: main agent\n- beta: stopped — answers as beta\n- alpha: running — lists the team\n/);
-	assert.match(rawText(preamble), /\nUse team send to hand results to whoever needs them and to coordinate\. In this run, your direct messages wake stopped members\.\n/);
+	assert.match(rawText(preamble), /\nUse team send to hand results to whoever needs them and to coordinate\. In this run, your direct messages wake stopped members\.\nCheck what team send returns: if a recipient was not woken, say so in your final reply\.\n/);
 	assert.match(rawText(preamble), /\nYour final reply goes to main\. Keep it short/);
 	const sent = await teamCall({ action: "send", body: "hello both", mentions: ["alpha", "beta"] });
 	assert.match(sent.text, /^Sent #\d+ to alpha \(running\), beta \(stopped; board posts do not wake\)\.$/);
