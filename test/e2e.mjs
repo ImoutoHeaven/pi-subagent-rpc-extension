@@ -524,6 +524,8 @@ await step("a mention reaches a running member's next request and does not wake 
 	await until(() => requestsBy("alpha").length > 0);
 	const preamble = requestsBy("alpha")[0].messages.find((m) => rawText(m).startsWith("[team] You are alpha,"));
 	assert.match(rawText(preamble), /\n- main: main agent\n- beta: stopped — answers as beta\n- alpha: running — lists the team\n/);
+	assert.match(rawText(preamble), /\nUse team send to hand results to whoever needs them and to coordinate\. In this run, your direct messages wake stopped members\.\n/);
+	assert.match(rawText(preamble), /\nYour final reply goes to main\. Keep it short/);
 	const sent = await teamCall({ action: "send", body: "hello both", mentions: ["alpha", "beta"] });
 	assert.match(sent.text, /^Sent #\d+ to alpha \(running\), beta \(stopped; board posts do not wake\)\.$/);
 	const done = await team.call({ action: "status", id: "alpha", waitMs: 30_000 });
@@ -589,7 +591,10 @@ await step("a member's direct message wakes a stopped member, whose final reply 
 	assert.ok(seen.some((m) => m.role === "tool" && /^Sent #\d+ to beta \(woken\)\.$/.test(rawText(m))), "beta was not woken");
 	assert.match(text(seen.at(-1)), /^\[team #\d+\] beta → you \(direct\):\nFinal reply of beta \(settled\); full text: .*final\.md\n\nfor waker$/);
 	const note = requestsBy("beta").at(-1).messages.findLast((m) => m.role === "user" && !isTeam(m));
-	assert.equal(rawText(note), "waker sent you a team message. Act on your team messages; your final reply is sent to waker.");
+	assert.equal(rawText(note), "waker sent you a team message. Act on your team messages.");
+	const rules = rawText(requestsBy("beta").at(-1).messages.findLast((m) => rawText(m).startsWith("[team] You are beta,")));
+	assert.match(rules, /\nUse team send to hand results to whoever needs them and to coordinate\. In this run, your direct messages cannot wake stopped members\.\n/);
+	assert.match(rules, /\nYour final reply goes to waker, or to main if waker has stopped by then\. Keep it short/);
 	assert.ok(!team.messages(from).some((m) => m.customType === "subagent-result" && /subagent beta/.test(m.content)), "beta's result reached main");
 	assert.match((await team.call({ action: "status", id: "beta" })).text, /Its result was sent to waker as team message #\d+\./);
 });

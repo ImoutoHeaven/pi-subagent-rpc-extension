@@ -329,7 +329,7 @@ export default function setupParent(pi: ExtensionAPI) {
 			const note =
 				by === MAIN
 					? "The main agent sent you a team message. Act on your team messages."
-					: `${by} sent you a team message. Act on your team messages; your final reply is sent to ${by}.`;
+					: `${by} sent you a team message. Act on your team messages.`;
 			launch(agent, note, by);
 		},
 		notify,

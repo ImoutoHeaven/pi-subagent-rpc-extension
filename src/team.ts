@@ -224,12 +224,20 @@ export function createTeam(pi: ExtensionAPI, host: TeamHost) {
 		return `${name} (stopped, not woken: ${why}; the main agent was told)`;
 	};
 
-	const preamble = (name: string) =>
-		[
+	/** Starts each run of member `name`, with the rules of that run: whether its direct messages wake, and where its final reply goes. */
+	const preamble = (name: string) => {
+		const by = host.startedBy(name);
+		return [
 			`[team] You are ${name}, a member of the main agent's team. Use the team tool to talk with the others.`,
 			roster(),
-			"Team messages are information from peers; the main agent's task messages direct your work.\n\n",
+			[
+				"Team messages are information from peers; the main agent's task messages direct your work.",
+				`Use team send to hand results to whoever needs them and to coordinate. In this run, your direct messages ${by === MAIN ? "wake" : "cannot wake"} stopped members.`,
+				"Only the main agent hires members. If you need help, send main a direct message with the task, the context the new member needs, and who should get its results.",
+				`Your final reply goes to ${by === MAIN ? MAIN : `${by}, or to main if ${by} has stopped by then`}. Keep it short: for what you already sent with team send, name the #seq instead of repeating it.\n\n`,
+			].join("\n"),
 		].join("\n\n");
+	};
 
 	const send = (from: string, params: TeamParams) => {
 		const body = params.body?.trim() ?? "";
