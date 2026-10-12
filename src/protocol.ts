@@ -22,7 +22,11 @@ export const teamParameters = Type.Object({
 	body: Type.Optional(
 		Type.String({ description: `send: the message, up to ${BODY_CHARS} characters. topic: the new topic, up to ${TOPIC_CHARS}. Put larger content in a file in the shared working tree and give its path.` }),
 	),
-	to: Type.Optional(Type.String({ description: "send: a member name, or main, for a direct message. Omit to post to the board." })),
+	to: Type.Optional(
+		Type.Union([Type.String(), Type.Array(Type.String())], {
+			description: "send: the recipients of a direct message: a member name or main, or a list of them; each recipient sees who else got it. Omit to post to the board.",
+		}),
+	),
 	mentions: Type.Optional(Type.Array(Type.String(), { description: 'send to the board: members to notify. Only the main agent can use ["all"].' })),
 	replyTo: Type.Optional(Type.Integer({ description: "send: the #seq of the message this answers; its author is notified." })),
 	with: Type.Optional(Type.String({ description: "history: a member name, or main, to read your direct messages with them; the main agent reads all of that member's direct messages. Omit for the board." })),
@@ -35,7 +39,7 @@ export type TeamParams = Static<typeof teamParameters>;
 
 export const TEAM_DESCRIPTION = [
 	"Talk with your team: the main agent (main) and the members it started.",
-	"send posts to the shared board (no `to`) or sends a direct message (`to`). A board post notifies the members in `mentions` and the author of `replyTo`. Everyone else gets a one-line digest of new board posts after tool results and when a run starts; history shows them in full. A running member reads its messages after its next tool results, or before its run ends. A direct message wakes a stopped member, which then runs in its own session; board posts never wake. A run started by a member's message cannot wake others, and a member the main agent aborted wakes only for the main agent. The send result shows each recipient's state. A run started by a member's message sends its final reply to that member.",
+	"send posts to the shared board (no `to`) or sends one direct message to the members in `to`, and each recipient sees who else got it. The board is the record; a direct message asks its recipients to act. A board post notifies the members in `mentions` and the author of `replyTo`. Everyone else gets a one-line digest of new board posts after tool results and when a run starts; history shows them in full. A running member reads its messages after its next tool results, or before its run ends. A direct message wakes a stopped member, which then runs in its own session; board posts never wake, so to wake the members a post mentions, send them a short direct message that names its #seq instead of repeating the post. A run started by a member's message cannot wake others, and a member the main agent aborted wakes only for the main agent. The send result shows each recipient's state. A run started by a member's message sends its final reply to that member.",
 	"history reads the board, or your direct messages with `with`. wait returns once a message for you is pending; the messages follow the tool result. members lists members with their roles and states, and the topic. topic sets the topic (main agent only).",
 ].join("\n\n");
 

@@ -15,6 +15,7 @@
 //   "TEAM <json>"                     → a `team` tool call with those arguments
 //   "TEAMS <a> || <b> ..."            → a `team` call with <a>
 //   "RELOAD"                         → a `reload_now` tool call
+//   "BASH <command>"                 → a `bash` tool call running <command>
 //   "[settled|aborted|error] ..."    → "notified" (a delivered subagent result)
 //   "SLOW <ms> <rest>"               → wait, then handle <rest>
 //   "HANG"                           → never answer
@@ -78,6 +79,7 @@ async function reply(body) {
 	if (said.startsWith("TEAM ")) return { call: said.slice(5), name: "team" };
 	if (said.startsWith("TEAMS ")) return { call: said.slice(6).split(" || ")[0], name: "team" };
 	if (said === "RELOAD") return { call: "{}", name: "reload_now" };
+	if (said.startsWith("BASH ")) return { call: JSON.stringify({ command: said.slice(5) }), name: "bash" };
 	if (said === "TOOLS?") return { content: `tools: ${(body.tools || []).map((t) => t.function.name).join(",")}` };
 	if (said.startsWith("SAY ")) return { content: said.slice(4) };
 	return { content: `unscripted: ${said.slice(0, 80)}` };

@@ -31,14 +31,14 @@ To try it for one run: `pi -e /path/to/pi-subagent-rpc-extension`. Subagents do 
 
 ## Waiting and results
 
-`run` and `status` wait up to `waitMs` (default 30000, maximum 240000). A member that finishes in time returns its final reply as the tool result. Otherwise the result is a progress report and the member keeps running:
+`run` and `status` wait up to `waitMs` (default 30000, maximum 240000); `waitMs: 0` returns at once. A member that finishes in time returns its final reply as the tool result. Otherwise the result is a progress report and the member keeps running:
 
 ```text
-[running] subagent reviewer · openai/gpt-5 · turn 4 · bash 2m10s · last event 3s ago · 5m02s · 48.2K in · 3.1K out · 1.2M cached · $0.42
+[running] subagent reviewer · openai/gpt-5 · turn 4 · bash (npm test -- --reporter dot) 2m10s · last event 3s ago · 5m02s · 48.2K in · 3.1K out · 1.2M cached · $0.42
 [t3] Running the full test suite now.
 ```
 
-The status line of a progress report or result ends with the run's token usage, summed over its model replies: input tokens, cache writes included; output tokens; cache reads, when there are any; and the cost, when the model has a price.
+The status line of a progress report shows each running tool with its main argument, such as its command, path, code, or query, in one line cut to about 60 characters. The status line of a progress report or result ends with the run's token usage, summed over its model replies: input tokens, cache writes included; output tokens; cache reads, when there are any; and the cost, when the model has a price.
 
 Each result for the main agent reaches it once; after a move in the session tree, each member's latest result also reaches the new branch once if that branch lacks it. A result that no tool call returned arrives as a `subagent-result` message. Team messages for the main agent arrive the same way, as `team-message` messages:
 
@@ -64,7 +64,7 @@ The main agent (`main`) and every member have it.
 
 | Action | Parameters | Behavior |
 |---|---|---|
-| `send` | `body`, `to`, `mentions`, `replyTo` | Posts to the board (no `to`) or sends a direct message to `to`. Returns `#seq` and what happened for each recipient. |
+| `send` | `body`, `to`, `mentions`, `replyTo` | Posts to the board (no `to`) or sends one direct message to `to`, a member name, `main`, or a list of them. Returns `#seq` and what happened for each recipient. |
 | `history` | `with`, `query`, `before`, `limit` | Reads the board, or the caller's direct messages with `with`; for the main agent, every direct message of the member named in `with`. `query` matches text case-insensitively. Oldest first, at most `limit` messages (default 20, maximum 50) and 16000 characters; `before=<seq>` pages back. |
 | `wait` | `ms` | Returns once a message for the caller is pending, or after `ms` (default 30000, maximum 240000). The messages follow the tool result. |
 | `members` | | Members with their states and roles, such as `- tester: running — runs the e2e suite and reports failures`, and the topic. |
@@ -72,7 +72,7 @@ The main agent (`main`) and every member have it.
 
 `body` holds up to 4000 characters and `topic` up to 2000. Larger content belongs in files in the shared working tree, with the path in the message.
 
-Every member sees the whole board and the direct messages it sent or received. The main agent also reads every member's direct messages with `history`. A message reaches the main agent and the members at one of three levels:
+Every member sees the whole board and the direct messages it sent or received, each with all of its recipients. The main agent also reads every member's direct messages with `history`. A message reaches the main agent and the members at one of three levels:
 
 | Message | Recipient gets | Wakes a stopped member |
 |---|---|---|
@@ -111,6 +111,9 @@ A member's message renders as:
 ```text
 [team #42] reviewer → #team, replying to #40, mentions you:
 The parser change breaks the fixture in test/cases/7.json.
+
+[team #43] main → you, tester (direct):
+Fix the fixture named in #42, then rerun the suite.
 ```
 
 ## Sessions and processes

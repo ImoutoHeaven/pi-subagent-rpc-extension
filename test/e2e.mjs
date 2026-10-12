@@ -217,6 +217,17 @@ await step("a result that outlives waitMs arrives once as a message that starts 
 	assert.doesNotMatch(again.text, /late/);
 });
 
+await step("progress shows each running tool with a one-line summary of its arguments", async () => {
+	const from = events.length;
+	await call({ action: "run", name: "sleeper", message: "BASH sleep 4 && echo slept", waitMs: 0 });
+	let progress = "";
+	for (const end = Date.now() + 30_000; !progress.includes(" · bash (") && Date.now() < end; ) progress = (await call({ action: "status", id: "sleeper", waitMs: 500 })).text;
+	assert.match(progress, LIVE);
+	assert.match(progress, /^\[running\] subagent sleeper(?: · \S+)? · turn 1 · bash \(sleep 4 && echo slept\) \d+s · last event /);
+	const result = await waitEvent((e) => asMessage(e)?.customType === "subagent-result" && asMessage(e).details?.id === "sleeper", from);
+	await waitEvent((e) => e.type === "agent_settled", events.indexOf(result));
+});
+
 const finalFile = (id) =>
 	fs.readdirSync(join(WORK_DIR, "sessions"), { recursive: true }).some((p) => String(p).replaceAll("\\", "/").endsWith(`subagents/${id}/final.md`));
 
@@ -575,6 +586,56 @@ await step("a direct message between two members is invisible to a third member;
 	assert.match(main.text, /^\[team #\d+\] carol → eve \(direct\):\nsecret plan$/);
 });
 
+await step("a direct message to several members is one message that each gets and wakes; only its participants see it", async () => {
+	await run({ name: "ann", message: TEAM({ action: "wait", ms: 60_000 }), waitMs: 0 });
+	await until(() => requestsBy("ann").length > 0);
+	await run({ name: "bob", message: "SAY bob ready" });
+	let mark = team.events.length;
+	const sent = await teamCall({ action: "send", to: ["ann", "bob"], body: "SAY to both" });
+	const seq = sent.text.match(/^Sent #(\d+) to ann \(running\), bob \(woken\)\.$/)?.[1] ?? assert.fail(sent.text);
+	assert.match(await report("bob", mark), /to both$/);
+	assert.match(rawText(requestsBy("bob").at(-1).messages.at(-1)), new RegExp(`\\[team #${seq}\\] main → ann, you \\(direct\\):\\nSAY to both\\n`));
+	await finished("ann");
+	assert.ok(requestsBy("ann").at(-1).messages.some((m) => text(m) === `[team #${seq}] main → you, bob (direct):\nSAY to both`), "ann did not get it");
+	assert.equal((await teamCall({ action: "history", with: "ann" })).text, `[team #${seq}] you → ann, bob (direct):\nSAY to both`);
+	// A recipient reads it with the other recipient; a member outside it does not.
+	mark = team.events.length;
+	await teamCall({ action: "send", to: "bob", body: TEAM({ action: "history", with: "ann" }) });
+	assert.match(await report("bob", mark), new RegExp(`team: \\[team #${seq}\\] main → ann, you \\(direct\\):\\nSAY to both$`));
+	assert.match((await run({ name: "cid", message: TEAM({ action: "history", with: "ann" }) })).text, /team: No messages\.$/);
+});
+
+await step("a direct reply to a member's direct message also goes to its author, who reads it in history", async () => {
+	const from = team.events.length;
+	await run({ name: "dot", message: TEAM({ action: "send", to: "main", body: "question for main" }) });
+	const asked = (await team.waitMessage("team-message", from)).details.seq;
+	// run returns early when dot's message arrives.
+	await finished("dot");
+	let mark = team.events.length;
+	const sent = await teamCall({ action: "send", to: ["ann"], replyTo: asked, body: "SAY answered" });
+	const seq = sent.text.match(/^Sent #(\d+) to ann \(woken\), dot \(woken\)\.$/)?.[1] ?? assert.fail(sent.text);
+	const reply = (viewer) => `[team #${seq}] ${viewer} → ann, dot (direct), replying to #${asked}:\nSAY answered`;
+	for (const id of ["ann", "dot"]) assert.match(await report(id, mark), /\n\nanswered(\n\n\(Background: .*\))?$/);
+	assert.ok((await teamCall({ action: "history", with: "dot" })).text.includes(reply("you")), "main's history lacks the reply");
+	mark = team.events.length;
+	await teamCall({ action: "send", to: "dot", body: TEAM({ action: "history", with: "main" }) });
+	assert.ok((await report("dot", mark)).includes(reply("main").replace("dot (direct)", "you (direct)")), "dot's history lacks the reply");
+});
+
+await step("a direct message names each recipient once, never its sender, and only members", async () => {
+	for (const [to, error] of [
+		[[], /to names at least one recipient/],
+		[["ann", "ann"], /to names ann twice/],
+		[["ann", "main"], /you cannot send a message to yourself/],
+		[["ann", "nobody"], /Unknown member: nobody/],
+		[["all"], /Unknown member: all/],
+	]) {
+		const r = await teamCall({ action: "send", to, body: "x" });
+		assert.ok(r.isError, r.text);
+		assert.match(r.text, error);
+	}
+});
+
 await step("a message that arrives while a member writes its final reply continues the same run", async () => {
 	await run({ name: "settler", message: "SLOW 3000 SAY first answer", waitMs: 0 });
 	await until(() => requestsBy("settler").length > 0);
@@ -651,6 +712,23 @@ await step("a run woken by a member cannot wake others; the main agent is told w
 	);
 });
 
+await step("a direct message to several members from a run woken by a member wakes none of them and tells the main agent about each", async () => {
+	await run({ name: "ray", message: "SAY ray ready" });
+	const from = team.events.length;
+	const relayed = TEAM({ action: "send", to: ["ann", "bob"], body: "SAY not woken" });
+	await run({ name: "orin", message: TEAMS([{ action: "send", to: "ray", body: relayed }, { action: "wait", ms: 60_000 }]), waitMs: 0 });
+	const result = await team.waitEvent((e) => asMessage(e)?.customType === "subagent-result" && asMessage(e).details?.id === "orin", from);
+	await team.waitEvent((e) => e.type === "agent_settled", team.events.indexOf(result));
+	const sendResult = rawText(requestsBy("ray").at(-1).messages.findLast((m) => m.role === "tool"));
+	const seq = sendResult.match(/^Sent #(\d+) /)?.[1] ?? assert.fail(sendResult);
+	const why = "stopped, not woken: your run was started by orin's message, so it cannot start others; the main agent was told";
+	assert.equal(sendResult, `Sent #${seq} to ann (${why}), bob (${why}).`);
+	assert.deepEqual(
+		team.messages(from).filter((m) => m.customType === "team-notice" && m.content.startsWith(`[team] #${seq} `)).map((m) => m.content.match(/→ (\w+) is waiting/)[1]),
+		["ann", "bob"],
+	);
+});
+
 await step("a member the main agent aborted wakes only for the main agent's direct message", async () => {
 	await run({ name: "locked", message: "HANG", waitMs: 300 });
 	assert.match((await team.call({ action: "abort", id: "locked" })).text, /^\[aborted\]/);
@@ -695,7 +773,7 @@ await step("wait returns early when a message arrives, and the message follows t
 	const started = Date.now();
 	const posted = (await teamCall({ action: "send", body: "not for delta" })).text.match(/^Posted #(\d+)\./)[1];
 	await sleep(1500);
-	assert.match((await team.call({ action: "status", id: "delta", waitMs: 0 })).text, /^\[running\]/);
+	assert.match((await team.call({ action: "status", id: "delta", waitMs: 0 })).text, /^\[running\] .* · team \d+s · /);
 	await teamCall({ action: "send", to: "delta", body: "wake up" });
 	// delta can finish before a status call starts waiting; that call then finds the result already sent as a message.
 	await finished("delta");
@@ -975,7 +1053,7 @@ const nextSeq = (log) =>
 				}
 			}),
 	) + 1;
-const missed = (seq, body, from = "alpha") => `${JSON.stringify({ t: "msg", seq, at: Date.now(), from, to: "main", notify: ["main"], body })}\n`;
+const missed = (seq, body, from = "alpha") => `${JSON.stringify({ t: "msg", seq, at: Date.now(), from, to: ["main"], notify: ["main"], body })}\n`;
 /** The team id that the first line of a team log holds. */
 const teamIdOf = (log) => JSON.parse(fs.readFileSync(log, "utf8").split("\n")[0]).id;
 const FORK_NOTICE =

@@ -16,6 +16,7 @@ import { createTeam, DESCRIPTION_CHARS } from "./team.ts";
 const MAX_RESULT_CHARS = 16_000;
 const NARRATION_LINES = 3;
 const NARRATION_CHARS = 300;
+const ARGS_CHARS = 60;
 const NOTICES = 3;
 const FOOTER_AGENTS = 3;
 const STALE_MS = 60_000;
@@ -41,7 +42,8 @@ interface Agent {
 	lastEventAt: number;
 	turns: number;
 	phase: string;
-	tools: Map<string, { name: string; since: number }>;
+	/** The running tools by call id; `args` is the call's main argument in one line. */
+	tools: Map<string, { name: string; args: string; since: number }>;
 	narration: string[];
 	/** The last ctx.ui.notify texts of the run's extensions, such as why a watchdog stopped it. */
 	notices: string[];
@@ -96,6 +98,12 @@ interface Pending {
 const oneLine = (text: string, limit: number) => {
 	const flat = text.replace(/\s+/g, " ").trim();
 	return flat.length > limit ? `${flat.slice(0, limit)}…` : flat;
+};
+
+/** A tool call's main argument in one line, empty when it has none; other arguments may hold secrets, such as an MCP call's API key. */
+const argsLine = (args: any) => {
+	const main = ["command", "path", "file_path", "code", "query", "pattern", "url"].map((key) => args?.[key]).find((value) => typeof value === "string");
+	return main ? oneLine(main, ARGS_CHARS) : "";
 };
 
 const duration = (ms: number) => {
@@ -177,7 +185,7 @@ export default function setupParent(pi: ExtensionAPI) {
 		if (agent.status === "stopped") return `[stopped] ${id}`;
 		if (agent.status !== "running") return `[${agent.status}] ${id} · ${agent.turns} turns · ${duration(agent.endedAt - agent.startedAt)}${usageText(agent.usage)}`;
 		const activity = agent.tools.size
-			? [...agent.tools.values()].map((tool) => `${tool.name} ${duration(now - tool.since)}`).join(", ")
+			? [...agent.tools.values()].map((tool) => `${tool.name}${tool.args ? ` (${tool.args})` : ""} ${duration(now - tool.since)}`).join(", ")
 			: agent.phase;
 		return `[running] ${id} · turn ${agent.turns + 1} · ${activity} · last event ${duration(now - agent.lastEventAt)} ago · ${duration(now - agent.startedAt)}${usageText(agent.usage)}`;
 	};
@@ -384,7 +392,7 @@ export default function setupParent(pi: ExtensionAPI) {
 				return;
 			}
 			case "tool_execution_start":
-				agent.tools.set(event.toolCallId, { name: event.toolName, since: Date.now() });
+				agent.tools.set(event.toolCallId, { name: event.toolName, args: argsLine(event.args), since: Date.now() });
 				return;
 			case "tool_execution_end":
 				agent.tools.delete(event.toolCallId);
@@ -568,7 +576,7 @@ export default function setupParent(pi: ExtensionAPI) {
 		model: Type.Optional(Type.String({ description: "run: Pi model pattern, provider/id[:thinking]. Default: your current model and thinking level." })),
 		cwd: Type.Optional(Type.String({ description: "run: working directory. Default: yours." })),
 		args: Type.Optional(Type.Array(Type.String(), { description: "run: extra Pi CLI options, for example tools, extensions, skills, or MCP." })),
-		waitMs: Type.Optional(Type.Integer({ minimum: 0, maximum: MAX_WAIT_MS, description: `run, status: wait up to this long. Default ${DEFAULT_WAIT_MS}.` })),
+		waitMs: Type.Optional(Type.Integer({ minimum: 0, maximum: MAX_WAIT_MS, description: `run, status: wait up to this long; 0 returns at once while the member keeps running. Default ${DEFAULT_WAIT_MS}.` })),
 	});
 	type Params = {
 		action: "run" | "status" | "abort";

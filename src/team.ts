@@ -55,7 +55,8 @@ interface MessageRecord {
 	seq: number;
 	at: number;
 	from: string;
-	to: string;
+	/** The board, or the recipients of a direct message in the order the sender gave. */
+	to: typeof BOARD | string[];
 	replyTo?: number;
 	mentions?: string[];
 	notify: string[];
@@ -89,12 +90,14 @@ const jsonLine = (record: object) => `${JSON.stringify(record)}\n`;
 const normalize = (text: string) => text.normalize("NFKC").toLowerCase();
 const text = (body: string, details?: object) => ({ content: [{ type: "text" as const, text: body }], details });
 
-const visibleTo = (message: MessageRecord, name: string) => message.to === BOARD || message.from === name || message.to === name;
+/** The sender and recipients of a direct message; none for a board post. */
+const participants = (message: MessageRecord) => (message.to === BOARD ? [] : [message.from, ...message.to]);
+const visibleTo = (message: MessageRecord, name: string) => message.to === BOARD || participants(message).includes(name);
 
 /** One message as its viewer reads it. Ends with a blank line, which keeps consecutive messages apart. */
 function render(message: MessageRecord, viewer: string) {
 	const who = (name: string) => (name === viewer ? "you" : name);
-	const route = message.to === BOARD ? `${who(message.from)} → #team` : `${who(message.from)} → ${who(message.to)} (direct)`;
+	const route = message.to === BOARD ? `${who(message.from)} → #team` : `${who(message.from)} → ${message.to.map(who).join(", ")} (direct)`;
 	const reply = message.replyTo ? `, replying to #${message.replyTo}` : "";
 	const mentions = message.mentions?.length ? `, mentions ${message.mentions.map(who).join(", ")}` : "";
 	return `[team #${message.seq}] ${route}${reply}${mentions}:\n${message.body}\n\n`;
@@ -246,11 +249,16 @@ export function createTeam(pi: ExtensionAPI, host: TeamHost) {
 		const body = params.body?.trim() ?? "";
 		if (!body) throw new Error("send requires body");
 		if (body.length > BODY_CHARS) throw new Error(`body exceeds ${BODY_CHARS} characters; put the content in a file in the shared working tree and send its path`);
+		let to = typeof params.to === "string" ? [params.to] : params.to;
 		let notify: string[];
-		if (params.to !== undefined) {
-			if (known(params.to) === from) throw new Error("you cannot send a message to yourself");
-			if (params.mentions?.length) throw new Error("mentions apply to board posts; a direct message notifies its recipient");
-			notify = [params.to];
+		if (to) {
+			if (!to.length) throw new Error("to names at least one recipient");
+			for (const [i, name] of to.entries()) {
+				if (known(name) === from) throw new Error("you cannot send a message to yourself");
+				if (to.indexOf(name) !== i) throw new Error(`to names ${name} twice`);
+			}
+			if (params.mentions?.length) throw new Error("mentions apply to board posts; a direct message notifies its recipients");
+			notify = [...to];
 		} else {
 			notify = (params.mentions ?? []).filter((name) => name !== "all").map(known);
 			if (params.mentions?.includes("all")) {
@@ -260,12 +268,11 @@ export function createTeam(pi: ExtensionAPI, host: TeamHost) {
 		}
 		if (params.replyTo !== undefined) {
 			const target = messages.find((message) => message.seq === params.replyTo);
-			const sameScope =
-				target &&
-				visibleTo(target, from) &&
-				(params.to === undefined ? target.to === BOARD : target.to !== BOARD && (target.from === params.to || target.to === params.to));
-			if (!sameScope) throw new Error(`#${params.replyTo} is not a message in this ${params.to === undefined ? "board" : "conversation"} that you can see`);
+			const sameScope = target && visibleTo(target, from) && (target.to === BOARD) === !to;
+			if (!sameScope) throw new Error(`#${params.replyTo} is not a ${to ? "direct message" : "board post"} that you can see`);
 			notify.push(target.from);
+			// A direct reply also goes to the author of the message it answers, so `to` holds every recipient.
+			if (to && target.from !== from && !to.includes(target.from)) to = [...to, target.from];
 		}
 		notify = [...new Set(notify)].filter((name) => name !== from);
 		const message: MessageRecord = {
@@ -273,7 +280,7 @@ export function createTeam(pi: ExtensionAPI, host: TeamHost) {
 			seq: (messages.at(-1)?.seq ?? 0) + 1,
 			at: Date.now(),
 			from,
-			to: params.to ?? BOARD,
+			to: to ?? BOARD,
 			...(params.replyTo !== undefined ? { replyTo: params.replyTo } : {}),
 			...(params.mentions?.length ? { mentions: params.mentions } : {}),
 			notify,
@@ -296,11 +303,9 @@ export function createTeam(pi: ExtensionAPI, host: TeamHost) {
 			(message) =>
 				(params.with === undefined
 					? message.to === BOARD
-					: message.to !== BOARD &&
+					: participants(message).includes(params.with) &&
 						// The main agent reads every direct message of the member, with any counterpart.
-						(caller === MAIN
-							? message.from === params.with || message.to === params.with
-							: (message.from === caller && message.to === params.with) || (message.from === params.with && message.to === caller))) &&
+						(caller === MAIN || participants(message).includes(caller))) &&
 				(params.before === undefined || message.seq < params.before) &&
 				(!query || normalize(message.body).includes(query)),
 		);
@@ -398,7 +403,7 @@ export function createTeam(pi: ExtensionAPI, host: TeamHost) {
 					if (record?.t === "member" && typeof record.name === "string" && typeof record.description === "string" && Array.isArray(record.args)) {
 						members.set(record.name, record);
 						hired = record.name;
-					} else if (record?.t === "msg" && typeof record.seq === "number" && Array.isArray(record.notify)) {
+					} else if (record?.t === "msg" && typeof record.seq === "number" && Array.isArray(record.notify) && (record.to === BOARD || Array.isArray(record.to))) {
 						messages.push(record);
 						if (joiner && record.from === MAIN && record.to === BOARD && String(record.body).startsWith(`joined: ${joiner} — `)) joined.set(joiner, record.seq);
 					} else if (record?.t === "topic" && typeof record.body === "string") topic = record.body;
@@ -479,7 +484,7 @@ export function createTeam(pi: ExtensionAPI, host: TeamHost) {
 		 * one from a sender that can wake it starts its next run; the others wait, and their senders and the main agent are told.
 		 */
 		afterRun(name: string) {
-			const unread = messages.filter((message) => message.to === name && message.seq > (pulled.get(name) ?? 0));
+			const unread = messages.filter((message) => message.to !== BOARD && message.to.includes(name) && message.seq > (pulled.get(name) ?? 0));
 			if (!unread.length) return;
 			// A member the main agent aborted stays stopped; only the main agent hears about its unread messages.
 			const locked = host.locked(name);
