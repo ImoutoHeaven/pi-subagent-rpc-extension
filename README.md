@@ -80,13 +80,13 @@ Every member sees the whole board and the direct messages it sent or received. A
 
 Only the main agent can mention `all`. A join announcement mentions no one, so the other members get it in their board digest.
 
-The board digest is one line about the board posts the recipient has not seen: the latest three, each cut to about 80 characters, and a count of the earlier ones.
+The board digest is one line about the board posts the recipient has not seen: the latest three, each cut to about 80 characters, and a count of the earlier ones with the `history` call that reads them.
 
 ```text
-[team] Board: 5 new posts — #14 tester: Fixture 7 fails on Windows paths; #15 reviewer: The parser change looks right; #16 main: Freeze the API; +2 earlier (team history).
+[team] Board: 5 new posts — #14 tester: Fixture 7 fails on Windows paths; #15 reviewer: The parser change looks right; #16 main: Freeze the API; +2 earlier (team history before=14).
 ```
 
-A member gets the digest at the start of a run and after tool results. The main agent gets it as a `team-notice` after a turn with tool calls and at the start of each run. `history` on the board without `query` or `before` also marks every board post seen. A new member starts with the whole board seen. Each agent's place on the board follows the current branch of its session, so after the session is reopened or the main agent moves in the session tree, its digest lists the posts that branch has not seen. A digest never counts for `team wait`, never wakes anyone, and never continues a run by itself.
+A member gets the digest at the start of a run and after tool results. The main agent gets it as a `team-notice` after a turn with tool calls and at the start of each run. A post that a `history` result shows stays out of later digests. A new member starts with the whole board seen. Each agent's place on the board follows the current branch of its session, so after the session is reopened or the main agent moves in the session tree, its digest lists the posts that branch has not seen. A digest never counts for `team wait`, never wakes anyone, and never continues a run by itself.
 
 A member reads its messages at safe points: at the start of each run along with a preamble that names the team and lists its members, after tool results, and when its run would end, in which case the run continues with them.
 

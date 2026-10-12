@@ -2,6 +2,7 @@
  * Team state: the log, routing, history, the main agent's `team` tool, and answers to members' requests.
  * It has no path to a process: it asks the host about members' runs, wakes members through it, and hands it messages for the main agent.
  */
+// Team text reaches the model only as appended session entries; read state lives in details, so no prefix is ever rewritten.
 import { randomUUID } from "node:crypto";
 import { appendFileSync, existsSync, mkdirSync, readFileSync } from "node:fs";
 import { dirname, join } from "node:path";
@@ -11,9 +12,11 @@ import {
 	DEFAULT_WAIT_MS,
 	type Delivery,
 	type Details,
+	detailsOf,
 	MAX_WAIT_MS,
 	type Reply,
 	type Request,
+	seenIn,
 	TEAM_DESCRIPTION,
 	TEAM_MESSAGE,
 	TOPIC_CHARS,
@@ -129,17 +132,6 @@ export function createTeam(pi: ExtensionAPI, host: TeamHost) {
 	};
 	const details = (message: MessageRecord) => ({ team: teamId, seq: message.seq, from: message.from });
 
-	/** The seqs of this team's messages that `details` mark seen: delivered or sent (`seq`), or counted by a notice (`covered`). */
-	const seenIn = (details: Details[]) => {
-		const seqs = new Set<number>();
-		for (const item of details) {
-			if (item?.team !== teamId) continue;
-			if (typeof item.seq === "number") seqs.add(item.seq);
-			if (Array.isArray(item.covered)) for (const seq of item.covered) seqs.add(seq);
-		}
-		return seqs;
-	};
-
 	const known = (name: string) => {
 		if (name !== MAIN && !members.has(name)) throw new Error(`Unknown member: ${name}. Members: ${[MAIN, ...members.keys()].join(", ")}`);
 		return name;
@@ -158,21 +150,25 @@ export function createTeam(pi: ExtensionAPI, host: TeamHost) {
 	const due = (name: string, after: number) => messages.filter((message) => message.seq > after && message.notify.includes(name));
 	const pendingCount = (name: string, after: number) => due(name, after).length + (notices.get(name)?.length ?? 0);
 
-	/** One line about the board posts after `cursor` that `name` did not write and was not notified of; empty when there are none. */
-	const digest = (name: string, cursor: number) => {
-		const unseen = messages.filter((message) => message.to === BOARD && message.seq > cursor && message.from !== name && !message.notify.includes(name));
+	/** One line about the board posts after `cursor` that `name` did not write, was not notified of, and whose seq `seen` lacks; empty when there are none. */
+	const digest = (name: string, cursor: number, seen: Set<number>) => {
+		const unseen = messages.filter(
+			(message) => message.to === BOARD && message.seq > cursor && message.from !== name && !message.notify.includes(name) && !seen.has(message.seq),
+		);
 		if (!unseen.length) return "";
 		const cut = (body: string) => {
 			const flat = body.replace(/\s+/g, " ").trim();
 			return flat.length > DIGEST_CHARS ? `${flat.slice(0, DIGEST_CHARS)}…` : flat;
 		};
-		const shown = unseen.slice(-DIGEST_POSTS).map((message) => `#${message.seq} ${message.from}: ${cut(message.body)}`);
-		const earlier = unseen.length > shown.length ? `; +${unseen.length - shown.length} earlier` : "";
-		return `[team] Board: ${unseen.length} new post${unseen.length === 1 ? "" : "s"} — ${shown.join("; ")}${earlier} (team history).\n\n`;
+		const latest = unseen.slice(-DIGEST_POSTS);
+		const shown = latest.map((message) => `#${message.seq} ${message.from}: ${cut(message.body)}`);
+		const more = unseen.length - latest.length;
+		const read = more ? `; +${more} earlier (team history before=${latest[0].seq})` : " (team history)";
+		return `[team] Board: ${unseen.length} new post${unseen.length === 1 ? "" : "s"} — ${shown.join("; ")}${read}.\n\n`;
 	};
 
-	/** With `cursor`, the member's board cursor, also the digest of the board posts after it. */
-	const inbox = (name: string, after: number, cursor?: number): Delivery[] => {
+	/** With `cursor`, the member's board cursor, also the digest of the board posts after it that `onBranch` lacks. */
+	const inbox = (name: string, after: number, cursor?: number, onBranch = new Set<number>()): Delivery[] => {
 		const pending = due(name, after);
 		const shown = pending.slice(0, INBOX_SIZE);
 		const more = pending.length - shown.length;
@@ -187,7 +183,7 @@ export function createTeam(pi: ExtensionAPI, host: TeamHost) {
 					render(message, name) +
 					(more && i === shown.length - 1 ? `(${more} more team messages for you are pending; they arrive after your next tool results or before your run ends.)\n\n` : ""),
 			})),
-			...[...notes, cursor === undefined ? "" : digest(name, Math.max(cursor, joined.get(name) ?? 0))].filter(Boolean).map((text) => ({ seq: 0, from: BOARD, text })),
+			...[...notes, cursor === undefined ? "" : digest(name, Math.max(cursor, joined.get(name) ?? 0), onBranch)].filter(Boolean).map((text) => ({ seq: 0, from: BOARD, text })),
 		];
 	};
 
@@ -288,9 +284,10 @@ export function createTeam(pi: ExtensionAPI, host: TeamHost) {
 		);
 		let shown = found.slice(-limit).map((message) => ({ seq: message.seq, text: render(message, caller) }));
 		while (shown.length > 1 && shown.reduce((sum, message) => sum + message.text.length, 0) > HISTORY_CHARS) shown = shown.slice(1);
-		if (!shown.length) return "No messages.";
+		const covered = shown.map((message) => message.seq);
+		if (!shown.length) return { text: "No messages.", covered };
 		const older = found.length > shown.length ? `Older messages exist: history before=${shown[0].seq}.\n\n` : "";
-		return older + shown.map((message) => message.text).join("").trimEnd();
+		return { text: older + shown.map((message) => message.text).join("").trimEnd(), covered };
 	};
 
 	const setTopic = (caller: string, params: TeamParams) => {
@@ -303,16 +300,14 @@ export function createTeam(pi: ExtensionAPI, host: TeamHost) {
 		return "Topic set.";
 	};
 
-	/** Every action except wait, which callers handle themselves. */
-	const act = (caller: string, params: TeamParams) => {
-		if (params.action === "send") return send(caller, params);
+	/** Every action except wait, which callers handle themselves. History also returns `covered`, the seqs it showed. */
+	const act = (caller: string, params: TeamParams): { text: string; covered?: number[] } => {
+		if (params.action === "send") return { text: send(caller, params) };
 		if (params.action === "history") return history(caller, params);
-		if (params.action === "members") return roster();
-		if (params.action === "topic") return setTopic(caller, params);
+		if (params.action === "members") return { text: roster() };
+		if (params.action === "topic") return { text: setTopic(caller, params) };
 		throw new Error(`unknown team action: ${params.action}`);
 	};
-	/** The call shows the whole board, so the caller has seen it up to the last post. */
-	const readsBoard = (params: TeamParams) => params.action === "history" && params.with === undefined && !params.query && params.before === undefined;
 
 	/** Holds a member's `wait` until a message for it is pending, `ms` pass, or its run ends. */
 	const wait = (name: string, after: number, ms: number, signal: AbortSignal) =>
@@ -338,10 +333,10 @@ export function createTeam(pi: ExtensionAPI, host: TeamHost) {
 		parameters: teamParameters,
 		async execute(_toolCallId, params, signal) {
 			if (params.action !== "wait") {
-				const result = act(MAIN, params);
-				// The branch holding this result has seen the message it sent, or the board it showed.
+				const { text: result, covered } = act(MAIN, params);
+				// The branch holding this result has seen the message it sent, or the messages it showed.
 				if (params.action === "send") return text(result, { team: teamId, seq: lastSeq() });
-				return text(result, readsBoard(params) ? { team: teamId, board: lastSeq() } : undefined);
+				return text(result, covered ? { team: teamId, covered } : undefined);
 			}
 			const ms = Math.min(params.ms ?? DEFAULT_WAIT_MS, MAX_WAIT_MS);
 			const count = await host.waitForMain(ms, signal);
@@ -404,8 +399,8 @@ export function createTeam(pi: ExtensionAPI, host: TeamHost) {
 		 * of the entries a new branch summary covers, mark seen; its `covered` marks them seen on this branch.
 		 */
 		redeliver(shown: Details[], summarized: Details[] = []) {
-			const seen = seenIn(shown);
-			const inSummaryOf = seenIn(summarized);
+			const seen = seenIn(shown, teamId);
+			const inSummaryOf = seenIn(summarized, teamId);
 			const missing = messages.filter((message) => (message.from === MAIN || message.notify.includes(MAIN)) && !seen.has(message.seq));
 			const inSummary = missing.filter((message) => inSummaryOf.has(message.seq));
 			const rest = missing.filter((message) => !inSummaryOf.has(message.seq));
@@ -445,11 +440,11 @@ export function createTeam(pi: ExtensionAPI, host: TeamHost) {
 		},
 
 		/**
-		 * The main agent's board digest of the posts after the board cursor of `entries`, its current branch, as a notice entry,
-		 * or undefined when there is nothing new. Once on the branch, the entry moves that cursor.
+		 * The main agent's board digest of the posts after the board cursor of `entries`, its current branch, that the branch does not hold,
+		 * as a notice entry, or undefined when there is nothing new. Once on the branch, the entry moves that cursor.
 		 */
 		mainDigest(entries: SessionEntry[]) {
-			const content = digest(MAIN, teamCursor(entries, teamId, "board"));
+			const content = digest(MAIN, teamCursor(entries, teamId, "board"), seenIn(entries.map(detailsOf), teamId));
 			return content ? { type: "custom_message" as const, customType: TEAM_NOTICE, content, display: true, details: { team: teamId, board: lastSeq() } } : undefined;
 		},
 
@@ -490,10 +485,11 @@ export function createTeam(pi: ExtensionAPI, host: TeamHost) {
 				if (request.op === "start") return { ok: true, team: teamId, preamble: preamble(name) };
 				if (request.op === "inbox") {
 					if (typeof request.board !== "number") return { ok: true, messages: inbox(name, after) };
-					return { ok: true, messages: inbox(name, after, request.board), board: lastSeq() };
+					const seen = new Set(Array.isArray(request.seen) ? request.seen : []);
+					return { ok: true, messages: inbox(name, after, request.board, seen), board: lastSeq() };
 				}
 				if (request.op === "wait") return { ok: true, count: await wait(name, after, Math.min(Number(request.ms) || 0, MAX_WAIT_MS), signal) };
-				if (request.op === "team" && request.action !== "wait") return { ok: true, text: act(name, request), ...(readsBoard(request) ? { board: lastSeq() } : {}) };
+				if (request.op === "team" && request.action !== "wait") return { ok: true, ...act(name, request) };
 				return { error: `unsupported request: ${request.op}` };
 			} catch (error) {
 				return { error: error instanceof Error ? error.message : String(error) };

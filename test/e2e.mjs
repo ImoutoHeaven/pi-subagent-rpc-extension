@@ -778,6 +778,57 @@ await step("after team history on the board, no digest repeats those posts", asy
 	assert.ok(!seenBy.some((body) => body.messages.some((m) => DIGEST.test(rawText(m)))), "a digest repeated posts read in history");
 });
 
+await step("a member's history marks only the posts it shows; the next digest lists the other unseen posts and how to read the earlier ones", async () => {
+	await run({ name: "xray", message: `SLOW 3000 ${TEAMS([{ action: "history", limit: 1 }, { action: "members" }])}`, waitMs: 0 });
+	await until(() => requestsBy("xray").length > 0);
+	const seqs = [];
+	for (const body of ["post 1", "post 2", "post 3", "post 4", "post 5"]) seqs.push((await teamCall({ action: "send", body })).text.match(/^Posted #(\d+)\./)[1]);
+	await finished("xray");
+	const seenBy = requestsBy("xray");
+	assert.equal(seenBy.length, 3);
+	const afterHistory = seenBy[1].messages;
+	assert.equal(rawText(afterHistory.at(-2)), `Older messages exist: history before=${seqs[4]}.\n\n[team #${seqs[4]}] main → #team:\npost 5`);
+	assert.equal(
+		text(afterHistory.at(-1)),
+		`[team] Board: 4 new posts — #${seqs[1]} main: post 2; #${seqs[2]} main: post 3; #${seqs[3]} main: post 4; +1 earlier (team history before=${seqs[1]}).`,
+	);
+	assert.ok(!seenBy[2].messages.slice(afterHistory.length).some((m) => DIGEST.test(rawText(m))), "a digest repeated posts");
+});
+
+await step("a post a member read in history stays out of its digest when it is woken again", async () => {
+	await run({ name: "zulu", message: `SLOW 3000 ${TEAM({ action: "history", limit: 1 })}`, waitMs: 0 });
+	await until(() => requestsBy("zulu").length > 0);
+	await teamCall({ action: "send", body: "read by zulu" });
+	await finished("zulu");
+	assert.match(rawText(requestsBy("zulu").at(-1).messages.at(-1)), /main → #team:\nread by zulu$/);
+	const seq = (await teamCall({ action: "send", body: "after zulu" })).text.match(/^Posted #(\d+)\./)[1];
+	const mark = team.events.length;
+	assert.match((await teamCall({ action: "send", to: "zulu", body: "SAY zulu again" })).text, /\(woken\)\.$/);
+	assert.match(await report("zulu", mark), /zulu again$/);
+	assert.match(
+		text(requestsBy("zulu").at(-1).messages.at(-1)),
+		new RegExp(`main → you \\(direct\\):\\nSAY zulu again\\n\\n\\[team\\] Board: 1 new post — #${seq} main: after zulu \\(team history\\)\\.$`),
+	);
+});
+
+await step("the main agent's history marks only the posts it shows; its next digest lists the other unseen posts", async () => {
+	await run({ name: "yankee", message: `SLOW 1500 ${TEAMS([1, 2, 3].map((n) => ({ action: "send", body: `yankee ${n}` })))}`, waitMs: 0 });
+	await until(() => requestsBy("yankee").length > 0);
+	const from = team.events.length;
+	team.prompt(`SLOW 6000 ${TEAMS([{ action: "history", limit: 1 }, { action: "members" }])}`);
+	const result = await team.waitMessage("subagent-result", from);
+	await team.waitEvent((e) => e.type === "agent_settled", result.at);
+	// yankee's final reply is the result of its last post.
+	const last = Number(result.content.match(/Posted #(\d+)\./)[1]);
+	const shown = team.events.slice(from).find((e) => e.type === "tool_execution_end" && e.toolName === "team");
+	assert.match(shown.result.content[0].text, new RegExp(`\\[team #${last}\\] yankee → #team:\\nyankee 3$`));
+	assert.deepEqual(shown.result.details.covered, [last]);
+	assert.deepEqual(
+		team.messages(from).filter((m) => m.customType === "team-notice").map((m) => m.content),
+		[`[team] Board: 2 new posts — #${last - 2} yankee: yankee 1; #${last - 1} yankee: yankee 2 (team history).`],
+	);
+});
+
 await step("the main agent gets a digest of other members' board posts at its turn boundary after a tool call", async () => {
 	const from = team.events.length;
 	const r = await run({ name: "november", message: TEAM({ action: "send", body: "member news" }) });

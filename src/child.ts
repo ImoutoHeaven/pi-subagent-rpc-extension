@@ -3,7 +3,20 @@
  * There is no subagent tool here, which keeps delegation one level deep.
  */
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
-import { DEFAULT_WAIT_MS, type Delivery, MAX_WAIT_MS, type Reply, type Request, TAG, TEAM_DESCRIPTION, TEAM_MESSAGE, teamCursor, teamParameters } from "./protocol.ts";
+import {
+	DEFAULT_WAIT_MS,
+	type Delivery,
+	detailsOf,
+	MAX_WAIT_MS,
+	type Reply,
+	type Request,
+	seenIn,
+	TAG,
+	TEAM_DESCRIPTION,
+	TEAM_MESSAGE,
+	teamCursor,
+	teamParameters,
+} from "./protocol.ts";
 
 const REQUEST_TIMEOUT_MS = 10_000;
 /** How much longer than the wait itself a `wait` request may take. */
@@ -24,15 +37,21 @@ export default function setupChild(pi: ExtensionAPI) {
 	let teamId = "";
 	/** The highest team message seq this member has received. */
 	let after = 0;
-	/** The seq up to which this member has seen the board, in a digest or in history. */
+	/** The seq up to which this member has seen the board in a digest. */
 	let board = 0;
+	/** The seqs after `board` whose text this member's branch holds, such as those history showed. */
+	let seen = new Set<number>();
+	const advance = (cursor: number) => {
+		board = cursor;
+		for (const seq of seen) if (seq <= board) seen.delete(seq);
+	};
 
 	/** Pulls the inbox and advances the cursors; notices and the board digest carry seq 0. */
 	const pull = async (ctx: ExtensionContext, digest = false) => {
-		const reply = await ask(ctx, { op: "inbox", after, ...(digest ? { board } : {}) }, ctx.signal);
+		const reply = await ask(ctx, { op: "inbox", after, ...(digest ? { board, seen: [...seen] } : {}) }, ctx.signal);
 		const { messages = [] } = reply;
 		after = messages.reduce((max, m) => Math.max(max, m.seq), after);
-		board = reply.board ?? board;
+		advance(reply.board ?? board);
 		return messages;
 	};
 
@@ -57,9 +76,9 @@ export default function setupChild(pi: ExtensionAPI) {
 				return text(count ? `${count} team message(s) for you follow this result.` : `No team messages for you within ${ms}ms.`);
 			}
 			const reply = await ask(ctx, { op: "team", ...params }, signal);
-			if (reply.board === undefined) return text(reply.text ?? "");
-			board = reply.board;
-			return text(reply.text ?? "", { team: teamId, board });
+			if (!reply.covered) return text(reply.text ?? "");
+			for (const seq of reply.covered) if (seq > board) seen.add(seq);
+			return text(reply.text ?? "", { team: teamId, covered: reply.covered });
 		},
 	});
 
@@ -68,7 +87,8 @@ export default function setupChild(pi: ExtensionAPI) {
 		teamId = id;
 		const entries = ctx.sessionManager.getBranch();
 		after = teamCursor(entries, teamId, "seq");
-		board = teamCursor(entries, teamId, "board");
+		seen = seenIn(entries.map(detailsOf), teamId);
+		advance(teamCursor(entries, teamId, "board"));
 		const messages = await pull(ctx, true);
 		return {
 			message: { customType: TEAM_MESSAGE, content: [preamble, ...messages.map((m) => m.text)].join(""), display: true, details: { team: teamId, seq: after, board } },
