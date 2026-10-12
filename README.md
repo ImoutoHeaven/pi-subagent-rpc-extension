@@ -38,7 +38,7 @@ To try it for one run: `pi -e /path/to/pi-subagent-rpc-extension`. Subagents do 
 [t3] Running the full test suite now.
 ```
 
-Each result for the main agent reaches it once. A result that no tool call returned arrives as a `subagent-result` message. Team messages for the main agent arrive the same way, as `team-message` messages:
+Each result for the main agent reaches it once; after a move in the session tree, each member's latest result also reaches the new branch once if that branch lacks it. A result that no tool call returned arrives as a `subagent-result` message. Team messages for the main agent arrive the same way, as `team-message` messages:
 
 - An idle parent starts a turn with the message.
 - A running parent gets every message that arrived meanwhile together, after its current tool calls and before its next model request. The extension adds them to the session itself, so Pi's `steeringMode` does not space them out. A `run`, `status`, or `team wait` call ends its wait early when such a message arrives, and the terminal shows a one-line notice.
@@ -114,8 +114,8 @@ The parser change breaks the fixture in test/cases/7.json.
 ## Sessions and processes
 
 - Member sessions are stored beside the parent session file, in `<parent session>/subagents/<name>/`. A parent without a session file uses the system temporary directory.
-- The team log, `<parent session>/team.jsonl`, records members and messages. The first record written creates it, and it holds the team of that session only: a fork or clone of the session in Pi starts its own team.
-- When the session is opened again, every member is listed as `stopped` and no member process starts. The main agent receives, without starting a turn, the team messages the current branch of its session lacks.
+- The team log, `<parent session>/team.jsonl`, records members and messages. The first record written creates it, and it holds the team of that session file only: a fork, clone, or import of the session in Pi starts its own team. After `/fork` or `/clone`, the main agent gets a notice that the copied team messages belong to the original session's team; `pi --fork` starts the new team without that notice.
+- When the session is opened again, every member is listed as `stopped` and no member process starts. When the session is opened and when the main agent moves in the session tree, the main agent receives, without starting a turn, the team messages to or from it that the current branch lacks: the latest ten in full, and one line that counts the earlier ones and those that the summary of the branch it left covers. After a move in the tree, it also receives the latest result of each member that the branch lacks.
 - The child runs the parent's Node.js executable with the RPC entry point of the parent's Pi package, so both use the same Pi build, also when the parent is an SDK host such as pi-web. Each run is one process: it starts with `run` or a wake and ends when the run settles.
 - Children cannot delegate: a member gets the `team` tool, never `subagent`. A member whose run starts without this extension loaded fails with an error.
 - A child talks to the parent through extension dialogs on its own RPC pipe. Its other extension dialogs are cancelled, since no user can answer them.

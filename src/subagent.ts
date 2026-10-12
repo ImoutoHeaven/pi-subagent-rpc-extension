@@ -6,9 +6,9 @@ import { existsSync, mkdirSync, statSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { StringEnum } from "@earendil-works/pi-ai";
-import type { BoundaryState, ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
+import type { BoundaryState, ExtensionAPI, ExtensionContext, SessionEntry } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
-import { BODY_CHARS, DEFAULT_WAIT_MS, MAX_WAIT_MS, type Reply, type Request } from "./protocol.ts";
+import { BODY_CHARS, DEFAULT_WAIT_MS, type Details, detailsOf, MAX_WAIT_MS, type Reply, type Request } from "./protocol.ts";
 import { type Run, type RunStatus, startRun } from "./rpc.ts";
 import { createTeam, DESCRIPTION_CHARS } from "./team.ts";
 
@@ -22,6 +22,9 @@ const IDLE_POLL_MS = 250;
 const MAIN = "main";
 // The extension owns the child's process mode, session, and model selection.
 const OWNED_FLAGS = ["--mode", "--print", "-p", "--no-session", "--session", "--session-id", "--session-dir", "--continue", "-c", "--resume", "-r", "--fork", "--export", "--model"];
+// Where a result for the main agent went.
+const SENT = "was sent to you as a subagent-result message";
+const RETURNED = "was returned to you earlier";
 
 /** `stopped`: a member restored from the log that has not run in this session yet. */
 type Status = RunStatus | "running" | "stopped";
@@ -45,7 +48,7 @@ interface Agent {
 	/** provider/id the child actually answered with; Pi matches --model fuzzily. */
 	model: string;
 	error: string | null;
-	/** Where the final result went, completing "Its result …"; null until it went somewhere. */
+	/** Where the final result went, completing "Its result …": SENT, RETURNED, or to the member that woke the run; null until it went somewhere. */
 	delivered: string | null;
 	/** The child sent its start request in this run, so the extension loaded in it. */
 	greeted: boolean;
@@ -154,6 +157,9 @@ export default function setupParent(pi: ExtensionAPI) {
 
 	const noticeLine = (agent: Agent) => (agent.notices.length ? `Notices: ${agent.notices.join(" | ")}` : "");
 
+	/** Marks the run's result seen in the details of an entry that shows it, so a branch without one gets the result again. */
+	const runKey = (agent: Agent) => ({ id: agent.id, run: agent.startedAt });
+
 	/** The model-facing report. */
 	const report = (agent: Agent) => {
 		if (agent.status === "running") {
@@ -171,13 +177,13 @@ export default function setupParent(pi: ExtensionAPI) {
 	 * Pending messages reach the parent after the tool result, so the final result then goes out as a message
 	 * behind that subagent's own, keeping it the last word.
 	 */
-	const consume = (agent: Agent) => {
-		if (agent.status === "running") return report(agent) + (loud() ? "\nReturned early: subagent messages follow this result." : "");
-		if (agent.status === "stopped") return header(agent);
+	const consume = (agent: Agent): { text: string; details?: object } => {
+		if (agent.status === "running") return { text: report(agent) + (loud() ? "\nReturned early: subagent messages follow this result." : "") };
+		if (agent.status === "stopped") return { text: header(agent) };
 		if (pending.some((message) => message.agentId === agent.id)) deliver(agent);
-		if (agent.delivered) return `${header(agent)}\n\nIts result ${agent.delivered}. Full reply: ${join(agent.dir, "final.md")}`;
-		agent.delivered = "was returned to you earlier";
-		return report(agent);
+		if (agent.delivered) return { text: `${header(agent)}\n\nIts result ${agent.delivered}. Full reply: ${join(agent.dir, "final.md")}` };
+		agent.delivered = RETURNED;
+		return { text: report(agent), details: runKey(agent) };
 	};
 
 	/** Other running subagents, so a result also shows what is still in flight. */
@@ -193,9 +199,10 @@ export default function setupParent(pi: ExtensionAPI) {
 		return `\n\n(Background: ${shown.join(", ")}${more}.)`;
 	};
 
-	// Pi runs before_agent_start only for prompts, so a run that a message starts gets the board digest just ahead of that message.
+	// The board digest joins the branch just ahead of what starts a run: a prompt, or a message, for which Pi runs no before_agent_start.
+	// It joins at once, so a message that arrives before that run starts finds it on the branch.
 	const digestFirst = () => {
-		const digest = team.mainDigest();
+		const digest = parent && team.mainDigest(parent.sessionManager.getBranch());
 		if (digest) pi.sendMessage(digest, { triggerTurn: false });
 	};
 
@@ -236,9 +243,9 @@ export default function setupParent(pi: ExtensionAPI) {
 		return { entries: [...event.entries, ...entries], continue: event.continue || (wakes && event.outcome !== "aborted") };
 	};
 	// The board digest rides on a request that follows tool results anyway, so it never makes a run continue.
-	pi.on("turn_end", (event) => {
+	pi.on("turn_end", (event, ctx) => {
 		const result = atBoundary(event);
-		const digest = event.outcome === "completed" && event.toolResults.length ? team.mainDigest() : undefined;
+		const digest = event.outcome === "completed" && event.toolResults.length ? team.mainDigest(ctx.sessionManager.getBranch()) : undefined;
 		return digest ? { ...result, entries: [...(result?.entries ?? event.entries), digest] } : result;
 	});
 	pi.on("agent_before_settle", atBoundary);
@@ -270,10 +277,7 @@ export default function setupParent(pi: ExtensionAPI) {
 		}, IDLE_POLL_MS);
 	};
 
-	pi.on("before_agent_start", () => {
-		const digest = team.mainDigest();
-		if (digest) return { message: digest };
-	});
+	pi.on("before_agent_start", digestFirst);
 
 	// Whoever starts the next run, the user or an extension that continues after its own abort, ends the suspension.
 	pi.on("agent_start", () => {
@@ -283,8 +287,8 @@ export default function setupParent(pi: ExtensionAPI) {
 
 	const deliver = (agent: Agent) => {
 		if (agent.delivered || shuttingDown) return;
-		agent.delivered = "was sent to you as a subagent-result message";
-		notify("subagent-result", agent.id, report(agent), { id: agent.id, status: agent.status });
+		agent.delivered = SENT;
+		notify("subagent-result", agent.id, report(agent), { ...runKey(agent), status: agent.status });
 	};
 
 	/**
@@ -497,7 +501,7 @@ export default function setupParent(pi: ExtensionAPI) {
 		return agent;
 	};
 
-	const create = (params: Params, ctx: ExtensionContext): Agent => {
+	const create = (params: Params, ctx: ExtensionContext) => {
 		if (!params.message) throw new Error("run requires message");
 		const cwd = resolve(ctx.cwd, params.cwd ?? ".");
 		if (!existsSync(cwd) || !statSync(cwd).isDirectory()) throw new Error(`cwd is not a directory: ${cwd}`);
@@ -510,9 +514,9 @@ export default function setupParent(pi: ExtensionAPI) {
 		if (removesTool(args, "team")) throw new Error("these args remove the team tool, which every member needs");
 		const dir = join(sessionBase(ctx), "subagents", params.name);
 		const launchArgs = ["--session-dir", dir, "--session-id", params.name, ...modelArgs, ...args];
-		team.hire(params.name, params.description ?? "", cwd, launchArgs);
+		const joined = team.hire(params.name, params.description ?? "", cwd, launchArgs);
 		mkdirSync(dir, { recursive: true });
-		return register(params.name, cwd, dir, launchArgs, "running");
+		return { agent: register(params.name, cwd, dir, launchArgs, "running"), joined };
 	};
 
 	const parameters = Type.Object({
@@ -558,23 +562,26 @@ export default function setupParent(pi: ExtensionAPI) {
 		parameters,
 		async execute(_toolCallId, params: Params, signal, _onUpdate, ctx) {
 			parent = ctx;
-			const plain = (body: string) => ({ content: [{ type: "text" as const, text: body }], details: undefined });
 			const waitMs = Math.min(params.waitMs ?? DEFAULT_WAIT_MS, MAX_WAIT_MS);
 			if (params.action === "status" && !params.id) {
-				return plain(agents.size ? [...agents.values()].map(header).join("\n") : "No subagents.");
+				return { content: [{ type: "text", text: agents.size ? [...agents.values()].map(header).join("\n") : "No subagents." }], details: undefined };
 			}
+			/** The state of `agent`, with the other running members; `details` mark what the result shows seen. */
+			const result = (agent: Agent, details?: object) => {
+				const state = consume(agent);
+				return { content: [{ type: "text" as const, text: state.text + footer(agent) }], details: { ...details, ...state.details } };
+			};
 			if (params.action === "run") {
-				const agent = create(params, ctx);
+				const { agent, joined } = create(params, ctx);
 				launch(agent, params.message as string, MAIN);
 				await waitFor(agent, waitMs, signal, true);
-				return plain(consume(agent) + footer(agent));
+				return result(agent, joined);
 			}
 			const agent = agents.get(params.id ?? "");
 			if (!agent) throw new Error(`Unknown subagent id: ${params.id}. Known: ${[...agents.keys()].join(", ") || "none"}`);
-			const text = (body: string) => plain(body + footer(agent));
 			if (params.action === "status") {
 				await waitFor(agent, waitMs, signal, true);
-				return text(consume(agent));
+				return result(agent);
 			}
 			// This call returns the final state, so hold a waiter to keep it from also being delivered.
 			const hold = () => {};
@@ -589,14 +596,41 @@ export default function setupParent(pi: ExtensionAPI) {
 			} finally {
 				agent.waiters.delete(hold);
 			}
-			return text(consume(agent));
+			return result(agent);
 		},
 	});
 
-	pi.on("session_start", (_event, ctx) => {
+	pi.on("session_start", (event, ctx) => {
 		parent = ctx;
 		const base = sessionBase(ctx);
 		for (const member of team.load(base, ctx)) register(member.name, member.cwd, join(base, "subagents", member.name), member.args, "stopped");
+		// Nothing is pending yet: a session start makes a new runtime.
+		const shown = ctx.sessionManager.getBranch().map(detailsOf);
+		if (event.reason === "fork") team.forked(shown);
+		team.redeliver(shown);
+	});
+
+	// The new branch gets, without a turn, the team messages and results it lacks; messages still pending reach it when they are flushed.
+	/** The entries Pi hands the summarizer of the tree navigation in progress; session_tree does not name them. */
+	let summarizing: SessionEntry[] = [];
+	pi.on("session_before_tree", (event) => {
+		summarizing = event.preparation.entriesToSummarize;
+	});
+	pi.on("session_tree", (event, ctx) => {
+		const summarized = event.summaryEntry ? summarizing : [];
+		summarizing = [];
+		const branch = ctx.sessionManager.getBranch();
+		const shown = [...branch.map(detailsOf), ...pending.map((message) => message.details as Details)];
+		team.redeliver(shown, summarized.map(detailsOf));
+		for (const agent of agents.values()) {
+			if (agent.delivered !== SENT && agent.delivered !== RETURNED) continue;
+			if (shown.some((details) => details?.id === agent.id && details.run === agent.startedAt)) continue;
+			agent.delivered = SENT;
+			pi.sendMessage(
+				{ customType: "subagent-result", content: `${report(agent).trimEnd()}\n\n`, display: true, details: { ...runKey(agent), status: agent.status } },
+				{ triggerTurn: false },
+			);
+		}
 	});
 
 	// Waits for the children: Pi exits the process right after shutdown, which would drop pending kill timers.

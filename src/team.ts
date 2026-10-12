@@ -2,13 +2,15 @@
  * Team state: the log, routing, history, the main agent's `team` tool, and answers to members' requests.
  * It has no path to a process: it asks the host about members' runs, wakes members through it, and hands it messages for the main agent.
  */
+import { randomUUID } from "node:crypto";
 import { appendFileSync, existsSync, mkdirSync, readFileSync } from "node:fs";
 import { dirname, join } from "node:path";
-import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
+import type { ExtensionAPI, ExtensionContext, SessionEntry } from "@earendil-works/pi-coding-agent";
 import {
 	BODY_CHARS,
 	DEFAULT_WAIT_MS,
 	type Delivery,
+	type Details,
 	MAX_WAIT_MS,
 	type Reply,
 	type Request,
@@ -34,6 +36,8 @@ const HISTORY_CHARS = 16_000;
 const DIGEST_POSTS = 3;
 const DIGEST_CHARS = 80;
 export const DESCRIPTION_CHARS = 100;
+const FORK_NOTICE =
+	"[team] The team messages above belong to the team of the session this one was forked from. This session has a team of its own, which starts without members; resume the original session to work with that team.\n\n";
 
 export interface MemberRecord {
 	t: "member";
@@ -78,6 +82,7 @@ export interface TeamHost {
 	waitForMain(ms: number, signal?: AbortSignal): Promise<number>;
 }
 
+const jsonLine = (record: object) => `${JSON.stringify(record)}\n`;
 const normalize = (text: string) => text.normalize("NFKC").toLowerCase();
 const text = (body: string, details?: object) => ({ content: [{ type: "text" as const, text: body }], details });
 
@@ -95,7 +100,7 @@ function render(message: MessageRecord, viewer: string) {
 export function createTeam(pi: ExtensionAPI, host: TeamHost) {
 	/** `<session base>/team.jsonl`, created by the first record written to it. */
 	let log = "";
-	/** The id of the session that owns the team. */
+	/** The team's id, the first record of its log; session entries about the team carry it in their details. */
 	let teamId = "";
 	const members = new Map<string, MemberRecord>();
 	let messages: MessageRecord[] = [];
@@ -105,8 +110,6 @@ export function createTeam(pi: ExtensionAPI, host: TeamHost) {
 	// shortcut: inbox cursors and sender notices live in memory; reopening a session forgets them, and every member is stopped then anyway.
 	/** Per member, the highest seq its inbox returned. */
 	const seen = new Map<string, number>();
-	/** The seq up to which the main agent has seen the board, in a digest or in history; the current branch of its session keeps it, as each member's session keeps its own. */
-	let board = 0;
 	/** Per member, the seq of its join announcement, the record after its member record in the log; a new member starts with the board seen up to it. */
 	const joined = new Map<string, number>();
 	/** Per member, the seq of the message that woke its current or last run; it never wakes the member again. */
@@ -119,10 +122,23 @@ export function createTeam(pi: ExtensionAPI, host: TeamHost) {
 	};
 
 	const append = (...records: (MemberRecord | MessageRecord | TopicRecord)[]) => {
+		// The first write creates the log, which starts with the team's id.
+		const id = existsSync(log) ? "" : jsonLine({ t: "team", id: teamId });
 		mkdirSync(dirname(log), { recursive: true });
-		appendFileSync(log, records.map((record) => `${JSON.stringify(record)}\n`).join(""));
+		appendFileSync(log, id + records.map(jsonLine).join(""));
 	};
 	const details = (message: MessageRecord) => ({ team: teamId, seq: message.seq, from: message.from });
+
+	/** The seqs of this team's messages that `details` mark seen: delivered or sent (`seq`), or counted by a notice (`covered`). */
+	const seenIn = (details: Details[]) => {
+		const seqs = new Set<number>();
+		for (const item of details) {
+			if (item?.team !== teamId) continue;
+			if (typeof item.seq === "number") seqs.add(item.seq);
+			if (Array.isArray(item.covered)) for (const seq of item.covered) seqs.add(seq);
+		}
+		return seqs;
+	};
 
 	const known = (name: string) => {
 		if (name !== MAIN && !members.has(name)) throw new Error(`Unknown member: ${name}. Members: ${[MAIN, ...members.keys()].join(", ")}`);
@@ -323,9 +339,9 @@ export function createTeam(pi: ExtensionAPI, host: TeamHost) {
 		async execute(_toolCallId, params, signal) {
 			if (params.action !== "wait") {
 				const result = act(MAIN, params);
-				if (!readsBoard(params)) return text(result);
-				board = lastSeq();
-				return text(result, { team: teamId, board });
+				// The branch holding this result has seen the message it sent, or the board it showed.
+				if (params.action === "send") return text(result, { team: teamId, seq: lastSeq() });
+				return text(result, readsBoard(params) ? { team: teamId, board: lastSeq() } : undefined);
 			}
 			const ms = Math.min(params.ms ?? DEFAULT_WAIT_MS, MAX_WAIT_MS);
 			const count = await host.waitForMain(ms, signal);
@@ -333,21 +349,20 @@ export function createTeam(pi: ExtensionAPI, host: TeamHost) {
 		},
 	});
 
-	/** Takes the main agent's board cursor from the current branch, which holds the digests and history its model still sees. */
-	const readBoard = (ctx: ExtensionContext) => {
-		board = teamCursor(ctx.sessionManager.getBranch(), teamId, "board");
-	};
-	pi.on("session_tree", (_event, ctx) => readBoard(ctx));
+	/** Appends to the main agent's current branch without starting a turn. */
+	const quietly = (customType: string, content: string, details: object) => pi.sendMessage({ customType, content, display: true, details }, { triggerTurn: false });
 
 	return {
 		/**
-		 * Loads the team of the session at `base` (its file path without .jsonl); a missing log means no members yet.
-		 * Delivers, without starting a turn, the messages for the main agent that the current branch of its session lacks. Returns the members.
+		 * Loads the team of the session at `base` (its file path without .jsonl) and returns its members.
+		 * A missing log means a new team, with a new id and no members yet.
 		 */
 		load(base: string, ctx: ExtensionContext): MemberRecord[] {
 			log = join(base, "team.jsonl");
-			teamId = ctx.sessionManager.getSessionId();
-			if (!existsSync(log)) return [];
+			if (!existsSync(log)) {
+				teamId = randomUUID();
+				return [];
+			}
 			const content = readFileSync(log, "utf8");
 			// An interrupted write leaves a partial last line; end it so the next record starts a line of its own.
 			if (content && !content.endsWith("\n")) appendFileSync(log, "\n");
@@ -372,19 +387,46 @@ export function createTeam(pi: ExtensionAPI, host: TeamHost) {
 						messages.push(record);
 						if (joiner && record.from === MAIN && record.to === BOARD && String(record.body).startsWith(`joined: ${joiner} — `)) joined.set(joiner, record.seq);
 					} else if (record?.t === "topic" && typeof record.body === "string") topic = record.body;
+					else if (record?.t === "team" && typeof record.id === "string") teamId ||= record.id;
 					else if (ctx.hasUI) ctx.ui.notify(`team.jsonl line ${i + 1} is not a team record; skipped`, "warning");
 				});
-			readBoard(ctx);
-			for (const message of due(MAIN, teamCursor(ctx.sessionManager.getBranch(), teamId, "seq"))) {
-				pi.sendMessage(
-					{ customType: TEAM_MESSAGE, content: render(message, MAIN), display: true, details: details(message) },
-					{ triggerTurn: false },
-				);
+			// A log without an id gets one, which every later load reads.
+			if (!teamId) {
+				teamId = randomUUID();
+				appendFileSync(log, jsonLine({ t: "team", id: teamId }));
 			}
 			return [...members.values()];
 		},
 
-		/** Validates a new member's name and description, records it, and announces it on the board. */
+		/**
+		 * Appends to the main agent's current branch the messages to or from it that `shown`, the details of that branch and of the messages
+		 * waiting for it, do not mark seen. The latest arrive in full. One notice counts the earlier ones and those that `summarized`, the details
+		 * of the entries a new branch summary covers, mark seen; its `covered` marks them seen on this branch.
+		 */
+		redeliver(shown: Details[], summarized: Details[] = []) {
+			const seen = seenIn(shown);
+			const inSummaryOf = seenIn(summarized);
+			const missing = messages.filter((message) => (message.from === MAIN || message.notify.includes(MAIN)) && !seen.has(message.seq));
+			const inSummary = missing.filter((message) => inSummaryOf.has(message.seq));
+			const rest = missing.filter((message) => !inSummaryOf.has(message.seq));
+			const earlier = rest.slice(0, Math.max(0, rest.length - INBOX_SIZE));
+			const count = (list: MessageRecord[]) =>
+				list.length === 1 ? `1 team message to or from you (#${list[0].seq})` : `${list.length} team messages to or from you (#${list[0].seq} to #${list[list.length - 1].seq})`;
+			const read = "read them in full with team history (with: a member, for direct messages)";
+			const notice = [
+				earlier.length ? `[team] Not shown here: ${count(earlier)}, earlier than those below; ${read}.\n\n` : "",
+				inSummary.length ? `[team] The branch summary covers ${count(inSummary)}; ${read}.\n\n` : "",
+			].join("");
+			if (notice) quietly(TEAM_NOTICE, notice, { team: teamId, covered: [...earlier, ...inSummary].map((message) => message.seq) });
+			for (const message of rest.slice(earlier.length)) quietly(TEAM_MESSAGE, render(message, MAIN), details(message));
+		},
+
+		/** In a forked session whose branch, with details `shown`, holds another team's messages, tells the main agent whose they are. */
+		forked(shown: Details[]) {
+			if (shown.some((details) => typeof details?.team === "string" && details.team !== teamId)) quietly(TEAM_NOTICE, FORK_NOTICE, { team: teamId });
+		},
+
+		/** Validates a new member's name and description, records it, and announces it on the board; returns the details that mark the announcement seen. */
 		hire(name: string, description: string, cwd: string, args: string[]) {
 			if (!NAME.test(name)) throw new Error(`name must match ${NAME.source}`);
 			if (RESERVED.has(name)) throw new Error(`${name} is reserved`);
@@ -399,16 +441,16 @@ export function createTeam(pi: ExtensionAPI, host: TeamHost) {
 			members.set(name, member);
 			messages.push(post);
 			joined.set(name, post.seq);
+			return details(post);
 		},
 
 		/**
-		 * The main agent's board digest as a notice entry, or undefined when there is nothing new.
-		 * The entry keeps the board cursor in the session; without an entry, the same posts make an empty digest again after a reopen.
+		 * The main agent's board digest of the posts after the board cursor of `entries`, its current branch, as a notice entry,
+		 * or undefined when there is nothing new. Once on the branch, the entry moves that cursor.
 		 */
-		mainDigest() {
-			const content = digest(MAIN, board);
-			board = lastSeq();
-			return content ? { type: "custom_message" as const, customType: TEAM_NOTICE, content, display: true, details: { team: teamId, board } } : undefined;
+		mainDigest(entries: SessionEntry[]) {
+			const content = digest(MAIN, teamCursor(entries, teamId, "board"));
+			return content ? { type: "custom_message" as const, customType: TEAM_NOTICE, content, display: true, details: { team: teamId, board: lastSeq() } } : undefined;
 		},
 
 		/** Sends a woken member's final reply to the running member that woke it; returns the message's seq. */

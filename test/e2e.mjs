@@ -390,6 +390,19 @@ fs.writeFileSync(
 		await ctx.navigateTree(digest.parentId, { summarize: false });
 		ctx.ui.notify("navigated back", "info");
 	} });
+	// "<id> [ms]": with ms, the abandoned branch is summarized after ms.
+	pi.registerCommand("tree-to", { handler: async (args, ctx) => {
+		const [id, ms] = args.trim().split(" ");
+		await ctx.navigateTree(id, ms ? { summarize: true, customInstructions: \`SLOW \${ms}\` } : { summarize: false });
+		ctx.ui.notify(\`navigated to \${id}\`, "info");
+	} });
+	// Appends the custom message that the JSON argument describes.
+	pi.registerCommand("deliver", { handler: async (args, ctx) => {
+		pi.sendMessage(JSON.parse(args), { triggerTurn: false });
+		ctx.ui.notify("delivered", "info");
+	} });
+	// Holds this prompt's start after the subagent extension's handler ran.
+	pi.on("before_agent_start", (event) => (event.prompt === "SAY preflight" ? new Promise((done) => setTimeout(done, 6000)) : undefined));
 }
 `,
 );
@@ -821,7 +834,11 @@ const nextSeq = (log) =>
 				}
 			}),
 	) + 1;
-const missed = (seq, body) => `${JSON.stringify({ t: "msg", seq, at: Date.now(), from: "alpha", to: "main", notify: ["main"], body })}\n`;
+const missed = (seq, body, from = "alpha") => `${JSON.stringify({ t: "msg", seq, at: Date.now(), from, to: "main", notify: ["main"], body })}\n`;
+/** The team id that the first line of a team log holds. */
+const teamIdOf = (log) => JSON.parse(fs.readFileSync(log, "utf8").split("\n")[0]).id;
+const FORK_NOTICE =
+	"[team] The team messages above belong to the team of the session this one was forked from. This session has a team of its own, which starts without members; resume the original session to work with that team.";
 let teamSession;
 
 await step("resuming the session restores members as stopped and delivers only missing messages", async () => {
@@ -876,6 +893,8 @@ await step("a team started in a clone restores its own messages despite the orig
 		assert.equal((await original.request({ type: "clone" })).data.cancelled, false);
 		clone = (await original.request({ type: "get_state" })).data;
 		assert.notEqual(clone.sessionFile, teamSession);
+		const { entries, leafId } = (await original.request({ type: "get_entries" })).data;
+		assert.equal(entries.find((e) => e.id === leafId).content.trimEnd(), FORK_NOTICE);
 		// alpha belongs to the original team, so hiring it again proves the clone has a team of its own.
 		assert.match((await original.call({ action: "run", name: "alpha", message: "SAY cloned" })).text, /^\[settled\] subagent alpha/);
 	} finally {
@@ -885,11 +904,38 @@ await step("a team started in a clone restores its own messages despite the orig
 	const reopened = startParent(["--session", clone.sessionFile]);
 	current = reopened;
 	try {
-		const restored = (await teamMessages(reopened)).filter((e) => e.details.team === clone.sessionId);
+		const restored = (await teamMessages(reopened)).filter((e) => e.details.team === teamIdOf(logOf(clone.sessionFile)));
 		assert.deepEqual(
 			restored.map((e) => [e.details.seq, e.content.trimEnd()]),
 			[[2, "[team #2] alpha → you (direct):\nfirst in the clone"]],
 		);
+	} finally {
+		await reopened.close();
+	}
+});
+
+await step("an imported copy of a session, which keeps the session id, starts a team of its own", async () => {
+	// What import does: the same file under another name.
+	const copy = teamSession.replace(/\.jsonl$/, "-imported.jsonl");
+	fs.copyFileSync(teamSession, copy);
+	const opened = startParent(["--session", copy]);
+	current = opened;
+	try {
+		assert.match((await opened.call({ action: "send", body: "first in the copy" }, "team")).text, /^Posted #1\./);
+	} finally {
+		await opened.close();
+	}
+	fs.appendFileSync(logOf(copy), missed(2, "for main in the copy"));
+	const reopened = startParent(["--session", copy]);
+	current = reopened;
+	try {
+		// The copy holds the original team's messages up to a higher seq, under the same session id.
+		const restored = (await teamMessages(reopened)).filter((e) => e.content.includes("in the copy"));
+		assert.deepEqual(
+			restored.map((e) => [e.details.team, e.details.seq, e.content.trimEnd()]),
+			[[teamIdOf(logOf(copy)), 2, "[team #2] alpha → you (direct):\nfor main in the copy"]],
+		);
+		assert.notEqual(teamIdOf(logOf(copy)), teamIdOf(logOf(teamSession)));
 	} finally {
 		await reopened.close();
 	}
@@ -928,6 +974,196 @@ await step("board posts an agent missed before its session closed show in its di
 		);
 	} finally {
 		await reopened.close();
+	}
+});
+
+const treeArgs = ["--no-extensions", "-e", fileURLToPath(new URL("..", import.meta.url)), "-e", busyExtension];
+/** The current branch of `p`'s session, root first, and its leaf. */
+const branchOf = async (p) => {
+	const { entries, leafId } = (await p.request({ type: "get_entries" })).data;
+	const byId = new Map(entries.map((e) => [e.id, e]));
+	const branch = [];
+	for (let e = byId.get(leafId); e; e = byId.get(e.parentId)) branch.unshift(e);
+	return { branch, leafId };
+};
+/** The entries the branch holds after entry `id`, as [customType or type, text]. */
+const after = (branch, id) =>
+	branch.slice(branch.findIndex((e) => e.id === id) + 1).map((e) => [e.customType ?? e.type, typeof e.content === "string" ? e.content.trimEnd() : ""]);
+/** Moves `p` to entry `id` of its session tree, summarizing the abandoned branch after `ms` if given. */
+const treeTo = async (p, id, ms) => {
+	const from = p.events.length;
+	p.prompt(`/tree-to ${id}${ms === undefined ? "" : ` ${ms}`}`);
+	return p.waitEvent((e) => e.type === "extension_ui_request" && e.message === `navigated to ${id}`, from, 90_000);
+};
+/** The seqs of team-message entries on `branch`. */
+const delivered = (branch) => branch.filter((e) => e.customType === "team-message").map((e) => e.details.seq);
+/** Waits for `p`'s next subagent-result from event index `from` and the end of the run it starts or joins. */
+const resultArrives = async (p, from) => {
+	const result = await p.waitMessage("subagent-result", from);
+	await p.waitEvent((e) => e.type === "agent_settled", result.at);
+	return result;
+};
+const treeSessions = join(WORK_DIR, "tree-sessions");
+let treeSession;
+let treeStart;
+let treeEnd;
+
+await step("after a rewind in the session tree, the main agent quietly gets the team messages and results the branch lacks, its own included, and none twice", async () => {
+	const tree = startParent(["--session-dir", treeSessions, ...treeArgs]);
+	current = tree;
+	try {
+		await tree.say("SAY start");
+		treeStart = (await branchOf(tree)).leafId;
+		treeSession = (await tree.request({ type: "get_state" })).data.sessionFile;
+		assert.match((await tree.call({ action: "run", name: "tango", message: "SAY tango done" })).text, /tango done$/);
+		const from = tree.events.length;
+		await tree.call({ action: "run", name: "uniform", message: TEAM({ action: "send", to: "main", body: "for main" }) });
+		await resultArrives(tree, from);
+		assert.match((await tree.call({ action: "send", body: "main's plan" }, "team")).text, /^Posted #4\./);
+		const { branch, leafId } = await branchOf(tree);
+		treeEnd = leafId;
+		assert.equal(branch.at(-1).message?.role, "assistant");
+		const mark = tree.events.length;
+		await treeTo(tree, treeStart);
+		const back = after((await branchOf(tree)).branch, treeStart);
+		assert.deepEqual(back.slice(0, 4), [
+			["team-message", "[team #1] you → #team:\njoined: tango — test member"],
+			["team-message", "[team #2] you → #team:\njoined: uniform — test member"],
+			["team-message", "[team #3] uniform → you (direct):\nfor main"],
+			["team-message", "[team #4] you → #team:\nmain's plan"],
+		]);
+		assert.equal(back.length, 6);
+		assert.match(back[4][1], /^\[settled\] subagent tango[\s\S]*tango done$/);
+		assert.match(back[5][1], /^\[settled\] subagent uniform[\s\S]*team: Sent #3 to main\.$/);
+		await sleep(1000);
+		assert.ok(!tree.events.slice(mark).some((e) => e.type === "agent_start"), "the redelivery started a turn");
+		// tango's result went out in a tool result on the other branch; on this one it went out as a message.
+		assert.match((await tree.call({ action: "status", id: "tango" })).text, /Its result was sent to you as a subagent-result message\./);
+		await treeTo(tree, treeEnd);
+		assert.deepEqual(after((await branchOf(tree)).branch, treeEnd), []);
+	} finally {
+		await tree.close();
+	}
+});
+
+await step("a branch that holds a later team message still gets an earlier one it lacks, and only that one", async () => {
+	const early = nextSeq(logOf(treeSession));
+	fs.appendFileSync(logOf(treeSession), missed(early, "gap early", "uniform") + missed(early + 1, "gap late", "uniform"));
+	// Without the team extension, only the later message joins the branch, as a message for main does.
+	const plain = startParent(["--session", treeSession, "--no-extensions", "-e", busyExtension]);
+	current = plain;
+	let leaf;
+	try {
+		const from = plain.events.length;
+		const late = { team: teamIdOf(logOf(treeSession)), seq: early + 1, from: "uniform" };
+		plain.prompt(`/deliver ${JSON.stringify({ customType: "team-message", content: `[team #${early + 1}] uniform → you (direct):\ngap late\n\n`, display: true, details: late })}`);
+		await plain.waitEvent((e) => e.type === "extension_ui_request" && e.message === "delivered", from);
+		const { branch, leafId } = await branchOf(plain);
+		assert.ok(delivered(branch).includes(early + 1) && !delivered(branch).includes(early), "no gap");
+		leaf = leafId;
+	} finally {
+		await plain.close();
+	}
+	const reopened = startParent(["--session", treeSession, ...treeArgs]);
+	current = reopened;
+	try {
+		assert.deepEqual(after((await branchOf(reopened)).branch, leaf), [["team-message", `[team #${early}] uniform → you (direct):\ngap early`]]);
+	} finally {
+		await reopened.close();
+	}
+});
+
+await step("after a move to a team message with a summary, that message arrives in full and one notice line counts those the summary covers", async () => {
+	const tree = startParent(["--session", treeSession, ...treeArgs]);
+	current = tree;
+	try {
+		const from = tree.events.length;
+		const sent = await tree.call({ action: "send", to: "uniform", body: TEAM({ action: "send", to: "main", body: "summarized" }) }, "team");
+		const dm = Number(sent.text.match(/^Sent #(\d+) to uniform \(woken\)\.$/)[1]) + 1;
+		await resultArrives(tree, from);
+		assert.match((await tree.call({ action: "send", body: "after the message" }, "team")).text, new RegExp(`^Posted #${dm + 1}\\.`));
+		// Pi summarizes the entries after the selected message and moves to its parent, so neither holds the message itself.
+		const target = (await branchOf(tree)).branch.find((e) => e.customType === "team-message" && e.details.seq === dm);
+		await treeTo(tree, target.id, 0);
+		const { branch } = await branchOf(tree);
+		const back = after(branch, target.parentId);
+		assert.deepEqual(back.slice(0, 3), [
+			["branch_summary", ""],
+			["team-notice", `[team] The branch summary covers 1 team message to or from you (#${dm + 1}); read them in full with team history (with: a member, for direct messages).`],
+			["team-message", `[team #${dm}] uniform → you (direct):\nsummarized`],
+		]);
+		assert.deepEqual(branch.at(-3).details.covered, [dm + 1]);
+		assert.equal(back.length, 4);
+		assert.match(back[3][1], new RegExp(`^\\[settled\\] subagent uniform[\\s\\S]*team: Sent #${dm} to main\\.$`));
+	} finally {
+		await tree.close();
+	}
+});
+
+await step("a team message that reaches the main agent while it summarizes a branch arrives once", async () => {
+	const tree = startParent(["--session", treeSession, ...treeArgs]);
+	current = tree;
+	try {
+		await tree.call({ action: "run", name: "victor", message: `SLOW 1500 ${TEAM({ action: "send", to: "main", body: "during navigation" })}`, waitMs: 0 });
+		const from = tree.events.length;
+		const moved = await treeTo(tree, treeStart, 8000);
+		const queued = tree.events.findIndex((e, i) => i >= from && e.type === "extension_ui_request" && e.message === "subagent victor: team message waiting for the main agent");
+		assert.ok(queued !== -1 && queued < tree.events.indexOf(moved), "the message came after the navigation");
+		const message = await tree.waitMessage("team-message", tree.events.indexOf(moved));
+		assert.match(message.content, /\nduring navigation$/);
+		await resultArrives(tree, from);
+		const { branch } = await branchOf(tree);
+		assert.equal(delivered(branch).filter((seq) => seq === message.details.seq).length, 1);
+	} finally {
+		await tree.close();
+	}
+});
+
+await step("of many team messages a branch lacks, the latest ten arrive in full and one notice line counts the others", async () => {
+	const first = nextSeq(logOf(treeSession));
+	for (let i = 0; i < 12; i++) fs.appendFileSync(logOf(treeSession), missed(first + i, `missed ${i}`, "uniform"));
+	// The second reopen finds them all seen.
+	let leaf = "";
+	for (const expected of [
+		[
+			["team-notice", `[team] Not shown here: 2 team messages to or from you (#${first} to #${first + 1}), earlier than those below; read them in full with team history (with: a member, for direct messages).`],
+			...Array.from({ length: 10 }, (_, i) => ["team-message", `[team #${first + 2 + i}] uniform → you (direct):\nmissed ${2 + i}`]),
+		],
+		[],
+	]) {
+		const opened = startParent(["--session", treeSession, ...treeArgs]);
+		current = opened;
+		try {
+			const { branch, leafId } = await branchOf(opened);
+			leaf ||= branch.findLast((e) => e.message?.role === "assistant").id;
+			assert.deepEqual(after(branch, leaf), expected);
+			if (expected.length) assert.deepEqual(branch.at(-11).details.covered, [first, first + 1]);
+			leaf = leafId;
+		} finally {
+			await opened.close();
+		}
+	}
+});
+
+await step("a result that arrives while a prompt's run is starting finds the board digest already on the branch", async () => {
+	const pre = startParent(["--session-dir", treeSessions, ...treeArgs]);
+	current = pre;
+	try {
+		await pre.call({ action: "run", name: "whiskey", message: TEAMS([{ action: "send", body: "whiskey news" }, { action: "wait", ms: 2000 }]), waitMs: 0 });
+		// The post is on the board once whiskey asks the model again.
+		await until(() => requestsBy("whiskey").length >= 2);
+		const from = pre.events.length;
+		pre.prompt("SAY preflight");
+		const result = await resultArrives(pre, from);
+		const answered = await pre.waitEvent((e) => e.type === "message_end" && e.message.role === "assistant" && text(e.message) === "preflight", from);
+		await pre.waitEvent((e) => e.type === "agent_settled", pre.events.indexOf(answered));
+		await sleep(1000);
+		const prompted = pre.events.findIndex((e, i) => i >= from && e.type === "message_start" && e.message.role === "user" && text(e.message) === "SAY preflight");
+		assert.ok(prompted === -1 || result.at < prompted, "the result came after the prompt joined the session");
+		const { entries } = (await pre.request({ type: "get_entries" })).data;
+		assert.equal(entries.filter((e) => e.customType === "team-notice" && e.content.includes("whiskey news")).length, 1);
+	} finally {
+		await pre.close();
 	}
 });
 

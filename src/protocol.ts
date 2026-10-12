@@ -56,15 +56,19 @@ export type Request =
 /** `board`: the caller's board cursor after a digest or a history call that showed the whole board. */
 export type Reply = { ok: true; text?: string; team?: string; preamble?: string; messages?: Delivery[]; count?: number; board?: number } | { error: string };
 
+export type Details = Record<string, unknown> | undefined;
+
+/** The details of a custom message or tool result entry, where the extension keeps what a branch has seen. */
+export const detailsOf = (entry: SessionEntry) =>
+	(entry.type === "custom_message" ? entry.details : entry.type === "message" && entry.message.role === "toolResult" ? entry.message.details : undefined) as Details;
+
 /**
- * A read cursor of `entries`, a session's current branch, for `team`: the highest `key` in the details of their custom messages and tool results; `team` is the id of the session that owns the team.
+ * A read cursor of `entries`, a session's current branch, for team `team`: the highest `key` in their details.
  * `seq`: every team message carries `details: { team, seq }`. `board`: digests and history calls that show the whole board carry `details: { team, board }`.
  */
 export const teamCursor = (entries: SessionEntry[], team: string, key: "seq" | "board") =>
 	entries.reduce((max, entry) => {
-		const details = (entry.type === "custom_message" ? entry.details : entry.type === "message" && entry.message.role === "toolResult" ? entry.message.details : undefined) as
-			| Record<string, unknown>
-			| undefined;
+		const details = detailsOf(entry);
 		const value = details?.team === team ? details[key] : undefined;
 		return typeof value === "number" && value > max ? value : max;
 	}, 0);
