@@ -2,6 +2,7 @@
  * The parent side: the `subagent` tool, the agent registry, waits, and delivery of results and team messages
  * to the main agent.
  */
+import { randomUUID } from "node:crypto";
 import { existsSync, mkdirSync, statSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
@@ -69,7 +70,8 @@ interface Pending {
 	customType: string;
 	agentId: string;
 	content: string;
-	details: object;
+	/** `delivery` identifies the message on the branch that holds it. */
+	details: { delivery: string };
 	/** Information only: it joins the session but never starts a turn. */
 	quiet: boolean;
 }
@@ -131,10 +133,18 @@ export default function setupParent(pi: ExtensionAPI) {
 	/** The main agent's last run was aborted, as with Esc; deliveries start no turn until a run starts again. */
 	let suspended = false;
 	/**
-	 * Messages for a busy parent, in arrival order. They join its session together at the next turn boundary,
+	 * Messages for a busy parent, in arrival order, until its current branch holds them. They join its session together at the next turn boundary,
 	 * outside Pi's steer queue, which hands over one message per model request and is cleared by Esc.
 	 */
 	let pending: Pending[] = [];
+	/** The pending messages, without those the parent's current branch holds. A batch another extension drops at a boundary leaves its messages here. */
+	const unreceived = () => {
+		if (pending.length && parent) {
+			const held = new Set(parent.sessionManager.getBranch().map((entry) => detailsOf(entry)?.delivery));
+			pending = pending.filter((message) => !held.has(message.details.delivery));
+		}
+		return pending;
+	};
 	/** From agent_start to this extension's agent_settled handler; Pi reports idle while earlier settle handlers run. */
 	let inRun = false;
 	/** The poll for an idle parent, while messages are pending. */
@@ -142,7 +152,7 @@ export default function setupParent(pi: ExtensionAPI) {
 	/** Ends every tool wait, so a new message does not sit behind a long wait. */
 	const waits = new Set<() => void>();
 	/** Pending messages that wake the parent. */
-	const loud = () => pending.filter((message) => !message.quiet).length;
+	const loud = () => unreceived().filter((message) => !message.quiet).length;
 
 	const header = (agent: Agent) => {
 		const now = Date.now();
@@ -180,7 +190,7 @@ export default function setupParent(pi: ExtensionAPI) {
 	const consume = (agent: Agent): { text: string; details?: object } => {
 		if (agent.status === "running") return { text: report(agent) + (loud() ? "\nReturned early: subagent messages follow this result." : "") };
 		if (agent.status === "stopped") return { text: header(agent) };
-		if (pending.some((message) => message.agentId === agent.id)) deliver(agent);
+		if (unreceived().some((message) => message.agentId === agent.id)) deliver(agent);
 		if (agent.delivered) return { text: `${header(agent)}\n\nIts result ${agent.delivered}. Full reply: ${join(agent.dir, "final.md")}` };
 		agent.delivered = RETURNED;
 		return { text: report(agent), details: runKey(agent) };
@@ -219,7 +229,7 @@ export default function setupParent(pi: ExtensionAPI) {
 			if (suspended && !quiet && parent?.hasUI) parent.ui.notify(`${label} added; the main agent sees it when it runs again`, "info");
 			return;
 		}
-		pending.push({ customType, agentId, content, details, quiet });
+		pending.push({ customType, agentId, content, details: { ...details, delivery: randomUUID() }, quiet });
 		watchIdle();
 		if (quiet) return;
 		for (const wake of [...waits]) wake();
@@ -227,19 +237,15 @@ export default function setupParent(pi: ExtensionAPI) {
 		if (parent.hasUI) parent.ui.notify(`${label} waiting for the main agent`, "info");
 	};
 
-	const takePending = () => {
-		const taken = pending;
-		pending = [];
-		return taken;
-	};
-
 	// Every pending message joins the session in the same request. A model error keeps them for agent_settled,
 	// which wakes the parent; an abort (Esc) appends them without asking for another request.
 	// Returned entries replace the drafts earlier handlers proposed, so they are kept in front.
+	// They stay pending until the branch holds them, so a batch a later extension drops is proposed again at the next boundary.
 	const atBoundary = (event: BoundaryState) => {
-		if (!pending.length || event.outcome === "error") return;
-		const wakes = loud() > 0;
-		const entries = takePending().map(({ customType, content, details }) => ({ type: "custom_message" as const, customType, content, display: true, details }));
+		const batch = unreceived();
+		if (!batch.length || event.outcome === "error") return;
+		const wakes = batch.some((message) => !message.quiet);
+		const entries = batch.map(({ customType, content, details }) => ({ type: "custom_message" as const, customType, content, display: true, details }));
 		return { entries: [...event.entries, ...entries], continue: event.continue || (wakes && event.outcome !== "aborted") };
 	};
 	// The board digest rides on a request that follows tool results anyway, so it never makes a run continue.
@@ -252,9 +258,11 @@ export default function setupParent(pi: ExtensionAPI) {
 
 	// Messages no boundary took, such as those that came during a model error; wake the parent unless it was stopped.
 	// One wake for the whole batch: each triggering message would start its own run, which Esc cannot cancel.
+	// sendMessage passes no boundary handler, so no extension drops what it sends, and none of it stays pending.
 	const flush = () => {
-		const wakes = !suspended && loud() > 0;
-		const taken = takePending();
+		const taken = unreceived();
+		pending = [];
+		const wakes = !suspended && taken.some((message) => !message.quiet);
 		if (wakes) digestFirst();
 		taken.forEach(({ customType, content, details }, i) => {
 			pi.sendMessage({ customType, content, display: true, details }, { triggerTurn: wakes && i === taken.length - 1 });
@@ -620,7 +628,7 @@ export default function setupParent(pi: ExtensionAPI) {
 		const summarized = event.summaryEntry ? summarizing : [];
 		summarizing = [];
 		const branch = ctx.sessionManager.getBranch();
-		const shown = [...branch.map(detailsOf), ...pending.map((message) => message.details as Details)];
+		const shown: Details[] = [...branch.map(detailsOf), ...unreceived().map((message) => message.details)];
 		team.redeliver(shown, summarized.map(detailsOf));
 		for (const agent of agents.values()) {
 			if (agent.delivered !== SENT && agent.delivered !== RETURNED) continue;

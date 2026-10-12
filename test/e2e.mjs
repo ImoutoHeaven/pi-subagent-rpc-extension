@@ -1292,5 +1292,58 @@ await step("a result that arrives while a prompt's run is starting finds the boa
 	}
 });
 
+await step("a result or team message in a batch another extension drops at the main agent's turn boundary arrives at its next boundary of the same run, once", async () => {
+	const dropper = join(WORK_DIR, "main-drop-extension.ts");
+	// Loaded after the subagent extension, it empties the first turn_end batch that holds a subagent result, and the first that holds a team message.
+	fs.writeFileSync(
+		dropper,
+		`export default function (pi) {
+	const dropped = new Set();
+	pi.on("turn_end", (event, ctx) => {
+		const types = event.entries.map((e) => e.customType).filter((type) => (type === "subagent-result" || type === "team-message") && !dropped.has(type));
+		if (!types.length) return;
+		for (const type of types) dropped.add(type);
+		ctx.ui.notify(\`dropped \${types.join(",")}\`, "info");
+		return { entries: [] };
+	});
+}
+`,
+	);
+	// Only this step's model requests: earlier steps hire a member named romeo too.
+	const earlier = fs.existsSync(REQUESTS) ? requests().length : 0;
+	const p = startParent(["--session-dir", join(WORK_DIR, "drop-sessions"), "--no-extensions", "-e", fileURLToPath(new URL("..", import.meta.url)), "-e", dropper]);
+	current = p;
+	/** Member `name` runs `script`, whose message of `customType` reaches the main agent during a team wait; the batch holding it is dropped. */
+	const dropOnce = async (name, script, customType) => {
+		await p.call({ action: "run", name, message: script, waitMs: 0 });
+		const from = p.events.length;
+		await p.call({ action: "wait", ms: 8000 }, "team");
+		const drop = p.events.findIndex((e, i) => i >= from && e.type === "extension_ui_request" && e.message === `dropped ${customType}`);
+		assert.ok(drop !== -1, `no batch with a ${customType} was dropped`);
+		const arrived = p.events.findIndex((e, i) => i > drop && asMessage(e)?.customType === customType);
+		const settled = p.events.findIndex((e, i) => i > drop && e.type === "agent_settled");
+		assert.ok(arrived !== -1 && arrived < settled, `the dropped ${customType} did not arrive in the same run`);
+	};
+	try {
+		await dropOnce("romeo", "SLOW 2500 SAY repro", "subagent-result");
+		assert.match((await p.call({ action: "status", id: "romeo" })).text, /\n\nIts result was sent to you as a subagent-result message\. Full reply: /);
+		const from = p.events.length;
+		await dropOnce("tango", `SLOW 2500 ${TEAM({ action: "send", to: "main", body: "dropped note" })}`, "team-message");
+		// tango's result may arrive after that run, starting another.
+		const result = await p.waitEvent((e) => asMessage(e)?.customType === "subagent-result" && asMessage(e).details?.id === "tango", from);
+		await p.waitEvent((e) => e.type === "agent_settled", p.events.indexOf(result));
+		const { branch } = await branchOf(p);
+		const count = (customType, match) => branch.filter((e) => e.type === "custom_message" && e.customType === customType && match(e)).length;
+		assert.equal(count("subagent-result", (e) => e.details.id === "romeo"), 1);
+		assert.equal(count("subagent-result", (e) => e.details.id === "tango"), 1);
+		assert.equal(count("team-message", (e) => e.details.from === "tango"), 1);
+		const seen = requests().slice(earlier);
+		assert.ok(seen.some((body) => body.messages.some((m) => m.role === "user" && /^\[settled\] subagent romeo[\s\S]*\nrepro$/.test(text(m)))), "the result did not reach the model");
+		assert.ok(seen.some((body) => body.messages.some((m) => isTeam(m) && text(m).endsWith("\ndropped note"))), "the team message did not reach the model");
+	} finally {
+		await p.close();
+	}
+});
+
 console.log(failed ? `\n${failed} FAILED` : "\nALL PASSED");
 process.exit(failed ? 1 : 0);
