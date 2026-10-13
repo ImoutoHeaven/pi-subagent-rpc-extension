@@ -326,7 +326,7 @@ export default function setupParent(pi: ExtensionAPI) {
 	/** Other running subagents, so a result also shows what is still in flight. */
 	const footer = (except?: Agent) => {
 		const now = Date.now();
-		const running = [...agents.values()].filter((agent) => agent !== except && busy(agent));
+		const running = [...agents.values()].filter((agent) => agent !== except && busy(agent) && !team.isRetired(agent.id));
 		if (!running.length) return "";
 		const shown = running.slice(0, FOOTER_AGENTS).map((agent) => {
 			const quiet = now - agent.lastEventAt;
@@ -478,8 +478,6 @@ export default function setupParent(pi: ExtensionAPI) {
 			launch(agent, { type: "prompt", message: note }, by);
 		},
 		notify,
-		// Information for the main agent's judgment, so it never starts a turn.
-		notice: (customType, text, details) => notify(customType, "team", text, details, true),
 		waitForMain: async (ms, signal) => {
 			await waitFor(undefined, ms, signal, true);
 			return loud();
@@ -795,6 +793,11 @@ export default function setupParent(pi: ExtensionAPI) {
 			Type.String({ description: "run: Pi model pattern, provider/id[:thinking]. Default: your current model and thinking level. switch: the member's new model, in the same form." }),
 		),
 		thinking: Type.Optional(Type.String({ description: "switch: a Pi thinking level: off, minimal, low, medium, high, xhigh, or max." })),
+		retire: Type.Optional(
+			Type.Boolean({
+				description: "abort (required): true also retires the member: it leaves the team for good, and its name is not reused. false only stops it.",
+			}),
+		),
 		cwd: Type.Optional(Type.String({ description: "run: working directory. Default: yours." })),
 		args: Type.Optional(Type.Array(Type.String(), { description: "run: extra Pi CLI options, for example tools, extensions, skills, or MCP." })),
 		waitMs: Type.Optional(
@@ -814,6 +817,7 @@ export default function setupParent(pi: ExtensionAPI) {
 		description?: string;
 		model?: string;
 		thinking?: string;
+		retire?: boolean;
 		cwd?: string;
 		args?: string[];
 		waitMs?: number;
@@ -824,10 +828,11 @@ export default function setupParent(pi: ExtensionAPI) {
 		label: "Subagent",
 		description: [
 			"Delegate work to a Pi subagent: a separate Pi process with its own session that loads tools, extensions, skills, and MCP servers like a normal Pi launch.",
-			"run hires a named team member, announces it on the board, and starts it on message; its name is its id, and its description is the role the team roster shows. status reports progress or the result (without id: lists subagents). abort stops the current run or compaction and cancels a queued one; a member you aborted wakes only for your direct message.",
+			"run hires a named team member, announces it on the board, and starts it on message; its name is its id, and its description is the role the team roster shows. status reports progress or the result (without id: lists subagents). abort stops a member's run or compaction, if any, and cancels a queued compaction; a member you aborted wakes only for your direct message. retire (required with abort): true also removes the member from the team, whether it runs or not; retire members you will not use again. A retired member's name is not reused, and status with its id still shows its last result.",
+			"Two ways to give work: a fresh member with a self-contained message suits a different domain or a new task; a stopped member, compacted with instructions that keep what helps and then messaged, suits continuing its work, or similar work its earlier context helps with.",
 			"compact compacts a member's context; instructions say what the summary keeps. Pi compacts a running member by itself at its compact point, a Pi setting; status lines show ctx: the member's context tokens against that point. Compact a member yourself when it is past about 60% of its compact point and is about to take a new or unrelated task, or holds much that the next task does not need. A stopped member compacts at once, a running one after its current run. With message, the member then runs on message as if you sent it; without, a result you did not wait for arrives without starting a turn.",
 			"switch moves a member to another model or thinking level for its next runs; it keeps its name, session, and context. A new model starts without the prompt cache, so its next request pays full input price for the whole context; compact first when the context is large. With message, a stopped member runs on it at once.",
-			`run, status, compact, and switch with message wait up to waitMs (default ${DEFAULT_WAIT_MS}, max ${MAX_WAIT_MS}) and return the result if it finishes in time, otherwise its progress while it keeps running. A finished result you have not seen arrives later as a message; do not poll for it. Team messages for you arrive the same way.`,
+			`run, status, compact, and switch with message wait up to waitMs (default ${DEFAULT_WAIT_MS}, max ${MAX_WAIT_MS}) and return the result if it finishes in time, otherwise its progress while it keeps running. To wait longer, call status again; each wait of up to ${MAX_WAIT_MS / 60_000} minutes keeps the prompt cache warm. Or end your turn: every result and message for you starts your next turn, and notices that start none arrive with it.`,
 			"Members talk with you and each other through the team tool. A member starts with an empty conversation, so put the context it needs in message. A direct team message to a stopped member wakes it in its own session. A run woken by a member's message sends its final reply to that member, or to you when that member has stopped.",
 			"args are Pi command-line options: read docs/cli.md in the Pi documentation listed in your system prompt, or run `pi --help`. Session, mode, model, provider, and thinking flags are set by this tool.",
 			"Progress showing no active tool and an old last event suggests a stall. Subagents cannot delegate further and end with this session.",
@@ -837,7 +842,8 @@ export default function setupParent(pi: ExtensionAPI) {
 			parent = ctx;
 			const waitMs = Math.min(params.waitMs ?? DEFAULT_WAIT_MS, MAX_WAIT_MS);
 			if (params.action === "status" && !params.id) {
-				return { content: [{ type: "text", text: agents.size ? [...agents.values()].map(header).join("\n") : "No subagents." }], details: undefined };
+				const listed = [...agents.values()].filter((agent) => !team.isRetired(agent.id));
+				return { content: [{ type: "text", text: listed.length ? listed.map(header).join("\n") : "No subagents." }], details: undefined };
 			}
 			/** The state of `agent`, with the other running members; `details` mark what the result shows seen. */
 			const result = (agent: Agent, details?: object, lead = "") => {
@@ -852,6 +858,7 @@ export default function setupParent(pi: ExtensionAPI) {
 			}
 			const agent = agents.get(params.id ?? "");
 			if (!agent) throw new Error(`Unknown subagent id: ${params.id}. Known: ${[...agents.keys()].join(", ") || "none"}`);
+			if (params.action !== "status" && team.isRetired(agent.id)) throw new Error(`${agent.id} is retired`);
 			if (params.action === "status") {
 				await waitFor(agent, waitMs, signal, true);
 				return result(agent);
@@ -901,6 +908,9 @@ export default function setupParent(pi: ExtensionAPI) {
 				await waitFor(agent, waitMs, signal, true);
 				return result(agent, undefined, `${line}\n\n`);
 			}
+			if (typeof params.retire !== "boolean") throw new Error("abort requires retire: true or false");
+			// Retired before its run stops, so nothing wakes the member in between.
+			if (params.retire) team.retire(agent.id);
 			// This call returns the final state, so hold a waiter to keep it from also being delivered.
 			const hold = () => {};
 			agent.waiters.add(hold);
@@ -916,7 +926,10 @@ export default function setupParent(pi: ExtensionAPI) {
 			} finally {
 				agent.waiters.delete(hold);
 			}
-			return result(agent);
+			if (!params.retire) return result(agent);
+			const unread = team.unread(agent.id);
+			const left = unread.length ? ` ${agent.id} had ${unread.length} unread message${unread.length === 1 ? "" : "s"}: ${unread.map((seq) => `#${seq}`).join(", ")}.` : "";
+			return result(agent, undefined, `${agent.id} is retired: it left the team; its session and final.md stay.${left}\n\n`);
 		},
 	});
 

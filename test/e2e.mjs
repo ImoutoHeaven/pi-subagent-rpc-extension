@@ -263,7 +263,7 @@ await step("a tool wait ends early when another subagent sends a message", async
 	assert.ok(Date.now() - started < 30_000, "the wait was not cut short");
 	assert.match(s.text, /Returned early: subagent messages follow this result\./);
 	assert.ok(parent.messages(from).some((m) => m.customType === "team-message" && /\nping$/.test(m.content)));
-	await call({ action: "abort", id: hung });
+	await call({ action: "abort", id: hung, retire: false });
 });
 
 await step("a result queued in a turn stopped with Esc is kept without waking the parent", async () => {
@@ -314,13 +314,16 @@ await step("a result returned by a call is not delivered again", async () => {
 	assert.equal(notifications(from).length, 0);
 });
 
-await step("abort stops a hung child; other results show it in their footer", async () => {
+await step("abort requires retire; with retire false, it stops a hung child, which other results show in their footer until then", async () => {
 	const r = await call({ action: "run", name: "hanging", message: "HANG", waitMs: 500 });
 	assert.match(r.text, LIVE);
 	const id = idOf(r.text);
 	const other = await call({ action: "run", name: "side", message: "SAY side" });
 	assert.match(other.text, new RegExp(`side\\n\\n\\(Background: ${id} running \\d+s\\.\\)$`));
-	const a = await call({ action: "abort", id });
+	const missing = await call({ action: "abort", id });
+	assert.ok(missing.isError, missing.text);
+	assert.match(missing.text, /abort requires retire: true or false/);
+	const a = await call({ action: "abort", id, retire: false });
 	assert.match(a.text, /^\[aborted\]/);
 	assert.doesNotMatch(a.text, /Background/);
 });
@@ -687,25 +690,23 @@ await step("a woken member's final reply reaches the main agent when its waker h
 	await team.waitEvent((e) => e.type === "agent_settled", note.at);
 });
 
-await step("a run woken by a member cannot wake others; the main agent is told without a turn and can wake the recipient", async () => {
+await step("a run woken by a member cannot wake others; a notice that starts a turn tells the main agent, which can wake the recipient", async () => {
 	await run({ name: "relay", message: "SAY relay ready" });
 	await run({ name: "sink", message: "SAY sink ready" });
 	const from = team.events.length;
 	const relayed = TEAM({ action: "send", to: "sink", body: "SAY sink got it" });
 	await run({ name: "origin", message: TEAMS([{ action: "send", to: "relay", body: relayed }, { action: "wait", ms: 60_000 }]), waitMs: 0 });
+	const idle = team.events.length;
 	const notice = await team.waitMessage("team-notice", from);
 	assert.match(
 		notice.content,
 		/^\[team\] #\d+ relay → sink is waiting in sink's inbox: sink is stopped, and relay's run cannot wake it\. A direct message from you would wake sink, if and when you think it should run\.$/,
 	);
-	// origin's result comes after relay's final reply reached origin, and it is what starts a turn.
+	// A triggered turn emits agent_start before its message; the idle main agent's turn starts with the notice.
+	assert.ok(team.events.slice(idle, notice.at).some((e) => e.type === "agent_start"), "the notice started no turn");
+	// origin's result comes after relay's final reply reached origin.
 	const result = await team.waitMessage("subagent-result", from);
 	assert.match(result.content, /^\[settled\] subagent origin/);
-	// A triggered turn emits agent_start before its message, so the notice must land between turns.
-	const before = team.events.slice(0, notice.at);
-	assert.ok(before.findLastIndex((e) => e.type === "agent_settled") > before.findLastIndex((e) => e.type === "agent_start"), "the notice came inside a turn");
-	const turn = team.events.findIndex((e, i) => i > notice.at && e.type === "agent_start");
-	assert.ok(team.events.slice(turn, turn + 4).includes(team.events[result.at]), "a turn started before origin's result");
 	await team.waitEvent((e) => e.type === "agent_settled", result.at);
 	const sendResult = requestsBy("relay").at(-1).messages.findLast((m) => m.role === "tool");
 	assert.equal(rawText(sendResult), `Sent #${notice.content.match(/#(\d+)/)[1]} to sink (stopped, not woken: your run was started by origin's message, so it cannot start others; the main agent was told).`);
@@ -738,18 +739,17 @@ await step("a direct message to several members from a run woken by a member wak
 
 await step("a member the main agent aborted wakes only for the main agent's direct message", async () => {
 	await run({ name: "locked", message: "HANG", waitMs: 300 });
-	assert.match((await team.call({ action: "abort", id: "locked" })).text, /^\[aborted\]/);
+	assert.match((await team.call({ action: "abort", id: "locked", retire: false })).text, /^\[aborted\]/);
 	const from = team.events.length;
+	// The notice ends run's wait, as a team message does, and joins the session after that tool call.
 	const knock = await run({ name: "knocker", message: TEAM({ action: "send", to: "locked", body: "SAY knocked" }) });
-	assert.match(knock.text, /team: Sent #\d+ to locked \(stopped, not woken: the main agent stopped it; the main agent was told\)\.$/);
-	// The main agent was busy with run when the notice came: it joins the session after that tool call and starts no run.
+	assert.match(knock.text, /Returned early: subagent messages follow this result\./);
 	const notice = await team.waitMessage("team-notice", from, 1000);
 	assert.match(notice.content, /^\[team\] #\d+ knocker → locked is waiting in locked's inbox: you stopped locked with abort, so knocker's message cannot wake it\./);
 	const toolEnd = team.events.findIndex((e, i) => i >= from && e.type === "tool_execution_end");
 	const settled = team.events.findIndex((e, i) => i > toolEnd && e.type === "agent_settled");
 	assert.ok(toolEnd < notice.at && notice.at < settled, "the notice did not join after the tool call");
-	await sleep(1000);
-	assert.ok(!team.events.slice(settled).some((e) => e.type === "agent_start"), "the notice started a run");
+	assert.match(await report("knocker", from), /team: Sent #\d+ to locked \(stopped, not woken: the main agent stopped it; the main agent was told\)\.$/);
 	const mark = team.events.length;
 	const woke = await teamCall({ action: "send", to: "locked", body: "SAY unlocked" });
 	assert.match(woke.text, /^Sent #\d+ to locked \(woken\)\.$/);
@@ -767,10 +767,44 @@ await step("abort stops a woken member before its run starts; extension notices 
 	const before = requestsBy("late").length;
 	assert.match((await teamCall({ action: "send", to: "late", body: "SAY should not run" })).text, /\(woken\)\.$/);
 	const started = Date.now();
-	assert.match((await team.call({ action: "abort", id: "late" })).text, /^\[aborted\] subagent late/);
+	assert.match((await team.call({ action: "abort", id: "late", retire: false })).text, /^\[aborted\] subagent late/);
 	assert.ok(Date.now() - started < 8000, "abort waited for the kill timeout");
 	await sleep(4000);
 	assert.equal(requestsBy("late").length, before, "the aborted run reached the model");
+});
+
+await step("abort with retire true removes a stopped member from the team and lists its unread direct messages", async () => {
+	await run({ name: "retiree", description: "leaves the team", message: "HANG", waitMs: 300 });
+	assert.match((await team.call({ action: "abort", id: "retiree", retire: false })).text, /^\[aborted\] subagent retiree/);
+	// A member's direct message to the locked member waits in its inbox.
+	const from = team.events.length;
+	await run({ name: "doorman", message: TEAM({ action: "send", to: "retiree", body: "SAY never read" }), waitMs: 0 });
+	const seq = (await team.waitMessage("team-notice", from)).content.match(/^\[team\] #(\d+) doorman → retiree is waiting/)?.[1] ?? assert.fail("no notice");
+	await finished("doorman");
+	const retired = await team.call({ action: "abort", id: "retiree", retire: true });
+	assert.match(
+		retired.text,
+		new RegExp(`^retiree is retired: it left the team; its session and final\\.md stay\\. retiree had 1 unread message: #${seq}\\.\\n\\n\\[aborted\\] subagent retiree`),
+	);
+	assert.doesNotMatch((await teamCall({ action: "members" })).text, /retiree/);
+	assert.doesNotMatch((await team.call({ action: "status" })).text, /retiree/);
+	assert.match((await team.call({ action: "status", id: "retiree" })).text, /^\[aborted\] subagent retiree/);
+	await run({ name: "newbie", message: "SAY newbie here" });
+	const preamble = rawText(requestsBy("newbie")[0].messages.find((m) => rawText(m).startsWith("[team] You are newbie,")));
+	assert.match(preamble, /\n- doorman: /);
+	assert.doesNotMatch(preamble, /^- retiree:/m);
+	for (const [r, error] of [
+		[await teamCall({ action: "send", to: "retiree", body: "x" }), /retiree is retired/],
+		[await teamCall({ action: "send", body: "x", mentions: ["retiree"] }), /retiree is retired/],
+		[await run({ name: "retiree", message: "SAY x" }), /retiree is retired/],
+		[await team.call({ action: "compact", id: "retiree" }), /retiree is retired/],
+		[await team.call({ action: "abort", id: "retiree", retire: true }), /retiree is retired/],
+	]) {
+		assert.ok(r.isError, r.text);
+		assert.match(r.text, error);
+	}
+	// mentions all leaves a retired member out.
+	assert.doesNotMatch((await teamCall({ action: "send", body: "to everyone", mentions: ["all"] })).text, /retiree/);
 });
 
 await step("wait returns early when a message arrives, and the message follows the tool result; an unmentioned board post does not end it", async () => {
@@ -1186,7 +1220,7 @@ await step("a direct message to a compacting member waits until the compaction e
 		progress = (await team.call({ action: "status", id: "slowc", waitMs: 0 })).text;
 	}
 	const started = Date.now();
-	assert.match((await team.call({ action: "abort", id: "slowc" })).text, /^\[aborted\] subagent slowc · [^\n]* · by main(\n|$)/);
+	assert.match((await team.call({ action: "abort", id: "slowc", retire: false })).text, /^\[aborted\] subagent slowc · [^\n]* · by main(\n|$)/);
 	assert.ok(Date.now() - started < 8000, "abort waited for the kill timeout");
 	assert.equal(await compactionsOf("slowc"), before);
 });
@@ -1195,7 +1229,7 @@ await step("the main agent's direct message to a member it aborted, sent during 
 	await run({ name: "lockc", model: "fake/fake-keep", args: ["-e", compactor], message: "SAY lockc ready" });
 	await teamCall({ action: "send", to: "lockc", body: "HANG" });
 	await until(() => requestsBy("lockc").length > 1);
-	assert.match((await team.call({ action: "abort", id: "lockc" })).text, /^\[aborted\] subagent lockc /);
+	assert.match((await team.call({ action: "abort", id: "lockc", retire: false })).text, /^\[aborted\] subagent lockc /);
 	const mark = team.events.length;
 	assert.match((await team.call({ action: "compact", id: "lockc", instructions: "WAIT 3000", waitMs: 0 })).text, /^\[compacting\] subagent lockc /);
 	assert.match((await teamCall({ action: "send", to: "lockc", body: "SAY unlocked" })).text, /^Sent #\d+ to lockc \(compacting; reads it afterwards\)\.$/);
@@ -1226,11 +1260,25 @@ await step("a member with a queued compaction is not woken between the end of it
 	assert.match((await team.call({ action: "status", id: "gapc", waitMs: 30_000 })).text, /^\[settled\] subagent gapc [^\n]*\n\ngapc second/);
 	mark = team.events.length;
 	assert.match((await teamCall({ action: "send", to: "gapc", body: "SAY should not run" })).text, /\(compacting; reads it afterwards\)\.$/);
-	assert.match((await team.call({ action: "abort", id: "gapc" })).text, /^\[settled\] subagent gapc /);
+	assert.match((await team.call({ action: "abort", id: "gapc", retire: false })).text, /^\[settled\] subagent gapc /);
 	const before = requestsBy("gapc").length;
 	await sleep(5000);
 	assert.equal(requestsBy("gapc").length, before, "the held message woke the member");
 	assert.ok(!team.messages(mark).some((m) => m.customType === "subagent-result"), "a run or compaction followed the abort");
+});
+
+await step("a member's direct message to an aborted member whose process still exits tells the main agent once", async () => {
+	await run({ name: "exiter", args: ["-e", slowExit], message: "HANG", waitMs: 300 });
+	await run({ name: "nudger", message: TEAMS([{ action: "wait", ms: 60_000 }, { action: "send", to: "exiter", body: "SAY never" }]), waitMs: 0 });
+	await until(() => requestsBy("nudger").length > 0);
+	const from = team.events.length;
+	assert.match((await team.call({ action: "abort", id: "exiter", retire: false })).text, /^\[aborted\] subagent exiter/);
+	// nudger sends while exiter's process takes 3 seconds to exit, whose end routes exiter's unread messages again.
+	await teamCall({ action: "send", to: "nudger", body: "go" });
+	const seq = (await team.waitMessage("team-notice", from)).content.match(/^\[team\] #(\d+) nudger → exiter is waiting/)?.[1] ?? assert.fail("no notice");
+	await finished("nudger");
+	await sleep(4000);
+	assert.equal(team.messages(from).filter((m) => m.customType === "team-notice" && m.content.startsWith(`[team] #${seq} `)).length, 1);
 });
 
 const teamMessages = async (parent) =>
@@ -1332,6 +1380,7 @@ await step("resuming the session restores members as stopped and delivers only m
 		const status = await resumed.call({ action: "status" });
 		for (const line of status.text.split("\n")) assert.match(line, /^\[stopped\] subagent [a-z-]+$/);
 		assert.match(status.text, /alpha/);
+		assert.doesNotMatch(status.text, /retiree/);
 		assert.ok(!requests().slice(before).some((body) => body.messages.some((m) => rawText(m).startsWith("[team] You are"))), "a member started");
 	} finally {
 		await resumed.close();

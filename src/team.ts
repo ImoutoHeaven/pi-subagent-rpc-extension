@@ -27,7 +27,7 @@ import {
 
 const MAIN = "main";
 const BOARD = "team";
-/** Custom message type of the one-line notices that tell the main agent about a message no one could wake for. */
+/** Custom message type of the main agent's board digest and of the one-line notices about a direct message that could not wake its recipient. */
 const TEAM_NOTICE = "team-notice";
 const NAME = /^[a-z][a-z0-9-]{0,22}[a-z0-9]$/;
 // `team` marks the board in the log's `to` field.
@@ -69,6 +69,11 @@ interface TopicRecord {
 	at: number;
 	body: string;
 }
+/** The main agent retired the member: it left the team for good. */
+interface RetireRecord {
+	t: "retire";
+	name: string;
+}
 
 export interface TeamHost {
 	isRunning(name: string): boolean;
@@ -84,8 +89,6 @@ export interface TeamHost {
 	wake(name: string, by: string): void;
 	/** Delivers a message to the main agent. */
 	notify(customType: string, from: string, text: string, details: object): void;
-	/** Tells the main agent something without starting a turn. */
-	notice(customType: string, text: string, details: object): void;
 	/** Resolves with the number of messages pending for the main agent once there is one, or after `ms`. */
 	waitForMain(ms: number, signal?: AbortSignal): Promise<number>;
 }
@@ -112,12 +115,14 @@ export function createTeam(pi: ExtensionAPI, host: TeamHost) {
 	let log = "";
 	/** The team's id, the first record of its log; session entries about the team carry it in their details. */
 	let teamId = "";
+	/** Every member ever hired, the retired ones included; their names are never reused. */
 	const members = new Map<string, MemberRecord>();
+	const retired = new Set<string>();
 	let messages: MessageRecord[] = [];
 	let topic = "";
 	/** Held `wait` requests by member. */
 	const waiters = new Map<string, Set<() => void>>();
-	// shortcut: pull marks and sender notices live in memory; reopening a session forgets them, and every member is stopped then anyway.
+	// shortcut: pull marks and sender notices live in memory; a reopened session counts every earlier message as pulled, and every member is stopped then anyway.
 	/** Per member, the highest seq its inbox returned; it decides only which messages wake the member again after a run. */
 	const pulled = new Map<string, number>();
 	/** Per member, the seq of its join announcement, the record after its member record in the log; the member's digest leaves it out. */
@@ -132,11 +137,12 @@ export function createTeam(pi: ExtensionAPI, host: TeamHost) {
 	};
 	/** Queues a notice for running member `name`'s next pull and ends its wait. */
 	const tell = (name: string, text: string) => {
+		if (retired.has(name)) return;
 		notices.set(name, [...(notices.get(name) ?? []), text]);
 		ping(name);
 	};
 
-	const append = (...records: (MemberRecord | MessageRecord | TopicRecord)[]) => {
+	const append = (...records: (MemberRecord | MessageRecord | TopicRecord | RetireRecord)[]) => {
 		// The first write creates the log, which starts with the team's id.
 		const id = existsSync(log) ? "" : jsonLine({ t: "team", id: teamId });
 		mkdirSync(dirname(log), { recursive: true });
@@ -144,8 +150,16 @@ export function createTeam(pi: ExtensionAPI, host: TeamHost) {
 	};
 	const details = (message: MessageRecord) => ({ team: teamId, seq: message.seq, from: message.from });
 
+	/** The members that have not retired. */
+	const active = () => [...members.values()].filter((member) => !retired.has(member.name));
+
 	const known = (name: string) => {
-		if (name !== MAIN && !members.has(name)) throw new Error(`Unknown member: ${name}. Members: ${[MAIN, ...members.keys()].join(", ")}`);
+		if (name !== MAIN && !members.has(name)) throw new Error(`Unknown member: ${name}. Members: ${[MAIN, ...active().map((member) => member.name)].join(", ")}`);
+		return name;
+	};
+	/** A member a message can name: known and not retired. */
+	const recipient = (name: string) => {
+		if (retired.has(known(name))) throw new Error(`${name} is retired`);
 		return name;
 	};
 
@@ -155,7 +169,7 @@ export function createTeam(pi: ExtensionAPI, host: TeamHost) {
 		[
 			"Members:",
 			`- ${MAIN}: ${state(MAIN)}`,
-			...[...members.values()].map((member) => `- ${member.name}: ${state(member.name)} — ${member.description}`),
+			...active().map((member) => `- ${member.name}: ${state(member.name)} — ${member.description}`),
 			`Topic: ${topic || "(none)"}`,
 		].join("\n");
 
@@ -211,11 +225,21 @@ export function createTeam(pi: ExtensionAPI, host: TeamHost) {
 		host.wake(name, message.from);
 	};
 
+	/** The direct messages to member `name` after its last inbox pull. */
+	const unread = (name: string) => messages.filter((message) => message.to !== BOARD && message.to.includes(name) && message.seq > (pulled.get(name) ?? 0));
+
 	type Block = "hop" | "abort";
+	/** `<recipient>#<seq>` of each stuck message the main agent was told about; route and afterRun can both find one. */
+	const toldMain = new Set<string>();
+	// A message stuck in an inbox calls for the main agent's decision, so it arrives like a team message, once.
 	const tellMain = (message: MessageRecord, name: string, block: Block) => {
+		const key = `${name}#${message.seq}`;
+		if (toldMain.has(key)) return;
+		toldMain.add(key);
 		const why = block === "hop" ? `${name} is stopped, and ${message.from}'s run cannot wake it` : `you stopped ${name} with abort, so ${message.from}'s message cannot wake it`;
-		host.notice(
+		host.notify(
 			TEAM_NOTICE,
+			BOARD,
 			`[team] #${message.seq} ${message.from} → ${name} is waiting in ${name}'s inbox: ${why}. A direct message from you would wake ${name}, if and when you think it should run.`,
 			{ team: teamId },
 		);
@@ -270,25 +294,27 @@ export function createTeam(pi: ExtensionAPI, host: TeamHost) {
 		if (to) {
 			if (!to.length) throw new Error("to names at least one recipient");
 			for (const [i, name] of to.entries()) {
-				if (known(name) === from) throw new Error("you cannot send a message to yourself");
+				if (recipient(name) === from) throw new Error("you cannot send a message to yourself");
 				if (to.indexOf(name) !== i) throw new Error(`to names ${name} twice`);
 			}
 			if (params.mentions?.length) throw new Error("mentions apply to board posts; a direct message notifies its recipients");
 			notify = [...to];
 		} else {
-			notify = (params.mentions ?? []).filter((name) => name !== "all").map(known);
+			notify = (params.mentions ?? []).filter((name) => name !== "all").map(recipient);
 			if (params.mentions?.includes("all")) {
 				if (from !== MAIN) throw new Error("only the main agent can mention all");
-				notify = [...members.keys()];
+				notify = active().map((member) => member.name);
 			}
 		}
 		if (params.replyTo !== undefined) {
 			const target = messages.find((message) => message.seq === params.replyTo);
 			const sameScope = target && visibleTo(target, from) && (target.to === BOARD) === !to;
 			if (!sameScope) throw new Error(`#${params.replyTo} is not a ${to ? "direct message" : "board post"} that you can see`);
-			notify.push(target.from);
-			// A direct reply also goes to the author of the message it answers, so `to` holds every recipient.
-			if (to && target.from !== from && !to.includes(target.from)) to = [...to, target.from];
+			// A direct reply also goes to the author of the message it answers, so `to` holds every recipient; a retired author gets neither.
+			if (!retired.has(target.from)) {
+				notify.push(target.from);
+				if (to && target.from !== from && !to.includes(target.from)) to = [...to, target.from];
+			}
 		}
 		notify = [...new Set(notify)].filter((name) => name !== from);
 		const message: MessageRecord = {
@@ -424,9 +450,11 @@ export function createTeam(pi: ExtensionAPI, host: TeamHost) {
 						messages.push(record);
 						if (joiner && record.from === MAIN && record.to === BOARD && String(record.body).startsWith(`joined: ${joiner} — `)) joined.set(joiner, record.seq);
 					} else if (record?.t === "topic" && typeof record.body === "string") topic = record.body;
+					else if (record?.t === "retire" && typeof record.name === "string") retired.add(record.name);
 					else if (record?.t === "team" && typeof record.id === "string") teamId ||= record.id;
 					else if (ctx.hasUI) ctx.ui.notify(`team.jsonl line ${i + 1} is not a team record; skipped`, "warning");
 				});
+			for (const name of members.keys()) pulled.set(name, lastSeq());
 			// A log without an id gets one, which every later load reads.
 			if (!teamId) {
 				teamId = randomUUID();
@@ -467,6 +495,7 @@ export function createTeam(pi: ExtensionAPI, host: TeamHost) {
 		hire(name: string, description: string, cwd: string, args: string[]) {
 			if (!NAME.test(name)) throw new Error(`name must match ${NAME.source}`);
 			if (RESERVED.has(name)) throw new Error(`${name} is reserved`);
+			if (retired.has(name)) throw new Error(`${name} is retired; a retired member's name is not reused`);
 			if (members.has(name)) throw new Error(`${name} is already a member; send it a direct message with team send`);
 			const role = description.trim();
 			if (!role) throw new Error("run requires description: the member's lasting role, in one line");
@@ -480,6 +509,18 @@ export function createTeam(pi: ExtensionAPI, host: TeamHost) {
 			joined.set(name, post.seq);
 			return details(post);
 		},
+
+		/** Whether the main agent retired member `name`. */
+		isRetired: (name: string) => retired.has(name),
+
+		/** Retires member `name`: it leaves the roster, messages cannot name it, and nothing wakes it again; throws when the log write fails. */
+		retire(name: string) {
+			append({ t: "retire", name });
+			retired.add(name);
+		},
+
+		/** The seqs of the direct messages to member `name` after its last inbox pull. */
+		unread: (name: string) => unread(name).map((message) => message.seq),
 
 		/** Records new launch args for member `name`, such as another model; throws when the log write fails. */
 		relaunch(name: string, args: string[]) {
@@ -508,14 +549,16 @@ export function createTeam(pi: ExtensionAPI, host: TeamHost) {
 		 * one from a sender that can wake it starts its next run; the others wait, and their senders and the main agent are told.
 		 */
 		afterRun(name: string) {
-			const unread = messages.filter((message) => message.to !== BOARD && message.to.includes(name) && message.seq > (pulled.get(name) ?? 0));
-			if (!unread.length) return;
+			// The main agent learned of a retired member's unread messages from its retirement.
+			if (retired.has(name)) return;
+			const left = unread(name);
+			if (!left.length) return;
 			// A member the main agent aborted stays stopped; only the main agent hears about its unread messages.
 			const locked = host.locked(name);
 			// The waking message and those before it never wake the member again; their senders learn the outcome from its result.
-			const waker = locked ? undefined : unread.find((message) => !message.hop1 && message.seq > (wokeBy.get(name) ?? 0));
+			const waker = locked ? undefined : left.find((message) => !message.hop1 && message.seq > (wokeBy.get(name) ?? 0));
 			if (waker) return wake(name, waker);
-			for (const message of unread) {
+			for (const message of left) {
 				if (message.from === MAIN || !(locked || message.hop1)) continue;
 				tellMain(message, name, locked ? "abort" : "hop");
 				if (locked || !host.isRunning(message.from)) continue;

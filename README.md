@@ -20,13 +20,14 @@ To try it for one run: `pi -e /path/to/pi-subagent-rpc-extension`. Subagents do 
 |---|---|---|
 | `run` | `name`, `description`, `message`, `model`, `cwd`, `args`, `waitMs` | Hires a member named `name`, announces it on the board, and starts it on `message`. |
 | `status` | `id`, `waitMs` | Reports progress or the result. Without `id`, lists every member. |
-| `abort` | `id` | Stops the current run or compaction and cancels a queued compaction. A run that Pi has not started yet, or that does not stop within 10 seconds, is killed; a wake still waiting for the previous process never starts. The member then wakes only for a direct message from the main agent. |
+| `abort` | `id`, `retire` | Stops the member's run or compaction, if any, and cancels a queued compaction. A run that Pi has not started yet, or that does not stop within 10 seconds, is killed; a wake still waiting for the previous process never starts. The member then wakes only for a direct message from the main agent. With `retire: true`, the member, running or stopped, also leaves the team. |
 | `compact` | `id`, `instructions`, `message`, `waitMs` | Compacts the member's context with Pi's compaction; see [Compaction](#compaction). |
 | `switch` | `id`, `model`, `thinking`, `message`, `waitMs` | Moves the member to another model or thinking level from its next run; see [Switching models](#switching-models). |
 
-- `name`: required, and the member's id. Names are 2 to 24 lowercase letters, digits, or hyphens, start with a letter, and do not end with a hyphen. `main`, `all`, and `team` are reserved, and a name is used once per team: `run` on an existing member fails, and a direct message gives it more work.
+- `name`: required, and the member's id. Names are 2 to 24 lowercase letters, digits, or hyphens, start with a letter, and do not end with a hyphen. `main`, `all`, and `team` are reserved, and a name is used once per team: `run` on an existing or retired member fails, and a direct message gives an existing member more work.
 - `description`: required, the member's lasting role rather than its current task, in one line of at most 100 characters, such as `runs the e2e suite and reports failures`. The team roster shows it, and hiring posts `joined: <name> — <description>` to the board from `main`.
-- `message`: the task. A member starts with an empty conversation, so `message` carries the context it needs. For `compact`, the task the member runs once compacted; for `switch`, the task a stopped member runs at once.
+- `message`: the task. A member starts with an empty conversation, so `message` carries the context it needs. For `compact`, the task the member runs once compacted; for `switch`, the task a stopped member runs at once. A fresh member with a self-contained `message` suits a different domain or a new task; a stopped member compacted with instructions that keep what helps, then given the task, suits continuing its work or similar work that its earlier context helps with.
+- `retire`: required for `abort`. `true` retires the member, running or stopped: it leaves the team for good. The roster, `members`, `status` without `id`, and the background footer leave it out, `all` does not cover it, and nothing wakes it again. A direct message or mention naming it fails with `tester is retired`, as do `compact` and `switch`, and a reply to its message does not notify it. `status` with its `id` still shows its last result, and its session, `final.md`, and team log records stay. The result lists the direct messages that reached it after its last read in this session, or after the session was reopened: `tester is retired: it left the team; its session and final.md stay. tester had 2 unread messages: #41, #45.` `false` only stops the member.
 - `instructions`: for `compact`, Pi's custom instructions for the summary, saying what it keeps; up to 4000 characters.
 - `model`: a Pi model pattern, `provider/id[:thinking]`. Default: the parent's current model and thinking level. For `switch`, the member's new model.
 - `thinking`: for `switch`, a Pi thinking level: `off`, `minimal`, `low`, `medium`, `high`, `xhigh`, or `max`.
@@ -41,6 +42,8 @@ To try it for one run: `pi -e /path/to/pi-subagent-rpc-extension`. Subagents do 
 [running] subagent reviewer · openai/gpt-5 · turn 4 · bash (npm test -- --reporter dot) 2m10s · last event 3s ago · 5m02s · 48.2K in · 3.1K out · 1.2M cached · $0.42
 [t3] Running the full test suite now.
 ```
+
+To wait longer, the main agent calls `status` again: each wait of at most 4 minutes ends within the 5-minute lifetime of Anthropic's prompt cache, which keeps the cache warm. Or it ends its turn: each result and message for it starts its next turn, as described below.
 
 Once a run ends, its status line names the model with its thinking level, such as `openai/gpt-5:high`. The status line of a progress report shows each running tool with its main argument, such as its command, path, code, or query, in one line cut to about 60 characters. The status line of a progress report or result ends with the run's token usage, summed over its model replies: input tokens, cache writes included; output tokens; cache reads, when there are any; and the cost, when the model has a price.
 
@@ -70,7 +73,7 @@ Results about one member end with the other members still running, up to three:
 (Background: reviewer running 4m10s · ctx 212K/300K 71%, tester compacting 12s, coder running 12m00s · no event 9m00s.)
 ```
 
-`no event` appears after a minute without activity; `compacting` marks a member in a [compaction](#compaction) run. A progress report or footer entry with no active tool and an old last event points to a stalled member.
+`no event` appears after a minute without activity; `compacting` marks a member in a [compaction](#compaction) run. Retired members never appear there. A progress report or footer entry with no active tool and an old last event points to a stalled member.
 
 Progress reports and results also show a `Notices:` line with the last three `ctx.ui.notify` texts that the member's extensions sent after the run started, such as the reason an extension stopped it.
 
@@ -113,7 +116,7 @@ The main agent (`main`) and every member have it.
 | `send` | `body`, `to`, `mentions`, `replyTo` | Posts to the board (no `to`) or sends one direct message to `to`, a member name, `main`, or a list of them. Returns `#seq` and what happened for each recipient. |
 | `history` | `with`, `query`, `before`, `limit` | Reads the board, or the caller's direct messages with `with`; for the main agent, every direct message of the member named in `with`. `query` matches text case-insensitively. Oldest first, at most `limit` messages (default 20, maximum 50) and 16000 characters; `before=<seq>` pages back. |
 | `wait` | `ms` | Returns once a message for the caller is pending, or after `ms` (default 30000, maximum 240000). The messages follow the tool result. |
-| `members` | | Members with their states (`running`, `compacting`, `stopped`, `stopped (error)`, or `stopped (aborted)`) and roles, such as `- tester: running — runs the e2e suite and reports failures`, and the topic. |
+| `members` | | Members with their states (`running`, `compacting`, `stopped`, `stopped (error)`, or `stopped (aborted)`) and roles, such as `- tester: running — runs the e2e suite and reports failures`, and the topic. Retired members are left out, here and in a member's preamble. |
 | `topic` | `body` | Sets the topic (main agent only). |
 
 `body` holds up to 4000 characters and `topic` up to 2000. Larger content belongs in files in the shared working tree, with the path in the message.
@@ -149,7 +152,7 @@ A direct message to a stopped member wakes it: the member runs again in its own 
 | Stopped, direct message from a member after the main agent aborted the recipient | Not woken: only the main agent's direct message wakes it. |
 | Stopped, board post | Not woken. |
 
-A direct message that cannot wake its recipient waits in the recipient's inbox, and the main agent gets a one-line `team-notice` that never starts a turn: an idle main agent sees it at once, a busy one at its next turn boundary. A direct message that arrives after a member's last read of its run is routed the same way once the run ends; its sender, if still running, then also gets a notice.
+A direct message that cannot wake its recipient waits in the recipient's inbox, and the main agent gets a one-line `team-notice` about it, delivered like a team message: it starts a turn of an idle main agent and reaches a busy one at its next turn boundary. A direct message that arrives after a member's last read of its run is routed the same way once the run ends; its sender, if still running, then also gets a notice.
 
 The final reply of a run woken by member X goes to X as a direct message holding the reply, cut to fit, and the path of `final.md`. When X has stopped, the reply goes to the main agent as a `subagent-result` marked `woken by X; X had stopped`. Every other run's result goes to the main agent.
 
