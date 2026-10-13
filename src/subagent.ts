@@ -121,6 +121,10 @@ interface Agent {
 	locked: boolean;
 	/** Identifies a launch that waits for the previous run's process to exit; null once it started or was cancelled. */
 	launching: object | null;
+	/** The launch args of the current or last run; a switch changes `launchArgs` for the next one. */
+	runArgs: string[];
+	/** A switch with when: now is stopping the run to start the next one, so the member counts as running throughout. */
+	restarting: boolean;
 	waiters: Set<() => void>;
 	run?: Run;
 }
@@ -205,6 +209,9 @@ function modelChoice(launchArgs: string[]) {
 	return { session: launchArgs.slice(0, SESSION_ARGS), args: launchArgs.slice(end), model: model.model, thinking: thinking ?? model.thinking };
 }
 
+/** `provider/id:level`, as a status header shows a model. */
+const modelLabel = (choice: { model?: string; thinking?: string }) => `${choice.model ?? "its session's model"}${choice.thinking ? `:${choice.thinking}` : ""}`;
+
 /** Whether Pi options `args` keep `tool` from loading or being active in a child. */
 function removesTool(args: string[], tool: string) {
 	const values = (names: string[]) =>
@@ -273,7 +280,16 @@ export default function setupParent(pi: ExtensionAPI) {
 		return ` · ${oneLine(agent.error, ERROR_CHARS)}${retried}`;
 	};
 
-	const header = (agent: Agent) => {
+	/** ` · next run: <model>` while a busy member's next run uses other settings than its current one. */
+	const nextRun = (agent: Agent) => {
+		if (!busy(agent) && !agent.queued) return "";
+		const next = modelLabel(modelChoice(agent.launchArgs));
+		return next === modelLabel(modelChoice(agent.runArgs)) ? "" : ` · next run: ${next}`;
+	};
+
+	const header = (agent: Agent) => statusLine(agent) + nextRun(agent);
+
+	const statusLine = (agent: Agent) => {
 		const now = Date.now();
 		const id = `subagent ${agent.id}${agent.model ? ` · ${agent.model}${agent.thinking ? `:${agent.thinking}` : ""}` : ""}`;
 		const context = ctxText(agent);
@@ -451,10 +467,11 @@ export default function setupParent(pi: ExtensionAPI) {
 		});
 
 	const team = createTeam(pi, {
-		isRunning: (name) => agents.get(name)?.status === "running",
+		isRunning: (name) => agents.get(name)?.status === "running" || Boolean(agents.get(name)?.restarting),
 		state: (name) => {
 			const agent = agents.get(name);
 			const status = agent?.status;
+			if (agent?.restarting) return "running";
 			if (status === "running" || status === "compacting") return status;
 			// From the end of the run until its process exits and the queued compaction starts, so no message wakes the member in between.
 			if (agent?.queued) return "compacting";
@@ -676,6 +693,7 @@ export default function setupParent(pi: ExtensionAPI) {
 		agent.tools.clear();
 		// A switch from here on is for the next run.
 		const args = agent.launchArgs;
+		agent.runArgs = args;
 		const launching = {};
 		agent.launching = launching;
 		const start = () => {
@@ -698,7 +716,8 @@ export default function setupParent(pi: ExtensionAPI) {
 			// A queued compaction comes first; the direct messages the run left unread are routed once it is over.
 			void run.exited.then(() => {
 				if (agent.run === run) agent.run = undefined;
-				if (busy(agent) || shuttingDown) return;
+				// A restart launches the next run itself, which reads the messages this run left unread.
+				if (busy(agent) || agent.restarting || shuttingDown) return;
 				const queued = agent.queued;
 				agent.queued = null;
 				if (queued) compact(agent, queued);
@@ -713,6 +732,23 @@ export default function setupParent(pi: ExtensionAPI) {
 	const compact = (agent: Agent, { instructions, message }: Compaction) => {
 		launch(agent, { type: "compact", ...(instructions ? { customInstructions: instructions } : {}) }, MAIN);
 		agent.next = message;
+	};
+
+	/** Stops the member's run or compaction, if any, and cancels a queued compaction; the caller returns the stopped run's state. */
+	const halt = async (agent: Agent, signal?: AbortSignal) => {
+		// Held so the stopped run's result is not also delivered.
+		const hold = () => {};
+		agent.waiters.add(hold);
+		try {
+			agent.queued = null;
+			if (agent.launching) {
+				// A wake still waiting for the previous process to exit: it never starts.
+				agent.launching = null;
+				onEnd(agent, "aborted", null, "main");
+			} else await agent.run?.stop(signal);
+		} finally {
+			agent.waiters.delete(hold);
+		}
 	};
 
 	const register = (id: string, cwd: string, dir: string, launchArgs: string[], status: Status) => {
@@ -747,6 +783,8 @@ export default function setupParent(pi: ExtensionAPI) {
 			woken: "",
 			locked: false,
 			launching: null,
+			runArgs: launchArgs,
+			restarting: false,
 			waiters: new Set(),
 		};
 		agents.set(id, agent);
@@ -777,7 +815,7 @@ export default function setupParent(pi: ExtensionAPI) {
 		message: Type.Optional(
 			Type.String({
 				description:
-					"run: the task. compact: a task the member runs once compacted, as if you sent it. switch: a task a stopped member runs at once, as if you sent it.",
+					"run: the task. compact: a task the member runs once compacted, as if you sent it. switch: a task the member runs at once on the new settings, as if you sent it; for a busy member, with when: now.",
 			}),
 		),
 		instructions: Type.Optional(Type.String({ description: `compact: what the summary must keep, up to ${BODY_CHARS} characters.` })),
@@ -793,6 +831,12 @@ export default function setupParent(pi: ExtensionAPI) {
 			Type.String({ description: "run: Pi model pattern, provider/id[:thinking]. Default: your current model and thinking level. switch: the member's new model, in the same form." }),
 		),
 		thinking: Type.Optional(Type.String({ description: "switch: a Pi thinking level: off, minimal, low, medium, high, xhigh, or max." })),
+		when: Type.Optional(
+			StringEnum(["now", "next"] as const, {
+				description:
+					"switch (required while the member runs, compacts, or has a compaction queued): now stops that as abort does and runs the member on message with the new settings at once, and needs message; next applies the settings from its next run. A stopped member ignores it.",
+			}),
+		),
 		retire: Type.Optional(
 			Type.Boolean({
 				description: "abort (required): true also retires the member: it leaves the team for good, and its name is not reused. false only stops it.",
@@ -818,6 +862,7 @@ export default function setupParent(pi: ExtensionAPI) {
 		model?: string;
 		thinking?: string;
 		retire?: boolean;
+		when?: "now" | "next";
 		cwd?: string;
 		args?: string[];
 		waitMs?: number;
@@ -831,7 +876,7 @@ export default function setupParent(pi: ExtensionAPI) {
 			"run hires a named team member, announces it on the board, and starts it on message; its name is its id, and its description is the role the team roster shows. status reports progress or the result (without id: lists subagents). abort stops a member's run or compaction, if any, and cancels a queued compaction; a member you aborted wakes only for your direct message. retire (required with abort): true also removes the member from the team, whether it runs or not; retire members you will not use again. A retired member's name is not reused, and status with its id still shows its last result.",
 			"Two ways to give work: a fresh member with a self-contained message suits a different domain or a new task; a stopped member, compacted with instructions that keep what helps and then messaged, suits continuing its work, or similar work its earlier context helps with.",
 			"compact compacts a member's context; instructions say what the summary keeps. Pi compacts a running member by itself at its compact point, a Pi setting; status lines show ctx: the member's context tokens against that point. Compact a member yourself when it is past about 60% of its compact point and is about to take a new or unrelated task, or holds much that the next task does not need. A stopped member compacts at once, a running one after its current run. With message, the member then runs on message as if you sent it; without, a result you did not wait for arrives without starting a turn.",
-			"switch moves a member to another model or thinking level for its next runs; it keeps its name, session, and context. A new model starts without the prompt cache, so its next request pays full input price for the whole context; compact first when the context is large. With message, a stopped member runs on it at once.",
+			"switch moves a member to another model or thinking level; it keeps its name, session, and context. A stopped member uses the new settings from its next run, and with message runs on them at once. A busy member needs when: next leaves its current run or compaction on the old settings, and its status shows `next run:` until then; now, with message, stops it as abort does and runs it on message with the new settings in the same call. A new model starts without the prompt cache, so its next request pays full input price for the whole context; compact first when the context is large.",
 			`run, status, compact, and switch with message wait up to waitMs (default ${DEFAULT_WAIT_MS}, max ${MAX_WAIT_MS}) and return the result if it finishes in time, otherwise its progress while it keeps running. To wait longer, call status again; each wait of up to ${MAX_WAIT_MS / 60_000} minutes keeps the prompt cache warm. Or end your turn: every result and message for you starts your next turn, and notices that start none arrive with it.`,
 			"Members talk with you and each other through the team tool. A member starts with an empty conversation, so put the context it needs in message. A direct team message to a stopped member wakes it in its own session. A run woken by a member's message sends its final reply to that member, or to you when that member has stopped.",
 			"args are Pi command-line options: read docs/cli.md in the Pi documentation listed in your system prompt, or run `pi --help`. Session, mode, model, provider, and thinking flags are set by this tool.",
@@ -880,52 +925,66 @@ export default function setupParent(pi: ExtensionAPI) {
 				const pattern = params.model?.trim() || undefined;
 				const level = params.thinking?.trim() || undefined;
 				if (!pattern && !level) throw new Error("switch requires model or thinking");
+				const occupied = busy(agent) || Boolean(agent.queued);
+				const state = agent.status === "running" ? "running" : "compacting";
+				if (occupied && !params.when) throw new Error(`${agent.id} is ${state}: switch requires when: now or next`);
+				const now = occupied && params.when === "now";
+				if (now && !params.message) throw new Error("switch with when: now requires message, the task the member runs on the new settings");
 				// A run on message would replace the current run, or drop a queued compaction.
-				if (params.message && (busy(agent) || agent.queued)) {
-					throw new Error(
-						agent.status === "running"
-							? `${agent.id} is running; abort it first, or switch now and message it after it stops`
-							: `${agent.id} is compacting; abort it first, or switch now and message it after the compaction`,
-					);
-				}
-				const was = modelChoice(agent.launchArgs);
+				if (occupied && !now && params.message) throw new Error(`${agent.id} is ${state}; with message, switch requires when: now, which stops it first`);
+				const configured = modelChoice(agent.launchArgs);
+				const ran = modelChoice(agent.runArgs);
 				const asked = pattern ? withLevel(pattern) : undefined;
-				const model = asked?.model ?? was.model;
-				const thinking = level ?? asked?.thinking ?? was.thinking;
-				const launchArgs = [...was.session, ...(model ? ["--model", model] : []), ...(thinking ? ["--thinking", thinking] : []), ...was.args];
+				const model = asked?.model ?? configured.model;
+				const thinking = level ?? asked?.thinking ?? configured.thinking;
+				const target = modelLabel({ model, thinking });
+				// Restarting a run on the settings it already uses gains nothing.
+				if (target === modelLabel(configured) && (!now || target === modelLabel(ran))) {
+					if (params.message) throw new Error(`${agent.id} is already set to ${target}; send it your message with team send`);
+					return { content: [{ type: "text", text: `${agent.id} is already set to ${target}.` }], details: undefined };
+				}
+				const launchArgs = [...configured.session, ...(model ? ["--model", model] : []), ...(thinking ? ["--thinking", thinking] : []), ...configured.args];
 				team.relaunch(agent.id, launchArgs);
 				agent.launchArgs = launchArgs;
-				const label = (choice: { model?: string; thinking?: string }) => `${choice.model ?? "its session's model"}${choice.thinking ? `:${choice.thinking}` : ""}`;
+				// The prompt cache belongs to the model of the current or last run.
 				const cache =
-					model !== was.model && agent.contextTokens !== undefined
+					model !== ran.model && agent.contextTokens !== undefined
 						? ` ctx ${tokens.format(agent.contextTokens)} — its next request pays full input price for that context.`
 						: "";
-				const line = `${agent.id} now runs on ${label({ model, thinking })} from its next run (was ${label(was)}).${cache}`;
-				if (!params.message) return { content: [{ type: "text", text: line }], details: undefined };
+				/** What the member runs or last ran on, as its status header shows it. */
+				const was = () => modelLabel({ model: agent.model || ran.model, thinking: agent.thinking || ran.thinking });
+				if (!params.message) return { content: [{ type: "text", text: `${agent.id} now runs on ${target} from its next run (was ${was()}).${cache}` }], details: undefined };
+				let stopped = "";
+				if (now) {
+					// Locked as by abort, in case the call is cancelled; counted as running until the next run launches,
+					// so no message meanwhile wakes the member or reaches the main agent as stuck.
+					agent.locked = true;
+					agent.restarting = true;
+					try {
+						await halt(agent, signal);
+					} finally {
+						agent.restarting = false;
+					}
+					if (signal?.aborted) {
+						// The user stopped the main agent, so no new work starts: the member ends as aborted. Its exit, if over, skipped routing its unread messages.
+						if (!agent.run) team.afterRun(agent.id);
+						return result(agent, undefined, `${agent.id} now runs on ${target} from its next run (was ${was()}).${cache} The call was cancelled, so it stopped without running on message.\n\n`);
+					}
+					stopped = `${consume(agent).text}\n\n`;
+				}
+				const line = `${agent.id} now runs on ${target} (was ${was()}).${cache}\n\n`;
 				// As the main agent's task, the run unlocks the member.
 				agent.locked = false;
 				launch(agent, { type: "prompt", message: params.message }, MAIN);
 				await waitFor(agent, waitMs, signal, true);
-				return result(agent, undefined, `${line}\n\n`);
+				return result(agent, undefined, line + stopped);
 			}
 			if (typeof params.retire !== "boolean") throw new Error("abort requires retire: true or false");
 			// Retired before its run stops, so nothing wakes the member in between.
 			if (params.retire) team.retire(agent.id);
-			// This call returns the final state, so hold a waiter to keep it from also being delivered.
-			const hold = () => {};
-			agent.waiters.add(hold);
-			try {
-				// A queued compaction holds messages until its run's process exits, which then routes them.
-				if (busy(agent) || agent.queued) agent.locked = true;
-				agent.queued = null;
-				if (agent.launching) {
-					// A wake still waiting for the previous process to exit: it never starts.
-					agent.launching = null;
-					onEnd(agent, "aborted", null, "main");
-				} else await agent.run?.stop(signal);
-			} finally {
-				agent.waiters.delete(hold);
-			}
+			// A queued compaction holds messages until its run's process exits, which then routes them.
+			if (busy(agent) || agent.queued) agent.locked = true;
+			await halt(agent, signal);
 			if (!params.retire) return result(agent);
 			const unread = team.unread(agent.id);
 			const left = unread.length ? ` ${agent.id} had ${unread.length} unread message${unread.length === 1 ? "" : "s"}: ${unread.map((seq) => `#${seq}`).join(", ")}.` : "";

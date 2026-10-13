@@ -1306,21 +1306,29 @@ await step("switch moves a stopped member to another model in the same session; 
 	const r = await team.call({ action: "switch", id: "swapper", model: "fake/fake-keep", message: "SAY swap two" });
 	assert.match(
 		r.text,
-		/^swapper now runs on fake\/fake-keep:off from its next run \(was fake\/fake-model:off\)\. ctx 1\.7K — its next request pays full input price for that context\.\n\n\[settled\] subagent swapper · fake\/fake-keep:off · 1 turns · [^\n]*\n\nswap two/,
+		/^swapper now runs on fake\/fake-keep:off \(was fake\/fake-model:off\)\. ctx 1\.7K — its next request pays full input price for that context\.\n\n\[settled\] subagent swapper · fake\/fake-keep:off · 1 turns · [^\n]*\n\nswap two/,
 	);
 	const last = requestsBy("swapper").at(-1);
 	assert.equal(last.model, "fake-keep");
 	assert.ok(last.messages.some((m) => m.role === "user" && rawText(m).startsWith("SAY swap one")), "the session history is missing");
 });
 
-await step("switch on a running member keeps its run on the old model and applies to its next run; with message, it fails", async () => {
+await step("switch on a running member requires when; next keeps its run on the old model, shows the next run's model, and applies to its next run", async () => {
 	const mark = team.events.length;
 	await run({ name: "runswap", message: "SLOW 5000 SAY runswap first", waitMs: 0 });
-	const refused = await team.call({ action: "switch", id: "runswap", model: "fake/fake-keep", message: "SAY too soon" });
-	assert.ok(refused.isError, refused.text);
-	assert.match(refused.text, /runswap is running; abort it first, or switch now and message it after it stops/);
-	const switched = await team.call({ action: "switch", id: "runswap", model: "fake/fake-keep" });
+	for (const [args, error] of [
+		[{ model: "fake/fake-keep" }, /runswap is running: switch requires when: now or next/],
+		[{ model: "fake/fake-keep", when: "now" }, /switch with when: now requires message/],
+		[{ model: "fake/fake-keep", when: "next", message: "SAY too soon" }, /runswap is running; with message, switch requires when: now/],
+	]) {
+		const refused = await team.call({ action: "switch", id: "runswap", ...args });
+		assert.ok(refused.isError, refused.text);
+		assert.match(refused.text, error);
+	}
+	const switched = await team.call({ action: "switch", id: "runswap", model: "fake/fake-keep", when: "next" });
 	assert.equal(switched.text, "runswap now runs on fake/fake-keep:off from its next run (was fake/fake-model:off).");
+	assert.match((await team.call({ action: "status", id: "runswap", waitMs: 0 })).text, /^\[running\] subagent runswap [^\n]* · next run: fake\/fake-keep:off\n/);
+	assert.equal((await team.call({ action: "switch", id: "runswap", model: "fake/fake-keep", when: "next" })).text, "runswap is already set to fake/fake-keep:off.");
 	assert.match(await report("runswap", mark), /^\[settled\] subagent runswap · fake\/fake-model:off · [^\n]*\n\nrunswap first/);
 	assert.equal(requestFor("SLOW 5000 SAY runswap first").model, "fake-model");
 	const woken = team.events.length;
@@ -1334,7 +1342,7 @@ await step("a wake that waits for the previous run's process to exit keeps the m
 	// The run's process is still exiting, so the wake waits for it.
 	const mark = team.events.length;
 	assert.match((await teamCall({ action: "send", to: "lateswap", body: "SAY late two" })).text, /\(woken\)\.$/);
-	assert.match((await team.call({ action: "switch", id: "lateswap", model: "fake/fake-keep" })).text, /^lateswap now runs on fake\/fake-keep:off from its next run/);
+	assert.match((await team.call({ action: "switch", id: "lateswap", model: "fake/fake-keep", when: "next" })).text, /^lateswap now runs on fake\/fake-keep:off from its next run/);
 	assert.match(await report("lateswap", mark), /^\[settled\] subagent lateswap · fake\/fake-model:off · [^\n]*\n\nlate two/);
 	assert.equal(requestsBy("lateswap").at(-1).model, "fake-model");
 });
@@ -1355,6 +1363,58 @@ await step("a thinking switch keeps the member's model for its next runs, and th
 	assert.deepEqual(thinker.at(-1).args.slice(4), ["--model", "fake/fake-think", "--thinking", "high"]);
 	const refused = await team.call({ action: "switch", id: "thinker" });
 	assert.ok(refused.isError && /switch requires model or thinking/.test(refused.text), refused.text);
+	assert.equal((await team.call({ action: "switch", id: "thinker", thinking: "high" })).text, "thinker is already set to fake/fake-think:high.");
+});
+
+const stall = join(WORK_DIR, "stall-extension.ts");
+// Holds every tool call for 15 seconds, deaf to an abort, so stopping the run takes the 10-second kill.
+fs.writeFileSync(stall, 'export default function (pi) { pi.on("tool_call", () => new Promise((done) => setTimeout(done, 15000))); }\n');
+
+await step("switch now stops a running member and runs it on message with the new settings in one call; a member's direct message during the stop reaches the new run", async () => {
+	await run({ name: "hotswap", args: ["-e", stall], message: "BASH echo stalled", waitMs: 0 });
+	await until(() => requestsBy("hotswap").length > 0);
+	// A switch from its next run first: the result's `was` names the model the run actually uses.
+	await team.call({ action: "switch", id: "hotswap", model: "fake/fake-keep", when: "next" });
+	const from = team.events.length;
+	// poker sends while the switch call waits for the stalled run to be killed.
+	await run({ name: "poker", message: `SLOW 4000 ${TEAM({ action: "send", to: "hotswap", body: "poked" })}`, waitMs: 0 });
+	const r = await team.call({ action: "switch", id: "hotswap", model: "fake/fake-think:high", when: "now", message: "SAY hot", waitMs: 0 });
+	assert.match(r.text, /^hotswap now runs on fake\/fake-think:high \(was fake\/fake-model:off\)\.[^\n]*\n\n\[aborted\] subagent hotswap [^\n]* · by main\n\n\[running\] subagent hotswap /);
+	await finished("poker");
+	assert.match(rawText(requestsBy("poker").at(-1).messages.findLast((m) => m.role === "tool")), /^Sent #\d+ to hotswap \(running\)\.$/);
+	assert.match(await report("hotswap", from), /^\[settled\] subagent hotswap · fake\/fake-think:high · [^\n]*\n\nhot$/);
+	await sleep(1000);
+	const last = requestsBy("hotswap").at(-1);
+	assert.equal(last.model, "fake-think");
+	assert.equal(last.messages.filter((m) => rawText(m).includes("poker → you (direct):\npoked\n")).length, 1, "the new run did not read the message once");
+	const about = team.messages(from).filter((m) => m.content.includes("hotswap"));
+	assert.ok(!about.some((m) => m.customType === "team-notice" || m.customType === "subagent-notice"), about.map((m) => m.content).join("\n"));
+	// One run after the stop, with one request, and the stopped run's result only in the switch result.
+	assert.equal(requestsBy("hotswap").filter((body) => body.model !== "fake-model").length, 1, "hotswap ran more than once");
+	assert.ok(!about.some((m) => m.customType === "subagent-result" && /^\[aborted\]/.test(m.content)), "the stopped run's result was delivered again");
+});
+
+await step("Esc during switch now leaves the member aborted on the new settings without running it; a member's direct message does not wake it", async () => {
+	await run({ name: "escswap", args: ["-e", stall], message: "BASH echo stalled", waitMs: 0 });
+	await until(() => requestsBy("escswap").length > 0);
+	const from = team.events.length;
+	team.prompt(`CALL ${JSON.stringify({ action: "switch", id: "escswap", model: "fake/fake-think:high", when: "now", message: "SAY should not run", waitMs: 0 })}`);
+	await team.waitEvent((e) => e.type === "tool_execution_start" && e.toolName === "subagent", from);
+	await sleep(1000);
+	team.send({ type: "clear_queue" });
+	team.send({ type: "abort" });
+	const end = await team.waitEvent((e) => e.type === "tool_execution_end" && e.toolName === "subagent", from);
+	assert.match(
+		end.result.content[0].text,
+		/^escswap now runs on fake\/fake-think:high from its next run \(was fake\/fake-model:off\)\.[^\n]* The call was cancelled, so it stopped without running on message\.\n\n\[aborted\] subagent escswap [^\n]* · by main/,
+	);
+	await team.waitEvent((e) => e.type === "agent_settled", team.events.indexOf(end));
+	assert.match((await teamCall({ action: "members" })).text, /\n- escswap: stopped \(aborted\) — test member\n/);
+	const mark = team.events.length;
+	await run({ name: "escknock", message: TEAM({ action: "send", to: "escswap", body: "SAY woke" }) });
+	assert.match(await report("escknock", mark), /team: Sent #\d+ to escswap \(stopped, not woken: the main agent stopped it; the main agent was told\)\.$/);
+	await sleep(2000);
+	assert.ok(requestsBy("escswap").every((body) => body.model === "fake-model"), "escswap ran after the cancelled switch");
 });
 
 const FORK_NOTICE =
