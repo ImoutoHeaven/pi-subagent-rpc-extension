@@ -417,6 +417,7 @@ export function createTeam(pi: ExtensionAPI, host: TeamHost) {
 					const joiner = hired;
 					hired = undefined;
 					if (record?.t === "member" && typeof record.name === "string" && typeof record.description === "string" && Array.isArray(record.args)) {
+						// A member's later record, such as one a switch writes, replaces its earlier one.
 						members.set(record.name, record);
 						hired = record.name;
 					} else if (record?.t === "msg" && typeof record.seq === "number" && Array.isArray(record.notify) && (record.to === BOARD || Array.isArray(record.to))) {
@@ -478,6 +479,13 @@ export function createTeam(pi: ExtensionAPI, host: TeamHost) {
 			messages.push(post);
 			joined.set(name, post.seq);
 			return details(post);
+		},
+
+		/** Records new launch args for member `name`, such as another model; throws when the log write fails. */
+		relaunch(name: string, args: string[]) {
+			const member: MemberRecord = { ...(members.get(name) as MemberRecord), args };
+			append(member);
+			members.set(name, member);
 		},
 
 		/**

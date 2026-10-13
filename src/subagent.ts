@@ -32,7 +32,26 @@ const STALE_MS = 60_000;
 const IDLE_POLL_MS = 250;
 const MAIN = "main";
 // The extension owns the child's process mode, session, and model selection.
-const OWNED_FLAGS = ["--mode", "--print", "-p", "--no-session", "--session", "--session-id", "--session-dir", "--continue", "-c", "--resume", "-r", "--fork", "--export", "--model"];
+const OWNED_FLAGS = [
+	"--mode",
+	"--print",
+	"-p",
+	"--no-session",
+	"--session",
+	"--session-id",
+	"--session-dir",
+	"--continue",
+	"-c",
+	"--resume",
+	"-r",
+	"--fork",
+	"--export",
+	"--model",
+	"--provider",
+	"--thinking",
+];
+/** The launch args before a member's model options: --session-dir and --session-id with their values. */
+const SESSION_ARGS = 4;
 // Where a result for the main agent went.
 const SENT = "was sent to you as a subagent-result message";
 const RETURNED = "was returned to you earlier";
@@ -70,6 +89,8 @@ interface Agent {
 	usage: Usage;
 	/** provider/id the child actually answered with; Pi matches --model fuzzily. */
 	model: string;
+	/** The run's thinking level, as Pi's state reports it at the run's end; empty until then. */
+	thinking: string;
 	error: string | null;
 	/** The run's last model reply was an error. */
 	modelError: boolean;
@@ -162,6 +183,28 @@ const assistantText = (message: { content?: unknown }) =>
 				.trim()
 		: "";
 
+/** A Pi model pattern split into the model and its `:level` thinking suffix, if any. */
+const withLevel = (pattern?: string) => {
+	const suffix = pattern?.match(/^(.+):(off|minimal|low|medium|high|xhigh|max)$/);
+	return suffix ? { model: suffix[1], thinking: suffix[2] } : { model: pattern, thinking: undefined };
+};
+
+/**
+ * A member's launch args split at its model options, the `--model` and `--thinking` the extension writes after the session args;
+ * `--thinking` beats a `:level` suffix, as in Pi.
+ */
+function modelChoice(launchArgs: string[]) {
+	let pattern: string | undefined;
+	let thinking: string | undefined;
+	let end = SESSION_ARGS;
+	for (; launchArgs[end] === "--model" || launchArgs[end] === "--thinking"; end += 2) {
+		if (launchArgs[end] === "--model") pattern = launchArgs[end + 1];
+		else thinking = launchArgs[end + 1];
+	}
+	const model = withLevel(pattern);
+	return { session: launchArgs.slice(0, SESSION_ARGS), args: launchArgs.slice(end), model: model.model, thinking: thinking ?? model.thinking };
+}
+
 /** Whether Pi options `args` keep `tool` from loading or being active in a child. */
 function removesTool(args: string[], tool: string) {
 	const values = (names: string[]) =>
@@ -232,7 +275,7 @@ export default function setupParent(pi: ExtensionAPI) {
 
 	const header = (agent: Agent) => {
 		const now = Date.now();
-		const id = `subagent ${agent.id}${agent.model ? ` · ${agent.model}` : ""}`;
+		const id = `subagent ${agent.id}${agent.model ? ` · ${agent.model}${agent.thinking ? `:${agent.thinking}` : ""}` : ""}`;
 		const context = ctxText(agent);
 		const compaction = agent.compaction ? ` · ${agent.compaction}` : "";
 		if (agent.status === "stopped") return `[stopped] ${id}${context}`;
@@ -537,6 +580,7 @@ export default function setupParent(pi: ExtensionAPI) {
 				// get_state names the model, also for a compaction run, which has no model reply.
 				const model = event.data?.model;
 				if (typeof model?.provider === "string" && typeof model.id === "string") setModel(agent, model.provider, model.id);
+				if (typeof event.data?.thinkingLevel === "string") agent.thinking = event.data.thinkingLevel;
 				return;
 			}
 			case "extension_ui_request":
@@ -620,6 +664,7 @@ export default function setupParent(pi: ExtensionAPI) {
 			lastText: "",
 			usage: noUsage(),
 			model: "",
+			thinking: "",
 			error: null,
 			modelError: false,
 			retries: 0,
@@ -631,6 +676,8 @@ export default function setupParent(pi: ExtensionAPI) {
 			woken: "",
 		});
 		agent.tools.clear();
+		// A switch from here on is for the next run.
+		const args = agent.launchArgs;
 		const launching = {};
 		agent.launching = launching;
 		const start = () => {
@@ -640,7 +687,7 @@ export default function setupParent(pi: ExtensionAPI) {
 			if (shuttingDown) return void (agent.status = "stopped");
 			const run = startRun({
 				cwd: agent.cwd,
-				args: agent.launchArgs,
+				args,
 				launch: command,
 				owner: {
 					onEvent: (event) => onEvent(agent, event),
@@ -688,6 +735,7 @@ export default function setupParent(pi: ExtensionAPI) {
 			lastText: "",
 			usage: noUsage(),
 			model: "",
+			thinking: "",
 			error: null,
 			modelError: false,
 			retries: 0,
@@ -713,7 +761,7 @@ export default function setupParent(pi: ExtensionAPI) {
 		if (!existsSync(cwd) || !statSync(cwd).isDirectory()) throw new Error(`cwd is not a directory: ${cwd}`);
 		const args = params.args ?? [];
 		const owned = args.find((arg) => OWNED_FLAGS.some((flag) => arg === flag || arg.startsWith(`${flag}=`)));
-		if (owned) throw new Error(`args must not include ${owned}; the extension sets the mode, session, and model (use the model parameter)`);
+		if (owned) throw new Error(`args must not include ${owned}; the extension sets the mode, session, model, and thinking level (use the model parameter)`);
 		const model = params.model ?? (ctx.model ? `${ctx.model.provider}/${ctx.model.id}:${pi.getThinkingLevel()}` : undefined);
 		const modelArgs = model ? ["--model", model] : [];
 		if (!params.name) throw new Error("run requires name: the new member's name");
@@ -726,9 +774,14 @@ export default function setupParent(pi: ExtensionAPI) {
 	};
 
 	const parameters = Type.Object({
-		action: StringEnum(["run", "status", "abort", "compact"] as const),
-		id: Type.Optional(Type.String({ description: "status, abort, compact: the subagent id, which is the member's name." })),
-		message: Type.Optional(Type.String({ description: "run: the task. compact: a task the member runs once compacted, as if you sent it." })),
+		action: StringEnum(["run", "status", "abort", "compact", "switch"] as const),
+		id: Type.Optional(Type.String({ description: "status, abort, compact, switch: the subagent id, which is the member's name." })),
+		message: Type.Optional(
+			Type.String({
+				description:
+					"run: the task. compact: a task the member runs once compacted, as if you sent it. switch: a task a stopped member runs at once, as if you sent it.",
+			}),
+		),
 		instructions: Type.Optional(Type.String({ description: `compact: what the summary must keep, up to ${BODY_CHARS} characters.` })),
 		name: Type.Optional(
 			Type.String({ description: "run (required): the new member's name, 2-24 lowercase letters, digits, or hyphens, starting with a letter. Each name is used once." }),
@@ -738,21 +791,29 @@ export default function setupParent(pi: ExtensionAPI) {
 				description: `run (required): the member's lasting role in one line of up to ${DESCRIPTION_CHARS} characters, not its current task; for example "runs the e2e suite and reports failures".`,
 			}),
 		),
-		model: Type.Optional(Type.String({ description: "run: Pi model pattern, provider/id[:thinking]. Default: your current model and thinking level." })),
+		model: Type.Optional(
+			Type.String({ description: "run: Pi model pattern, provider/id[:thinking]. Default: your current model and thinking level. switch: the member's new model, in the same form." }),
+		),
+		thinking: Type.Optional(Type.String({ description: "switch: a Pi thinking level: off, minimal, low, medium, high, xhigh, or max." })),
 		cwd: Type.Optional(Type.String({ description: "run: working directory. Default: yours." })),
 		args: Type.Optional(Type.Array(Type.String(), { description: "run: extra Pi CLI options, for example tools, extensions, skills, or MCP." })),
 		waitMs: Type.Optional(
-			Type.Integer({ minimum: 0, maximum: MAX_WAIT_MS, description: `run, status, compact: wait up to this long; 0 returns at once while the member keeps running. Default ${DEFAULT_WAIT_MS}.` }),
+			Type.Integer({
+				minimum: 0,
+				maximum: MAX_WAIT_MS,
+				description: `run, status, compact, switch with message: wait up to this long; 0 returns at once while the member keeps running. Default ${DEFAULT_WAIT_MS}.`,
+			}),
 		),
 	});
 	type Params = {
-		action: "run" | "status" | "abort" | "compact";
+		action: "run" | "status" | "abort" | "compact" | "switch";
 		id?: string;
 		message?: string;
 		instructions?: string;
 		name?: string;
 		description?: string;
 		model?: string;
+		thinking?: string;
 		cwd?: string;
 		args?: string[];
 		waitMs?: number;
@@ -765,9 +826,10 @@ export default function setupParent(pi: ExtensionAPI) {
 			"Delegate work to a Pi subagent: a separate Pi process with its own session that loads tools, extensions, skills, and MCP servers like a normal Pi launch.",
 			"run hires a named team member, announces it on the board, and starts it on message; its name is its id, and its description is the role the team roster shows. status reports progress or the result (without id: lists subagents). abort stops the current run or compaction and cancels a queued one; a member you aborted wakes only for your direct message.",
 			"compact compacts a member's context; instructions say what the summary keeps. Pi compacts a running member by itself at its compact point, a Pi setting; status lines show ctx: the member's context tokens against that point. Compact a member yourself when it is past about 60% of its compact point and is about to take a new or unrelated task, or holds much that the next task does not need. A stopped member compacts at once, a running one after its current run. With message, the member then runs on message as if you sent it; without, a result you did not wait for arrives without starting a turn.",
-			`run, status, and compact wait up to waitMs (default ${DEFAULT_WAIT_MS}, max ${MAX_WAIT_MS}) and return the result if it finishes in time, otherwise its progress while it keeps running. A finished result you have not seen arrives later as a message; do not poll for it. Team messages for you arrive the same way.`,
+			"switch moves a member to another model or thinking level for its next runs; it keeps its name, session, and context. A new model starts without the prompt cache, so its next request pays full input price for the whole context; compact first when the context is large. With message, a stopped member runs on it at once.",
+			`run, status, compact, and switch with message wait up to waitMs (default ${DEFAULT_WAIT_MS}, max ${MAX_WAIT_MS}) and return the result if it finishes in time, otherwise its progress while it keeps running. A finished result you have not seen arrives later as a message; do not poll for it. Team messages for you arrive the same way.`,
 			"Members talk with you and each other through the team tool. A member starts with an empty conversation, so put the context it needs in message. A direct team message to a stopped member wakes it in its own session. A run woken by a member's message sends its final reply to that member, or to you when that member has stopped.",
-			"args are Pi command-line options: read docs/cli.md in the Pi documentation listed in your system prompt, or run `pi --help`. Session, mode, and model flags are set by this tool.",
+			"args are Pi command-line options: read docs/cli.md in the Pi documentation listed in your system prompt, or run `pi --help`. Session, mode, model, provider, and thinking flags are set by this tool.",
 			"Progress showing no active tool and an old last event suggests a stall. Subagents cannot delegate further and end with this session.",
 		].join("\n\n"),
 		parameters,
@@ -778,9 +840,9 @@ export default function setupParent(pi: ExtensionAPI) {
 				return { content: [{ type: "text", text: agents.size ? [...agents.values()].map(header).join("\n") : "No subagents." }], details: undefined };
 			}
 			/** The state of `agent`, with the other running members; `details` mark what the result shows seen. */
-			const result = (agent: Agent, details?: object) => {
+			const result = (agent: Agent, details?: object, lead = "") => {
 				const state = consume(agent);
-				return { content: [{ type: "text" as const, text: state.text + footer(agent) }], details: { ...details, ...state.details } };
+				return { content: [{ type: "text" as const, text: lead + state.text + footer(agent) }], details: { ...details, ...state.details } };
 			};
 			if (params.action === "run") {
 				const { agent, joined } = create(params, ctx);
@@ -806,6 +868,38 @@ export default function setupParent(pi: ExtensionAPI) {
 				compact(agent, request);
 				await waitFor(agent, waitMs, signal, true);
 				return result(agent);
+			}
+			if (params.action === "switch") {
+				const pattern = params.model?.trim() || undefined;
+				const level = params.thinking?.trim() || undefined;
+				if (!pattern && !level) throw new Error("switch requires model or thinking");
+				// A run on message would replace the current run, or drop a queued compaction.
+				if (params.message && (busy(agent) || agent.queued)) {
+					throw new Error(
+						agent.status === "running"
+							? `${agent.id} is running; abort it first, or switch now and message it after it stops`
+							: `${agent.id} is compacting; abort it first, or switch now and message it after the compaction`,
+					);
+				}
+				const was = modelChoice(agent.launchArgs);
+				const asked = pattern ? withLevel(pattern) : undefined;
+				const model = asked?.model ?? was.model;
+				const thinking = level ?? asked?.thinking ?? was.thinking;
+				const launchArgs = [...was.session, ...(model ? ["--model", model] : []), ...(thinking ? ["--thinking", thinking] : []), ...was.args];
+				team.relaunch(agent.id, launchArgs);
+				agent.launchArgs = launchArgs;
+				const label = (choice: { model?: string; thinking?: string }) => `${choice.model ?? "its session's model"}${choice.thinking ? `:${choice.thinking}` : ""}`;
+				const cache =
+					model !== was.model && agent.contextTokens !== undefined
+						? ` ctx ${tokens.format(agent.contextTokens)} — its next request pays full input price for that context.`
+						: "";
+				const line = `${agent.id} now runs on ${label({ model, thinking })} from its next run (was ${label(was)}).${cache}`;
+				if (!params.message) return { content: [{ type: "text", text: line }], details: undefined };
+				// As the main agent's task, the run unlocks the member.
+				agent.locked = false;
+				launch(agent, { type: "prompt", message: params.message }, MAIN);
+				await waitFor(agent, waitMs, signal, true);
+				return result(agent, undefined, `${line}\n\n`);
 			}
 			// This call returns the final state, so hold a waiter to keep it from also being delivered.
 			const hold = () => {};

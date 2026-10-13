@@ -22,31 +22,33 @@ To try it for one run: `pi -e /path/to/pi-subagent-rpc-extension`. Subagents do 
 | `status` | `id`, `waitMs` | Reports progress or the result. Without `id`, lists every member. |
 | `abort` | `id` | Stops the current run or compaction and cancels a queued compaction. A run that Pi has not started yet, or that does not stop within 10 seconds, is killed; a wake still waiting for the previous process never starts. The member then wakes only for a direct message from the main agent. |
 | `compact` | `id`, `instructions`, `message`, `waitMs` | Compacts the member's context with Pi's compaction; see [Compaction](#compaction). |
+| `switch` | `id`, `model`, `thinking`, `message`, `waitMs` | Moves the member to another model or thinking level from its next run; see [Switching models](#switching-models). |
 
 - `name`: required, and the member's id. Names are 2 to 24 lowercase letters, digits, or hyphens, start with a letter, and do not end with a hyphen. `main`, `all`, and `team` are reserved, and a name is used once per team: `run` on an existing member fails, and a direct message gives it more work.
 - `description`: required, the member's lasting role rather than its current task, in one line of at most 100 characters, such as `runs the e2e suite and reports failures`. The team roster shows it, and hiring posts `joined: <name> — <description>` to the board from `main`.
-- `message`: the task. A member starts with an empty conversation, so `message` carries the context it needs. For `compact`, the task the member runs once compacted.
+- `message`: the task. A member starts with an empty conversation, so `message` carries the context it needs. For `compact`, the task the member runs once compacted; for `switch`, the task a stopped member runs at once.
 - `instructions`: for `compact`, Pi's custom instructions for the summary, saying what it keeps; up to 4000 characters.
-- `model`: a Pi model pattern, `provider/id[:thinking]`. Default: the parent's current model and thinking level.
+- `model`: a Pi model pattern, `provider/id[:thinking]`. Default: the parent's current model and thinking level. For `switch`, the member's new model.
+- `thinking`: for `switch`, a Pi thinking level: `off`, `minimal`, `low`, `medium`, `high`, `xhigh`, or `max`.
 - `cwd`: the member's working directory, relative to the parent's. Default: the parent's.
-- `args`: extra Pi command-line options, such as `--tools`, `--no-extensions`, `-e`, `--no-mcp`, or `--thinking`. The extension sets the mode, session, and model flags itself and rejects them here, along with args that remove the `team` tool.
+- `args`: extra Pi command-line options, such as `--tools`, `--no-extensions`, `-e`, or `--no-mcp`. The extension sets the mode, session, model, provider, and thinking flags itself and rejects them here, along with args that remove the `team` tool; `model` carries the provider and thinking level.
 
 ## Waiting and results
 
-`run`, `status`, and `compact` wait up to `waitMs` (default 30000, maximum 240000); `waitMs: 0` returns at once. A member that finishes in time returns its final reply as the tool result. Otherwise the result is a progress report and the member keeps running:
+`run`, `status`, `compact`, and `switch` with `message` wait up to `waitMs` (default 30000, maximum 240000); `waitMs: 0` returns at once. A member that finishes in time returns its final reply as the tool result. Otherwise the result is a progress report and the member keeps running:
 
 ```text
 [running] subagent reviewer · openai/gpt-5 · turn 4 · bash (npm test -- --reporter dot) 2m10s · last event 3s ago · 5m02s · 48.2K in · 3.1K out · 1.2M cached · $0.42
 [t3] Running the full test suite now.
 ```
 
-The status line of a progress report shows each running tool with its main argument, such as its command, path, code, or query, in one line cut to about 60 characters. The status line of a progress report or result ends with the run's token usage, summed over its model replies: input tokens, cache writes included; output tokens; cache reads, when there are any; and the cost, when the model has a price.
+Once a run ends, its status line names the model with its thinking level, such as `openai/gpt-5:high`. The status line of a progress report shows each running tool with its main argument, such as its command, path, code, or query, in one line cut to about 60 characters. The status line of a progress report or result ends with the run's token usage, summed over its model replies: input tokens, cache writes included; output tokens; cache reads, when there are any; and the cost, when the model has a price.
 
 Once known, the status line also shows the member's context as `ctx 212K/300K 71%`: the context tokens of its last model reply, or Pi's estimate after its last compaction, against its [compact point](#compaction). The context stays known across runs. A run that did not settle ends its status line with how it ended:
 
 ```text
-[error] subagent tester · openai/gpt-5 · 3 turns · 2m10s · 48.2K in · 3.1K out · ctx 52K/300K 17% · stream error: stream disconnected before completion: stream closed before response.completed (Pi retried 0 times)
-[aborted] subagent tester · openai/gpt-5 · 2 turns · 41s · 20.1K in · 1.2K out · ctx 31K/300K 10% · by an extension
+[error] subagent tester · openai/gpt-5:high · 3 turns · 2m10s · 48.2K in · 3.1K out · ctx 52K/300K 17% · stream error: stream disconnected before completion: stream closed before response.completed (Pi retried 0 times)
+[aborted] subagent tester · openai/gpt-5:high · 2 turns · 41s · 20.1K in · 1.2K out · ctx 31K/300K 10% · by an extension
 ```
 
 - `[error]`: the error in one line, followed in full when it is longer, and, for a failed model request, how many times Pi retried it. Retries are Pi's own; a progress report shows one in progress as `retrying (2/3): <error>`.
@@ -87,11 +89,20 @@ compacts above about 300K tokens. The `ctx` share uses the same compact point, r
 - A stopped member compacts at once in a process of its own. A result of its last run that the main agent has not received arrives first. Meanwhile the member's state is `compacting`, and it is never woken: a direct message to it shows `compacting; reads it afterwards` and is routed when the compaction ends, as for a message that reached a run after its last read.
 - A running member compacts after its current run's process exits, and the result reads `Compaction queued after the current run.` A second `compact` before the compaction ends fails.
 - `abort` cancels a queued compaction or stops the compaction in progress, after which Pi records no compaction, and locks the member as after any abort.
-- A compacted member's result reads `[compacted] subagent tester · openai/gpt-5 · 18s · ctx 24K/300K 8% · compacted 312K→24K (manual)`; Pi's `Nothing to compact (session too small)` and `Already compacted` also end as `[compacted]`, with that text. A failure, such as an extension that cancels the compaction or a provider error, ends as `[error] … · compaction failed: <reason>`, with the extensions' notices.
+- A compacted member's result reads `[compacted] subagent tester · openai/gpt-5:high · 18s · ctx 24K/300K 8% · compacted 312K→24K (manual)`; Pi's `Nothing to compact (session too small)` and `Already compacted` also end as `[compacted]`, with that text. A failure, such as an extension that cancels the compaction or a provider error, ends as `[error] … · compaction failed: <reason>`, with the extensions' notices.
 - With `message`, a compacted member then runs on `message` as if the main agent started it, which also unlocks a member the main agent aborted; that run's result arrives as usual and its status line shows the compaction. After a failure the member does not run, and the result starts a turn.
 - Without `message`, a result that `waitMs` does not cover arrives as a `subagent-result` that starts no turn, and a locked member stays locked.
 
 The member's extensions take part in both kinds of compaction as in any Pi session, for example through `session_before_compact`.
+
+## Switching models
+
+`switch` moves a member to another model, thinking level, or both, from its next run. The member keeps its name, session, and context. Pi resolves `model` and `thinking` when that run starts and fits the level to what the model supports; a model Pi cannot resolve ends the run as `[error]` with Pi's reason.
+
+- A model switch keeps the member's thinking level, and a thinking switch keeps its model. The team log records the new settings, so a reopened session keeps them.
+- The result reads `tester now runs on openai/gpt-5:high from its next run (was openai/gpt-5-mini:medium). ctx 212K — its next request pays full input price for that context.` The `ctx` part comes with a model change once the member's context is known: the new model starts without the prompt cache, so its next request pays full input price for the whole context. A large context is cheaper to [compact](#compaction) first.
+- A run or compaction already under way keeps the settings it started with, as does a wake that waits for the previous run's process to exit. A queued compaction and every later run use the new settings.
+- With `message`, a stopped member runs on `message` at once, as if the main agent started it, which also unlocks a member the main agent aborted, and the call waits as `run` does. A running or compacting member takes `message` after it stops: `switch` with `message` on it returns an error.
 
 ## The `team` tool
 
