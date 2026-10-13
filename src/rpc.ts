@@ -1,6 +1,6 @@
 /**
- * One run of a subagent: a `pi --mode rpc` process that lives from its launch prompt until the run concludes.
- * It reports events, child requests, and the run's end to its owner.
+ * One run of a subagent: a `pi --mode rpc` process that lives from its launch command, a prompt or a compaction,
+ * until the run concludes. It reports events, child requests, and the run's end to its owner.
  */
 import { type ChildProcessWithoutNullStreams, spawn } from "node:child_process";
 import { randomBytes } from "node:crypto";
@@ -16,14 +16,18 @@ const STDERR_CHARS = 2_000;
 const DIALOGS = new Set(["select", "confirm", "input", "editor"]);
 
 export type RunStatus = "settled" | "aborted" | "error";
+/** Who aborted a run: the parent with stop, or the child itself, such as one of its extensions with ctx.abort(). */
+export type AbortedBy = "main" | "extension";
+/** The RPC command a run starts with. */
+export type Launch = { type: "prompt"; message: string } | { type: "compact"; customInstructions?: string };
 
 export interface RunOwner {
 	/** Every record the child writes, before the run's own bookkeeping. */
 	onEvent(event: any): void;
 	/** A child request. Resolves to the reply, or undefined for none. The signal aborts when the run concludes. */
 	onRequest(request: Request, signal: AbortSignal): Promise<Reply | undefined>;
-	/** The run concluded; called once. */
-	onEnd(status: RunStatus, error: string | null): void;
+	/** The run concluded; called once. `abortedBy` is set for an aborted run. */
+	onEnd(status: RunStatus, error: string | null, abortedBy?: AbortedBy): void;
 }
 
 export interface Run {
@@ -63,8 +67,8 @@ function within<T>(promise: Promise<T>, ms: number, signal?: AbortSignal) {
 	});
 }
 
-/** Starts a child on `message`. */
-export function startRun(options: { cwd: string; args: string[]; message: string; owner: RunOwner }): Run {
+/** Starts a child on `launch`; a compaction run ends with the compaction. */
+export function startRun(options: { cwd: string; args: string[]; launch: Launch; owner: RunOwner }): Run {
 	const { owner } = options;
 	// The host's runtime and Pi package, so the child runs the same Pi build even when the host is an SDK app.
 	// shortcut: a Bun-compiled Pi binary has no rpc-entry file; add a path for it if such hosts need subagents.
@@ -77,16 +81,20 @@ export function startRun(options: { cwd: string; args: string[]; message: string
 		windowsHide: true,
 	});
 	const launchId = `run-${hex()}`;
-	/** The launch prompt got its response. */
+	/** The launch command got its response. */
 	let replied = false;
 	let busy = false;
-	/** Pi started the run (agent_start). */
+	/** Between compaction_start and compaction_end. */
+	let compacting = false;
+	/** Pi started the run (agent_start), or the compaction a compaction run asked for. */
 	let begun = false;
 	/** The launch prompt started a run whose agent_start has not arrived yet. */
 	let gate = false;
 	let probe: string | null = null;
 	let lastStop: string | null = null;
 	let lastError: string | null = null;
+	/** Pi's agent_settled reported an abort, as with ctx.abort() from an extension of the child. */
+	let settledAborted = false;
 	/** The parent asked to stop; survives the child's own event resets. */
 	let aborting = false;
 	let finished = false;
@@ -99,13 +107,13 @@ export function startRun(options: { cwd: string; args: string[]; message: string
 		if (child.stdin.writable) child.stdin.write(`${JSON.stringify(record)}\n`);
 	};
 
-	const finish = (status: RunStatus, error: string | null) => {
+	const finish = (status: RunStatus, error: string | null, abortedBy?: AbortedBy) => {
 		if (finished) return;
 		finished = true;
 		concluded.abort();
 		child.stdin.end();
 		setTimeout(() => killTree(child), KILL_AFTER_MS).unref();
-		owner.onEnd(status, error);
+		owner.onEnd(status, error, abortedBy);
 	};
 
 	const fail = (error: string) => {
@@ -113,15 +121,17 @@ export function startRun(options: { cwd: string; args: string[]; message: string
 		killTree(child);
 	};
 
+	// A stop during a tool can end with an assistant error, so the abort decides first.
 	const conclude = () => {
-		if (aborting || lastStop === "aborted") finish("aborted", null);
+		if (aborting) finish("aborted", null, "main");
+		else if (settledAborted) finish("aborted", null, "extension");
 		else if (lastStop === "error") finish("error", lastError ?? "assistant error");
 		else finish("settled", null);
 	};
 
-	// Pi's events can lag its state, so Pi's own isStreaming confirms a run is over.
+	// Pi's events can lag its state, so Pi's own isStreaming and isCompacting confirm a run is over.
 	const maybeFinish = () => {
-		if (finished || busy || gate || probe || !replied) return;
+		if (finished || busy || compacting || gate || probe || !replied) return;
 		probe = `probe-${hex()}`;
 		write({ id: probe, type: "get_state" });
 	};
@@ -145,15 +155,15 @@ export function startRun(options: { cwd: string; args: string[]; message: string
 				if (event.id && event.id === probe) {
 					probe = null;
 					if (!event.success || typeof event.data?.isStreaming !== "boolean") finish("error", `state check failed: ${event.error ?? "no isStreaming"}`);
-					// While streaming, the coming agent_settled checks again.
-					else if (!event.data.isStreaming && !busy && !gate) conclude();
+					// While streaming or compacting, the coming agent_settled or compaction_end checks again.
+					else if (!event.data.isStreaming && !event.data.isCompacting && !busy && !compacting && !gate) conclude();
 					return;
 				}
 				if (event.id !== launchId) return;
 				replied = true;
 				if (!event.success) {
 					lastStop = "error";
-					lastError = event.error ?? "prompt rejected";
+					lastError = event.error ?? `${options.launch.type} rejected`;
 				} else if (event.data?.disposition === "started") gate = true;
 				maybeFinish();
 				return;
@@ -163,6 +173,7 @@ export function startRun(options: { cwd: string; args: string[]; message: string
 				begun = true;
 				gate = false;
 				lastStop = null;
+				settledAborted = false;
 				return;
 			case "message_end":
 				if (event.message?.role !== "assistant") return;
@@ -172,6 +183,16 @@ export function startRun(options: { cwd: string; args: string[]; message: string
 			case "agent_settled":
 				busy = false;
 				gate = false;
+				settledAborted = event.aborted === true;
+				maybeFinish();
+				return;
+			case "compaction_start":
+				compacting = true;
+				// From here Pi honours an abort of the compaction a compaction run asked for.
+				if (options.launch.type === "compact") begun = true;
+				return;
+			case "compaction_end":
+				compacting = false;
 				maybeFinish();
 				return;
 			case "extension_ui_request":
@@ -206,8 +227,8 @@ export function startRun(options: { cwd: string; args: string[]; message: string
 	const closed = (reason: string, clean = false) => {
 		if (ended) return;
 		ended = true;
-		if (aborting) finish("aborted", null);
-		else if (clean && !busy && !gate) conclude();
+		if (aborting) finish("aborted", null, "main");
+		else if (clean && !busy && !compacting && !gate) conclude();
 		else finish("error", `${reason}${stderr.trim() ? `\n${stderr.trim()}` : ""}`);
 		markExited();
 	};
@@ -217,7 +238,7 @@ export function startRun(options: { cwd: string; args: string[]; message: string
 	const onExit = (code: number | null, signal: NodeJS.Signals | null) => closed(`Pi exited (code ${code}, signal ${signal})`, code === 0);
 	child.on("close", onExit);
 	child.on("exit", (code, signal) => setTimeout(() => onExit(code, signal), 2_000).unref());
-	write({ id: launchId, type: "prompt", message: options.message });
+	write({ id: launchId, ...options.launch });
 
 	return {
 		exited,
@@ -227,7 +248,7 @@ export function startRun(options: { cwd: string; args: string[]; message: string
 			aborting = true;
 			// Pi drops an abort that arrives before its run starts, so a run that has not started ends with its process.
 			if (!begun) {
-				finish("aborted", null);
+				finish("aborted", null, "main");
 				killTree(child);
 				return exited;
 			}

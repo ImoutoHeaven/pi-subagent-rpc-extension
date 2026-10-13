@@ -7,15 +7,24 @@ import { existsSync, mkdirSync, statSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { StringEnum } from "@earendil-works/pi-ai";
-import type { BoundaryState, ExtensionAPI, ExtensionContext, SessionEntry } from "@earendil-works/pi-coding-agent";
+import {
+	type BoundaryState,
+	calculateContextTokens,
+	type ExtensionAPI,
+	type ExtensionContext,
+	getAgentDir,
+	type SessionEntry,
+	SettingsManager,
+} from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
 import { BODY_CHARS, DEFAULT_WAIT_MS, type Details, detailsOf, MAX_WAIT_MS, type Reply, type Request } from "./protocol.ts";
-import { type Run, type RunStatus, startRun } from "./rpc.ts";
+import { type AbortedBy, type Launch, type Run, type RunStatus, startRun } from "./rpc.ts";
 import { createTeam, DESCRIPTION_CHARS } from "./team.ts";
 
 const MAX_RESULT_CHARS = 16_000;
 const NARRATION_LINES = 3;
 const NARRATION_CHARS = 300;
+const ERROR_CHARS = 200;
 const ARGS_CHARS = 60;
 const NOTICES = 3;
 const FOOTER_AGENTS = 3;
@@ -28,8 +37,17 @@ const OWNED_FLAGS = ["--mode", "--print", "-p", "--no-session", "--session", "--
 const SENT = "was sent to you as a subagent-result message";
 const RETURNED = "was returned to you earlier";
 
-/** `stopped`: a member restored from the log that has not run in this session yet. */
-type Status = RunStatus | "running" | "stopped";
+/**
+ * `stopped`: a member restored from the log that has not run in this session yet.
+ * `compacting`: a compaction run; `compacted`: one that compacted the member's context, or found nothing to compact.
+ */
+type Status = RunStatus | "running" | "stopped" | "compacting" | "compacted";
+
+/** A compaction the main agent asked for: Pi's custom instructions, and the message the member runs on afterwards. */
+interface Compaction {
+	instructions?: string;
+	message?: string;
+}
 
 interface Agent {
 	id: string;
@@ -53,6 +71,22 @@ interface Agent {
 	/** provider/id the child actually answered with; Pi matches --model fuzzily. */
 	model: string;
 	error: string | null;
+	/** The run's last model reply was an error. */
+	modelError: boolean;
+	/** Pi's automatic retries of a model request in this run. */
+	retries: number;
+	abortedBy: AbortedBy | undefined;
+	/** The run is a compaction run. */
+	compactOnly: boolean;
+	/** The run's last compaction, such as `compacted 312K→24K (threshold)` or `compaction failed: …`; empty when there was none. */
+	compaction: string;
+	/** Context tokens after the last model reply or compaction, and the member's compact point; kept across runs, undefined until known. */
+	contextTokens?: number;
+	compactAt?: number;
+	/** A compaction that starts once the current run's process exits. */
+	queued: Compaction | null;
+	/** The message a compaction run continues with once the member is compacted. */
+	next?: string;
 	/** Where the final result went, completing "Its result …": SENT, RETURNED, or to the member that woke the run; null until it went somewhere. */
 	delivered: string | null;
 	/** The child sent its start request in this run, so the extension loaded in it. */
@@ -83,6 +117,12 @@ const usageText = ({ input, output, cached, cost }: Usage) => {
 	if (!input && !output && !cached) return "";
 	const price = cost <= 0 ? "" : cost < 0.01 ? " · <$0.01" : ` · $${cost.toFixed(2)}`;
 	return ` · ${tokens.format(input)} in · ${tokens.format(output)} out${cached ? ` · ${tokens.format(cached)} cached` : ""}${price}`;
+};
+/** ` · ctx 212K/300K 71%`: the context tokens against the compact point; empty until known. */
+const ctxText = ({ contextTokens, compactAt }: { contextTokens?: number; compactAt?: number }) => {
+	if (contextTokens === undefined) return "";
+	const share = compactAt ? `/${tokens.format(compactAt)} ${Math.round((100 * contextTokens) / compactAt)}%` : "";
+	return ` · ctx ${tokens.format(contextTokens)}${share}`;
 };
 
 interface Pending {
@@ -179,15 +219,32 @@ export default function setupParent(pi: ExtensionAPI) {
 	/** Pending messages that wake the parent. */
 	const loud = () => unreceived().filter((message) => !message.quiet).length;
 
+	/** A running member, or one in a compaction run. */
+	const busy = (agent: Agent) => agent.status === "running" || agent.status === "compacting";
+
+	/** How an ended run ended: who aborted it, or its error and Pi's retries of a failed model request. */
+	const outcome = (agent: Agent) => {
+		if (agent.status === "aborted") return ` · by ${agent.abortedBy === "extension" ? "an extension" : "main"}`;
+		if (agent.status !== "error" || !agent.error) return "";
+		const retried = agent.modelError ? ` (Pi retried ${agent.retries} time${agent.retries === 1 ? "" : "s"})` : "";
+		return ` · ${oneLine(agent.error, ERROR_CHARS)}${retried}`;
+	};
+
 	const header = (agent: Agent) => {
 		const now = Date.now();
 		const id = `subagent ${agent.id}${agent.model ? ` · ${agent.model}` : ""}`;
-		if (agent.status === "stopped") return `[stopped] ${id}`;
-		if (agent.status !== "running") return `[${agent.status}] ${id} · ${agent.turns} turns · ${duration(agent.endedAt - agent.startedAt)}${usageText(agent.usage)}`;
+		const context = ctxText(agent);
+		const compaction = agent.compaction ? ` · ${agent.compaction}` : "";
+		if (agent.status === "stopped") return `[stopped] ${id}${context}`;
+		if (agent.status === "compacting") return `[compacting] ${id} · ${duration(now - agent.startedAt)}${context}`;
+		if (agent.status === "compacted") return `[compacted] ${id} · ${duration(agent.endedAt - agent.startedAt)}${context}${compaction}`;
+		if (agent.status !== "running") {
+			return `[${agent.status}] ${id} · ${agent.turns} turns · ${duration(agent.endedAt - agent.startedAt)}${usageText(agent.usage)}${context}${compaction}${outcome(agent)}`;
+		}
 		const activity = agent.tools.size
 			? [...agent.tools.values()].map((tool) => `${tool.name}${tool.args ? ` (${tool.args})` : ""} ${duration(now - tool.since)}`).join(", ")
 			: agent.phase;
-		return `[running] ${id} · turn ${agent.turns + 1} · ${activity} · last event ${duration(now - agent.lastEventAt)} ago · ${duration(now - agent.startedAt)}${usageText(agent.usage)}`;
+		return `[running] ${id} · turn ${agent.turns + 1} · ${activity} · last event ${duration(now - agent.lastEventAt)} ago · ${duration(now - agent.startedAt)}${usageText(agent.usage)}${context}${compaction}`;
 	};
 
 	const noticeLine = (agent: Agent) => (agent.notices.length ? `Notices: ${agent.notices.join(" | ")}` : "");
@@ -197,14 +254,16 @@ export default function setupParent(pi: ExtensionAPI) {
 
 	/** The model-facing report. */
 	const report = (agent: Agent) => {
-		if (agent.status === "running") {
-			return [header(agent), ...agent.narration, noticeLine(agent), "Still running: wait with status, or abort."].filter(Boolean).join("\n");
+		if (busy(agent)) {
+			return [header(agent), ...agent.narration, noticeLine(agent), `Still ${agent.status}: wait with status, or abort.`].filter(Boolean).join("\n");
 		}
 		const text =
 			agent.lastText.length > MAX_RESULT_CHARS
 				? `${agent.lastText.slice(0, MAX_RESULT_CHARS)}\n…[truncated; full reply: ${join(agent.dir, "final.md")}]`
 				: agent.lastText;
-		return [header(agent), agent.woken, agent.error, noticeLine(agent), text].filter(Boolean).join("\n\n");
+		// The header holds the error in one line; one that does not fit follows in full.
+		const error = agent.error && oneLine(agent.error, ERROR_CHARS) !== agent.error ? agent.error : "";
+		return [header(agent), agent.woken, error, noticeLine(agent), text].filter(Boolean).join("\n\n");
 	};
 
 	/**
@@ -213,9 +272,9 @@ export default function setupParent(pi: ExtensionAPI) {
 	 * behind that subagent's own, keeping it the last word.
 	 */
 	const consume = (agent: Agent): { text: string; details?: object } => {
-		if (agent.status === "running") return { text: report(agent) + (loud() ? "\nReturned early: subagent messages follow this result." : "") };
+		if (busy(agent)) return { text: report(agent) + (loud() ? "\nReturned early: subagent messages follow this result." : "") };
 		if (agent.status === "stopped") return { text: header(agent) };
-		if (unreceived().some((message) => message.agentId === agent.id)) deliver(agent);
+		if (unreceived().some((message) => message.agentId === agent.id && !message.quiet)) deliver(agent);
 		if (agent.delivered) return { text: `${header(agent)}\n\nIts result ${agent.delivered}. Full reply: ${join(agent.dir, "final.md")}` };
 		agent.delivered = RETURNED;
 		return { text: report(agent), details: runKey(agent) };
@@ -224,11 +283,11 @@ export default function setupParent(pi: ExtensionAPI) {
 	/** Other running subagents, so a result also shows what is still in flight. */
 	const footer = (except?: Agent) => {
 		const now = Date.now();
-		const running = [...agents.values()].filter((agent) => agent !== except && agent.status === "running");
+		const running = [...agents.values()].filter((agent) => agent !== except && busy(agent));
 		if (!running.length) return "";
 		const shown = running.slice(0, FOOTER_AGENTS).map((agent) => {
 			const quiet = now - agent.lastEventAt;
-			return `${agent.id} running ${duration(now - agent.startedAt)}${quiet > STALE_MS ? ` · no event ${duration(quiet)}` : ""}`;
+			return `${agent.id} ${agent.status} ${duration(now - agent.startedAt)}${ctxText(agent)}${quiet > STALE_MS ? ` · no event ${duration(quiet)}` : ""}`;
 		});
 		const more = running.length > FOOTER_AGENTS ? `, +${running.length - FOOTER_AGENTS} more` : "";
 		return `\n\n(Background: ${shown.join(", ")}${more}.)`;
@@ -318,11 +377,15 @@ export default function setupParent(pi: ExtensionAPI) {
 		suspended = false;
 	});
 
+	// A compaction run's result is information only, unless a message waited on the compaction that failed.
 	const deliver = (agent: Agent) => {
 		if (agent.delivered || shuttingDown) return;
 		agent.delivered = SENT;
-		notify("subagent-result", agent.id, report(agent), { ...runKey(agent), status: agent.status });
+		notify("subagent-result", agent.id, report(agent), { ...runKey(agent), status: agent.status }, agent.compactOnly && agent.next === undefined);
 	};
+
+	/** Tells the main agent about a member without starting a turn. */
+	const notice = (agent: Agent, text: string) => notify("subagent-notice", agent.id, `[subagent] ${agent.id} ${text}`, { id: agent.id }, true);
 
 	/**
 	 * Resolves once `agent` (if given) stops running, `ms` pass, or `signal` aborts.
@@ -330,7 +393,7 @@ export default function setupParent(pi: ExtensionAPI) {
 	 */
 	const waitFor = (agent: Agent | undefined, ms: number, signal?: AbortSignal, forTool = false) =>
 		new Promise<void>((done) => {
-			if ((agent && agent.status !== "running") || ms <= 0 || signal?.aborted || (forTool && loud())) return done();
+			if ((agent && !busy(agent)) || ms <= 0 || signal?.aborted || (forTool && loud())) return done();
 			const end = () => {
 				clearTimeout(timer);
 				signal?.removeEventListener("abort", end);
@@ -346,16 +409,30 @@ export default function setupParent(pi: ExtensionAPI) {
 
 	const team = createTeam(pi, {
 		isRunning: (name) => agents.get(name)?.status === "running",
+		state: (name) => {
+			const agent = agents.get(name);
+			const status = agent?.status;
+			if (status === "running" || status === "compacting") return status;
+			// From the end of the run until its process exits and the queued compaction starts, so no message wakes the member in between.
+			if (agent?.queued) return "compacting";
+			return status === "error" || status === "aborted" ? `stopped (${status})` : "stopped";
+		},
 		startedBy: (name) => agents.get(name)?.startedBy ?? MAIN,
 		locked: (name) => Boolean(agents.get(name)?.locked),
+		unlock: (name) => {
+			(agents.get(name) as Agent).locked = false;
+		},
 		wake: (name, by) => {
 			const agent = agents.get(name) as Agent;
 			if (by === MAIN) agent.locked = false;
+			else if (agent.status === "error" || agent.status === "aborted") {
+				notice(agent, `resumed (woken by ${by}) after its run ${agent.status === "error" ? "ended in an error" : "was aborted"}.`);
+			}
 			const note =
 				by === MAIN
 					? "The main agent sent you a team message. Act on your team messages."
 					: `${by} sent you a team message. Act on your team messages.`;
-			launch(agent, note, by);
+			launch(agent, { type: "prompt", message: note }, by);
 		},
 		notify,
 		// Information for the main agent's judgment, so it never starts a turn.
@@ -370,6 +447,21 @@ export default function setupParent(pi: ExtensionAPI) {
 		if (shuttingDown) return { error: "the main agent's session is ending" };
 		if (request.op === "start") agent.greeted = true;
 		return team.answer(agent.id, request, signal);
+	};
+
+	/** Records the member's model and, through Pi's settings for its working directory, its compact point. */
+	const setModel = (agent: Agent, provider: string, id: string) => {
+		if (agent.model === `${provider}/${id}`) return;
+		agent.model = `${provider}/${id}`;
+		const model = parent?.modelRegistry.find(provider, id);
+		if (!model) return;
+		try {
+			const settings = SettingsManager.create(agent.cwd, getAgentDir()).getCompactionSettings(model);
+			const point = settings.enabled ? model.contextWindow - settings.reserveTokens : model.contextWindow;
+			agent.compactAt = point > 0 ? point : undefined;
+		} catch {
+			// Invalid compaction settings, which the member's Pi reports itself.
+		}
 	};
 
 	const onEvent = (agent: Agent, event: any) => {
@@ -400,13 +492,18 @@ export default function setupParent(pi: ExtensionAPI) {
 				return;
 			case "message_end": {
 				if (event.message?.role !== "assistant") return;
-				if (event.message.provider && event.message.model) agent.model = `${event.message.provider}/${event.message.model}`;
+				if (event.message.provider && event.message.model) setModel(agent, event.message.provider, event.message.model);
 				const usage = event.message.usage;
+				const stop = event.message.stopReason;
+				agent.modelError = stop === "error";
 				if (usage) {
 					agent.usage.input += (usage.input ?? 0) + (usage.cacheWrite ?? 0);
 					agent.usage.output += usage.output ?? 0;
 					agent.usage.cached += usage.cacheRead ?? 0;
 					agent.usage.cost += usage.cost?.total ?? 0;
+					// As Pi counts context: a failed or aborted reply carries no valid usage.
+					const context = stop === "error" || stop === "aborted" ? 0 : calculateContextTokens(usage);
+					if (context > 0) agent.contextTokens = context;
 				}
 				const text = assistantText(event.message);
 				if (text) {
@@ -420,11 +517,28 @@ export default function setupParent(pi: ExtensionAPI) {
 				agent.phase = "between turns";
 				return;
 			case "auto_retry_start":
+				agent.retries = event.attempt;
 				agent.phase = `retrying (${event.attempt}/${event.maxAttempts}): ${oneLine(event.errorMessage ?? "", 120)}`;
 				return;
 			case "compaction_start":
 				agent.phase = "compacting";
 				return;
+			case "compaction_end": {
+				const { reason, result } = event;
+				if (result) {
+					agent.contextTokens = result.estimatedTokensAfter;
+					agent.compaction = `compacted ${tokens.format(result.tokensBefore)}→${tokens.format(result.estimatedTokensAfter)} (${reason})`;
+				} else agent.compaction = `compaction failed: ${event.errorMessage ?? "cancelled"}`;
+				// A compaction run reports its own result.
+				if (reason !== "manual") notice(agent, `${agent.compaction}${ctxText(agent)}`);
+				return;
+			}
+			case "response": {
+				// get_state names the model, also for a compaction run, which has no model reply.
+				const model = event.data?.model;
+				if (typeof model?.provider === "string" && typeof model.id === "string") setModel(agent, model.provider, model.id);
+				return;
+			}
 			case "extension_ui_request":
 				// Startup notices, such as an extension announcing itself, say nothing about this run.
 				if (event.method === "notify" && agent.phase !== "starting") agent.notices = [...agent.notices, oneLine(String(event.message ?? ""), NARRATION_CHARS)].slice(-NOTICES);
@@ -432,13 +546,35 @@ export default function setupParent(pi: ExtensionAPI) {
 		}
 	};
 
-	const onEnd = (agent: Agent, status: RunStatus, error: string | null) => {
-		Object.assign(agent, { status, error, endedAt: Date.now() });
+	const onEnd = (agent: Agent, runStatus: RunStatus, runError: string | null, abortedBy?: AbortedBy) => {
+		let status: Status = runStatus;
+		let error = runError;
+		if (agent.compactOnly) {
+			// Pi's reasons to have nothing to compact leave the member as compacted as it gets.
+			const noop = status === "error" && /^(Nothing to compact|Already compacted)/.test(error ?? "");
+			if (noop) agent.compaction = error as string;
+			else if (status !== "settled") agent.compaction = "";
+			if (status === "settled" || noop) [status, error] = ["compacted", null];
+			else if (status === "error") error = `compaction failed: ${error}`;
+		}
+		Object.assign(agent, { status, error, abortedBy, endedAt: Date.now() });
 		agent.tools.clear();
-		try {
-			writeFileSync(join(agent.dir, "final.md"), agent.lastText);
-		} catch {
-			// The report still carries the reply.
+		if (status === "compacted" && agent.next !== undefined && !shuttingDown) {
+			// The run on the message is the main agent's task, so it unlocks the member; its header keeps this compaction,
+			// and its result is the one delivered.
+			const compaction = agent.compaction;
+			agent.delivered = "continued";
+			agent.locked = false;
+			launch(agent, { type: "prompt", message: agent.next }, MAIN);
+			agent.compaction = compaction;
+			return;
+		}
+		if (!agent.compactOnly) {
+			try {
+				writeFileSync(join(agent.dir, "final.md"), agent.lastText);
+			} catch {
+				// The report still carries the reply.
+			}
 		}
 		const starter = agent.startedBy;
 		// A finished run started by a member reaches the main agent only when that member had stopped.
@@ -456,18 +592,24 @@ export default function setupParent(pi: ExtensionAPI) {
 				agent.woken = `(woken by ${starter}; sending the final reply to ${starter} failed: ${error instanceof Error ? error.message : String(error)})`;
 			}
 		}
+		if (status === "error" && !agent.compactOnly && !shuttingDown) {
+			team.stoppedOnError(agent.id, agent.startedAt, starter);
+			// The final reply went to the member that started the run; the main agent hears of the error.
+			if (agent.delivered) notice(agent, `stopped on an error; its final reply ${agent.delivered}: ${oneLine(error ?? "", ERROR_CHARS)}`);
+		}
 		const waiting = agent.waiters.size > 0;
 		for (const wake of [...agent.waiters]) wake();
 		if (!waiting) deliver(agent);
 	};
 
-	/** Starts a run on `message` once the previous run's process has exited; the member counts as running at once. */
-	const launch = (agent: Agent, message: string, startedBy: string) => {
+	/** Starts a run on `command` once the previous run's process has exited; the member counts as running or compacting at once. */
+	const launch = (agent: Agent, command: Launch, startedBy: string) => {
 		if (shuttingDown) throw new Error("the session is ending; no new subagent processes start");
 		// A finished result no one took yet, such as one an abort call still waits to return, would be lost to the reset.
-		if (agent.status !== "running" && agent.status !== "stopped") deliver(agent);
+		if (!busy(agent) && agent.status !== "stopped") deliver(agent);
 		Object.assign(agent, {
-			status: "running",
+			status: command.type === "compact" ? "compacting" : "running",
+			compactOnly: command.type === "compact",
 			startedBy,
 			startedAt: Date.now(),
 			lastEventAt: Date.now(),
@@ -479,6 +621,11 @@ export default function setupParent(pi: ExtensionAPI) {
 			usage: noUsage(),
 			model: "",
 			error: null,
+			modelError: false,
+			retries: 0,
+			abortedBy: undefined,
+			compaction: "",
+			next: undefined,
 			delivered: null,
 			greeted: false,
 			woken: "",
@@ -494,22 +641,33 @@ export default function setupParent(pi: ExtensionAPI) {
 			const run = startRun({
 				cwd: agent.cwd,
 				args: agent.launchArgs,
-				message,
+				launch: command,
 				owner: {
 					onEvent: (event) => onEvent(agent, event),
 					onRequest: (request, signal) => answer(agent, request, signal),
-					onEnd: (status, error) => onEnd(agent, status, error),
+					onEnd: (status, error, abortedBy) => onEnd(agent, status, error, abortedBy),
 				},
 			});
 			agent.run = run;
 			// After exit, so a tool call waiting on this run has taken its result before a wake starts the next run.
+			// A queued compaction comes first; the direct messages the run left unread are routed once it is over.
 			void run.exited.then(() => {
 				if (agent.run === run) agent.run = undefined;
-				if (agent.status !== "running" && !shuttingDown) team.afterRun(agent.id);
+				if (busy(agent) || shuttingDown) return;
+				const queued = agent.queued;
+				agent.queued = null;
+				if (queued) compact(agent, queued);
+				else team.afterRun(agent.id);
 			});
 		};
 		if (agent.run) void agent.run.exited.then(start);
 		else start();
+	};
+
+	/** Starts a compaction run, which continues with `message` once the member is compacted. */
+	const compact = (agent: Agent, { instructions, message }: Compaction) => {
+		launch(agent, { type: "compact", ...(instructions ? { customInstructions: instructions } : {}) }, MAIN);
+		agent.next = message;
 	};
 
 	const register = (id: string, cwd: string, dir: string, launchArgs: string[], status: Status) => {
@@ -531,6 +689,12 @@ export default function setupParent(pi: ExtensionAPI) {
 			usage: noUsage(),
 			model: "",
 			error: null,
+			modelError: false,
+			retries: 0,
+			abortedBy: undefined,
+			compactOnly: false,
+			compaction: "",
+			queued: null,
 			delivered: null,
 			greeted: false,
 			startedBy: MAIN,
@@ -562,9 +726,10 @@ export default function setupParent(pi: ExtensionAPI) {
 	};
 
 	const parameters = Type.Object({
-		action: StringEnum(["run", "status", "abort"] as const),
-		id: Type.Optional(Type.String({ description: "status, abort: the subagent id, which is the member's name." })),
-		message: Type.Optional(Type.String({ description: "run: the task." })),
+		action: StringEnum(["run", "status", "abort", "compact"] as const),
+		id: Type.Optional(Type.String({ description: "status, abort, compact: the subagent id, which is the member's name." })),
+		message: Type.Optional(Type.String({ description: "run: the task. compact: a task the member runs once compacted, as if you sent it." })),
+		instructions: Type.Optional(Type.String({ description: `compact: what the summary must keep, up to ${BODY_CHARS} characters.` })),
 		name: Type.Optional(
 			Type.String({ description: "run (required): the new member's name, 2-24 lowercase letters, digits, or hyphens, starting with a letter. Each name is used once." }),
 		),
@@ -576,12 +741,15 @@ export default function setupParent(pi: ExtensionAPI) {
 		model: Type.Optional(Type.String({ description: "run: Pi model pattern, provider/id[:thinking]. Default: your current model and thinking level." })),
 		cwd: Type.Optional(Type.String({ description: "run: working directory. Default: yours." })),
 		args: Type.Optional(Type.Array(Type.String(), { description: "run: extra Pi CLI options, for example tools, extensions, skills, or MCP." })),
-		waitMs: Type.Optional(Type.Integer({ minimum: 0, maximum: MAX_WAIT_MS, description: `run, status: wait up to this long; 0 returns at once while the member keeps running. Default ${DEFAULT_WAIT_MS}.` })),
+		waitMs: Type.Optional(
+			Type.Integer({ minimum: 0, maximum: MAX_WAIT_MS, description: `run, status, compact: wait up to this long; 0 returns at once while the member keeps running. Default ${DEFAULT_WAIT_MS}.` }),
+		),
 	});
 	type Params = {
-		action: "run" | "status" | "abort";
+		action: "run" | "status" | "abort" | "compact";
 		id?: string;
 		message?: string;
+		instructions?: string;
 		name?: string;
 		description?: string;
 		model?: string;
@@ -595,8 +763,9 @@ export default function setupParent(pi: ExtensionAPI) {
 		label: "Subagent",
 		description: [
 			"Delegate work to a Pi subagent: a separate Pi process with its own session that loads tools, extensions, skills, and MCP servers like a normal Pi launch.",
-			"run hires a named team member, announces it on the board, and starts it on message; its name is its id, and its description is the role the team roster shows. status reports progress or the result (without id: lists subagents). abort stops the current run; a member you aborted wakes only for your direct message.",
-			`run and status wait up to waitMs (default ${DEFAULT_WAIT_MS}, max ${MAX_WAIT_MS}) and return the result if it finishes in time, otherwise its progress while it keeps running. A finished result you have not seen arrives later as a message; do not poll for it. Team messages for you arrive the same way.`,
+			"run hires a named team member, announces it on the board, and starts it on message; its name is its id, and its description is the role the team roster shows. status reports progress or the result (without id: lists subagents). abort stops the current run or compaction and cancels a queued one; a member you aborted wakes only for your direct message.",
+			"compact compacts a member's context; instructions say what the summary keeps. Pi compacts a running member by itself at its compact point, a Pi setting; status lines show ctx: the member's context tokens against that point. Compact a member yourself when it is past about 60% of its compact point and is about to take a new or unrelated task, or holds much that the next task does not need. A stopped member compacts at once, a running one after its current run. With message, the member then runs on message as if you sent it; without, a result you did not wait for arrives without starting a turn.",
+			`run, status, and compact wait up to waitMs (default ${DEFAULT_WAIT_MS}, max ${MAX_WAIT_MS}) and return the result if it finishes in time, otherwise its progress while it keeps running. A finished result you have not seen arrives later as a message; do not poll for it. Team messages for you arrive the same way.`,
 			"Members talk with you and each other through the team tool. A member starts with an empty conversation, so put the context it needs in message. A direct team message to a stopped member wakes it in its own session. A run woken by a member's message sends its final reply to that member, or to you when that member has stopped.",
 			"args are Pi command-line options: read docs/cli.md in the Pi documentation listed in your system prompt, or run `pi --help`. Session, mode, and model flags are set by this tool.",
 			"Progress showing no active tool and an old last event suggests a stall. Subagents cannot delegate further and end with this session.",
@@ -615,7 +784,7 @@ export default function setupParent(pi: ExtensionAPI) {
 			};
 			if (params.action === "run") {
 				const { agent, joined } = create(params, ctx);
-				launch(agent, params.message as string, MAIN);
+				launch(agent, { type: "prompt", message: params.message as string }, MAIN);
 				await waitFor(agent, waitMs, signal, true);
 				return result(agent, joined);
 			}
@@ -625,15 +794,30 @@ export default function setupParent(pi: ExtensionAPI) {
 				await waitFor(agent, waitMs, signal, true);
 				return result(agent);
 			}
+			if (params.action === "compact") {
+				const instructions = params.instructions?.trim();
+				if (instructions && instructions.length > BODY_CHARS) throw new Error(`instructions exceed ${BODY_CHARS} characters`);
+				if (agent.status === "compacting" || agent.queued) throw new Error(`${agent.id} is already compacting or has a compaction queued`);
+				const request = { instructions, message: params.message || undefined };
+				if (agent.status === "running") {
+					agent.queued = request;
+					return { content: [{ type: "text", text: `${header(agent)}\n\nCompaction queued after the current run.${footer(agent)}` }], details: undefined };
+				}
+				compact(agent, request);
+				await waitFor(agent, waitMs, signal, true);
+				return result(agent);
+			}
 			// This call returns the final state, so hold a waiter to keep it from also being delivered.
 			const hold = () => {};
 			agent.waiters.add(hold);
 			try {
-				if (agent.status === "running") agent.locked = true;
+				// A queued compaction holds messages until its run's process exits, which then routes them.
+				if (busy(agent) || agent.queued) agent.locked = true;
+				agent.queued = null;
 				if (agent.launching) {
 					// A wake still waiting for the previous process to exit: it never starts.
 					agent.launching = null;
-					onEnd(agent, "aborted", null);
+					onEnd(agent, "aborted", null, "main");
 				} else await agent.run?.stop(signal);
 			} finally {
 				agent.waiters.delete(hold);

@@ -50,7 +50,8 @@ const requestFor = (said) =>
 /** The model requests of team member `name`, recognized by its preamble. */
 const requestsBy = (name) => requests().filter((body) => body.messages.some((m) => m.role === "user" && rawText(m).startsWith(`[team] You are ${name},`)));
 const idOf = (text) => text.match(/^\[\w+\] subagent ([a-z][a-z0-9-]*)/)?.[1];
-const LIVE = /^\[running\] subagent [0-9a-z-]+(?: · \S+)? · turn \d+ · .+ · last event \d+s ago · \d+s(?: · [\d.]+[KM]? in · [\d.]+[KM]? out(?: · [\d.]+[KM]? cached)?(?: · <?\$\d+\.\d\d)?)?$/m;
+const LIVE =
+	/^\[running\] subagent [0-9a-z-]+(?: · \S+)? · turn \d+ · .+ · last event \d+s ago · \d+s(?: · [\d.]+[KM]? in · [\d.]+[KM]? out(?: · [\d.]+[KM]? cached)?(?: · <?\$\d+\.\d\d)?)?(?: · ctx [\d.]+[KM]?\/[\d.]+[KM]? \d+%)?$/m;
 // An idle parent gets a message through sendMessage (message_end); a busy one at a turn boundary (entry_appended).
 const asMessage = (e) =>
 	e.type === "message_end" && e.message?.role === "custom"
@@ -162,8 +163,9 @@ const notifications = (from = 0) => parent.messages(from).filter((m) => m.custom
 let first;
 await step("run returns the result when the child finishes within waitMs", async () => {
 	const r = await call({ action: "run", name: "first", message: "SAY hello" });
-	// One reply of 500 uncached and 1000 cached prompt tokens and 200 completion tokens, at the test model's price.
-	assert.match(r.text, /^\[settled\] subagent first · fake\/fake-model · 1 turns · \d+s · 500 in · 200 out · 1K cached · \$0\.26\n/);
+	// One reply of 500 uncached and 1000 cached prompt tokens and 200 completion tokens, at the test model's price;
+	// its 1700 context tokens against the compact point of Pi's default 128000-token window and 16384 reserve tokens.
+	assert.match(r.text, /^\[settled\] subagent first · fake\/fake-model · 1 turns · \d+s · 500 in · 200 out · 1K cached · \$0\.26 · ctx 1\.7K\/111\.6K 2%\n/);
 	assert.match(r.text, /hello$/);
 	assert.doesNotMatch(r.text, /\(Background:/);
 	first = idOf(r.text);
@@ -643,7 +645,7 @@ await step("a message that arrives while a member writes its final reply continu
 	assert.match(sent.text, /^Sent #\d+ to settler \(running\)\.$/);
 	const done = await team.call({ action: "status", id: "settler", waitMs: 30_000 });
 	// The usage of both replies of the run.
-	assert.match(done.text, /^\[settled\] subagent settler · fake\/fake-model · 2 turns · \d+s · 1K in · 400 out · 2K cached · \$0\.52\n.*notified$/s);
+	assert.match(done.text, /^\[settled\] subagent settler · fake\/fake-model · 2 turns · \d+s · 1K in · 400 out · 2K cached · \$0\.52 · ctx 1\.7K\/111\.6K 2%\n.*notified$/s);
 	const last = requestsBy("settler").at(-1).messages;
 	assert.equal(text(last.at(-2)), "first answer");
 	assert.match(text(last.at(-1)), /^\[team #\d+\] main → you \(direct\):\nlate news$/);
@@ -1034,6 +1036,195 @@ await step("a team member without the extension fails its run", async () => {
 	const r = await run({ name: "bare", message: "SAY x", args: ["--no-extensions", "-e", empty] });
 	assert.match(r.text, /^\[error\] subagent bare/);
 	assert.match(r.text, /team extension did not load/);
+});
+
+// A transport error that Pi does not retry.
+const DROP = "stream error: stream disconnected before completion: stream closed before response.completed";
+const escaped = (text) => text.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+
+await step("a provider error ends a run as an error with Pi's retry count; a running member that sent it a direct message is told, and its unread message resumes it", async () => {
+	await run({ name: "erring", message: `SLOW 4000 FAIL ${DROP}`, waitMs: 0 });
+	await until(() => requestsBy("erring").length > 0);
+	const mark = team.events.length;
+	await run({ name: "partner", message: TEAMS([{ action: "send", to: "erring", body: "SAY erring back" }, { action: "wait", ms: 60_000 }]), waitMs: 0 });
+	const status = (await team.call({ action: "status", id: "erring", waitMs: 30_000 })).text;
+	assert.match(status, new RegExp(`^\\[error\\] subagent erring · fake/fake-model · \\d+ turns · \\d+s · ${escaped(DROP)} \\(Pi retried 0 times\\)(\\n|$)`));
+	const told = "[team] erring stopped on an error; the main agent was told.";
+	await until(() => requestsBy("partner").some((body) => body.messages.some((m) => text(m) === told)));
+	const resumed = await team.waitMessage("subagent-notice", mark);
+	assert.equal(resumed.content, "[subagent] erring resumed (woken by partner) after its run ended in an error.");
+	for (const id of ["erring", "partner"]) await finished(id);
+});
+
+await step("a run that a member started and that ends on an error replies to that member; the main agent gets a notice that starts no turn", async () => {
+	const mark = team.events.length;
+	const r = await run({ name: "caller", message: TEAMS([{ action: "send", to: "erring", body: `SLOW 1000 FAIL ${DROP}` }, { action: "wait", ms: 60_000 }]), waitMs: 60_000 });
+	assert.match(r.text, /team: 1 team message\(s\) for you follow this result\./);
+	const reply = text(requestsBy("caller").at(-1).messages.at(-1));
+	const seq = reply.match(new RegExp(`^\\[team #(\\d+)\\] erring → you \\(direct\\):\\nFinal reply of erring \\(error\\); full text: .*final\\.md\\n\\n${escaped(DROP)}$`))?.[1] ?? assert.fail(reply);
+	const notices = team.messages(mark).filter((m) => m.customType === "subagent-notice").map((m) => m.content);
+	assert.deepEqual(notices, [`[subagent] erring stopped on an error; its final reply was sent to caller as team message #${seq}: ${DROP}`]);
+	assert.match((await teamCall({ action: "members" })).text, /\n- erring: stopped \(error\) — test member\n/);
+});
+
+await step("a run that an extension of the member aborts ends as aborted by an extension, and a member's message still wakes it; the main agent is told", async () => {
+	const selfAbort = join(WORK_DIR, "self-abort-extension.ts");
+	fs.writeFileSync(
+		selfAbort,
+		`export default function (pi) {
+	pi.on("message_end", (event, ctx) => {
+		if (event.message.role !== "assistant" || !JSON.stringify(event.message.content).includes("abort me")) return;
+		ctx.ui.notify("aborting myself", "warning");
+		ctx.abort();
+	});
+}
+`,
+	);
+	const r = await run({ name: "selfstop", message: "SAY abort me", args: ["-e", selfAbort] });
+	assert.match(r.text, /^\[aborted\] subagent selfstop · fake\/fake-model · [^\n]* · by an extension\n\nNotices: aborting myself\n\nabort me/);
+	assert.match((await teamCall({ action: "members" })).text, /\n- selfstop: stopped \(aborted\) — test member\n/);
+	const mark = team.events.length;
+	const knock = await run({ name: "knock", message: TEAM({ action: "send", to: "selfstop", body: "SAY back again" }) });
+	assert.match(knock.text, /team: Sent #\d+ to selfstop \(woken\)\./);
+	assert.equal((await team.waitMessage("subagent-notice", mark)).content, "[subagent] selfstop resumed (woken by knock) after its run was aborted.");
+	await report("selfstop", mark);
+});
+
+await step("Pi's own compaction of a member at its compact point shows in the run's result and context, with a notice that starts no turn", async () => {
+	const mark = team.events.length;
+	const r = await run({ name: "tiny", model: "fake/fake-small", message: "SAY tiny" });
+	// fake/fake-small compacts above 1000 context tokens; one reply holds 1700.
+	assert.match(r.text, /^\[settled\] subagent tiny · fake\/fake-small · 1 turns · \d+s · 500 in · 200 out · 1K cached · ctx ([\d.]+K?)\/1K \d+% · compacted 1\.7K→\1 \(threshold\)\n\ntiny/);
+	const notices = team.messages(mark).filter((m) => m.customType === "subagent-notice");
+	assert.ok(notices.length, "no compaction notice");
+	for (const notice of notices) assert.match(notice.content, /^\[subagent\] tiny compacted [\d.]+K?→[\d.]+K? \(threshold\) · ctx [\d.]+K?\/1K \d+%$/);
+});
+
+const compactor = join(WORK_DIR, "compact-extension.ts");
+// Takes compaction from Pi: "CANCEL" instructions cancel it and abort, "WAIT <ms>" holds it, and it ends with a fixed summary.
+fs.writeFileSync(
+	compactor,
+	`export default function (pi) {
+	pi.on("session_before_compact", async (event, ctx) => {
+		const wait = Number(event.customInstructions?.match(/^WAIT (\\d+)$/)?.[1] ?? 0);
+		if (wait) {
+			ctx.ui.notify("compaction waits", "info");
+			await new Promise((done) => {
+				const timer = setTimeout(done, wait);
+				event.signal.addEventListener("abort", () => (clearTimeout(timer), done()));
+			});
+		}
+		if (event.customInstructions === "CANCEL") {
+			ctx.ui.notify("compaction refused", "warning");
+			ctx.abort();
+			return { cancel: true };
+		}
+		return { compaction: { summary: "fixed summary", firstKeptEntryId: event.preparation.firstKeptEntryId, tokensBefore: event.preparation.tokensBefore } };
+	});
+}
+`,
+);
+/** The compaction entries in member `id`'s session. */
+const compactionsOf = async (id) => {
+	const dir = join((await team.request({ type: "get_state" })).data.sessionFile.replace(/\.jsonl$/, ""), "subagents", id);
+	return fs
+		.readdirSync(dir)
+		.filter((file) => file.endsWith(".jsonl"))
+		.flatMap((file) => fs.readFileSync(join(dir, file), "utf8").split("\n"))
+		.filter((line) => line.includes('"type":"compaction"')).length;
+};
+
+await step("compact compacts a stopped member; an extension that takes compaction decides the summary or cancels it; with message, a member with nothing to compact runs on it", async () => {
+	await run({ name: "keeper", model: "fake/fake-keep", args: ["-e", compactor], message: "SAY kept" });
+	// fake/fake-keep has a 100000-token window and Pi's default 16384 reserve tokens.
+	const refused = await team.call({ action: "compact", id: "keeper", instructions: "CANCEL" });
+	assert.match(refused.text, /^\[error\] subagent keeper · fake\/fake-keep · 0 turns · \d+s · ctx 1\.7K\/83\.6K 2% · compaction failed: Compaction cancelled\n\nNotices: compaction refused(\n|$)/);
+	assert.equal(await compactionsOf("keeper"), 0);
+	const compacted = await team.call({ action: "compact", id: "keeper", instructions: "keep the reply" });
+	assert.match(compacted.text, /^\[compacted\] subagent keeper · fake\/fake-keep · \d+s · ctx ([\d.]+K?)\/83\.6K \d+% · compacted 1\.7K→\1 \(manual\)(\n|$)/);
+	assert.equal(await compactionsOf("keeper"), 1);
+	assert.match((await teamCall({ action: "members" })).text, /\n- keeper: stopped — test member\n/);
+	const continued = await team.call({ action: "compact", id: "keeper", message: "SAY continued" });
+	assert.match(continued.text, /^\[settled\] subagent keeper · fake\/fake-keep · 1 turns · [^\n]* · Already compacted\n\ncontinued/);
+});
+
+await step("compact on a running member waits for its run; with message, the member runs on it once compacted", async () => {
+	const mark = team.events.length;
+	await run({ name: "busyc", model: "fake/fake-keep", message: "SLOW 3000 SAY first", waitMs: 0 });
+	const queued = await team.call({ action: "compact", id: "busyc", message: "SAY after compaction" });
+	assert.match(queued.text, /^\[running\] subagent busyc [^\n]*\n\nCompaction queued after the current run\./);
+	const again = await team.call({ action: "compact", id: "busyc" });
+	assert.ok(again.isError, again.text);
+	assert.match(again.text, /busyc is already compacting or has a compaction queued/);
+	const done = await team.waitEvent((e) => asMessage(e)?.customType === "subagent-result" && asMessage(e).content.trimEnd().endsWith("after compaction"), mark);
+	assert.match(asMessage(done).content, /^\[settled\] subagent busyc · fake\/fake-keep · 1 turns · [^\n]* · compacted 1\.7K→[\d.]+K? \(manual\)\n\nafter compaction/);
+	assert.ok(team.messages(mark).some((m) => m.customType === "subagent-result" && /^\[settled\] subagent busyc[^\n]*\n\nfirst$/.test(m.content)), "the first run's result is missing");
+	await team.waitEvent((e) => e.type === "agent_settled", team.events.indexOf(done));
+});
+
+await step("a direct message to a compacting member waits until the compaction ends; abort stops a compaction, and Pi records none", async () => {
+	await run({ name: "slowc", model: "fake/fake-keep", args: ["-e", compactor], message: "SAY slowc ready" });
+	const mark = team.events.length;
+	assert.match((await team.call({ action: "compact", id: "slowc", instructions: "WAIT 4000", waitMs: 0 })).text, /^\[compacting\] subagent slowc /);
+	assert.match((await teamCall({ action: "members" })).text, /\n- slowc: compacting — test member\n/);
+	assert.match((await teamCall({ action: "send", to: "slowc", body: "SAY read afterwards" })).text, /^Sent #\d+ to slowc \(compacting; reads it afterwards\)\.$/);
+	// The compaction run's result joins the session without a turn; the message then wakes the member.
+	const compacted = await team.waitMessage("subagent-result", mark);
+	assert.match(compacted.content, /^\[compacted\] subagent slowc · fake\/fake-keep · \d+s · ctx [\d.]+K?\/83\.6K \d+% · compacted 1\.7K→[\d.]+K? \(manual\)\n\nNotices: compaction waits$/);
+	assert.match(await report("slowc", compacted.at + 1), /read afterwards$/);
+	const before = await compactionsOf("slowc");
+	await team.call({ action: "compact", id: "slowc", instructions: "WAIT 30000", waitMs: 0 });
+	// Pi has started the compaction once the extension holds it.
+	let progress = "";
+	for (const end = Date.now() + 30_000; !progress.includes("Notices: compaction waits"); await sleep(200)) {
+		if (Date.now() > end) assert.fail(progress);
+		progress = (await team.call({ action: "status", id: "slowc", waitMs: 0 })).text;
+	}
+	const started = Date.now();
+	assert.match((await team.call({ action: "abort", id: "slowc" })).text, /^\[aborted\] subagent slowc · [^\n]* · by main(\n|$)/);
+	assert.ok(Date.now() - started < 8000, "abort waited for the kill timeout");
+	assert.equal(await compactionsOf("slowc"), before);
+});
+
+await step("the main agent's direct message to a member it aborted, sent during a compaction, wakes it once the compaction ends", async () => {
+	await run({ name: "lockc", model: "fake/fake-keep", args: ["-e", compactor], message: "SAY lockc ready" });
+	await teamCall({ action: "send", to: "lockc", body: "HANG" });
+	await until(() => requestsBy("lockc").length > 1);
+	assert.match((await team.call({ action: "abort", id: "lockc" })).text, /^\[aborted\] subagent lockc /);
+	const mark = team.events.length;
+	assert.match((await team.call({ action: "compact", id: "lockc", instructions: "WAIT 3000", waitMs: 0 })).text, /^\[compacting\] subagent lockc /);
+	assert.match((await teamCall({ action: "send", to: "lockc", body: "SAY unlocked" })).text, /^Sent #\d+ to lockc \(compacting; reads it afterwards\)\.$/);
+	const compacted = await team.waitMessage("subagent-result", mark);
+	assert.match(compacted.content, /^\[compacted\] subagent lockc /);
+	assert.match(await report("lockc", compacted.at + 1), /unlocked$/);
+});
+
+await step("a member with a queued compaction is not woken between the end of its run and the compaction; an abort there locks it", async () => {
+	const slowExit = join(WORK_DIR, "slow-exit-extension.ts");
+	// Holds the member's process for 3 seconds after each run ends, within the extension's 5-second kill timeout.
+	fs.writeFileSync(slowExit, 'export default function (pi) { pi.on("session_shutdown", () => new Promise((done) => setTimeout(done, 3000))); }\n');
+	const args = ["-e", compactor, "-e", slowExit];
+	await run({ name: "gapc", model: "fake/fake-keep", args, message: "SLOW 1000 SAY gapc first", waitMs: 0 });
+	assert.match((await team.call({ action: "compact", id: "gapc", instructions: "WAIT 1000" })).text, /Compaction queued after the current run\./);
+	assert.match((await team.call({ action: "status", id: "gapc", waitMs: 30_000 })).text, /^\[settled\] subagent gapc [^\n]*\n\ngapc first/);
+	let mark = team.events.length;
+	assert.match((await teamCall({ action: "send", to: "gapc", body: "SAY after the compaction" })).text, /^Sent #\d+ to gapc \(compacting; reads it afterwards\)\.$/);
+	// The run's process has not exited, so the compaction has not started.
+	assert.match((await team.call({ action: "status", id: "gapc", waitMs: 0 })).text, /^\[settled\] subagent gapc /);
+	const compacted = await team.waitMessage("subagent-result", mark);
+	assert.match(compacted.content, /^\[compacted\] subagent gapc /);
+	assert.match(await report("gapc", compacted.at + 1), /after the compaction$/);
+	// The same gap again, now ended by abort: the member is locked, and the message held for after the compaction does not wake it.
+	assert.match((await teamCall({ action: "send", to: "gapc", body: "SLOW 1000 SAY gapc second" })).text, /\(woken\)\.$/);
+	assert.match((await team.call({ action: "compact", id: "gapc", instructions: "WAIT 1000" })).text, /Compaction queued after the current run\./);
+	assert.match((await team.call({ action: "status", id: "gapc", waitMs: 30_000 })).text, /^\[settled\] subagent gapc [^\n]*\n\ngapc second/);
+	mark = team.events.length;
+	assert.match((await teamCall({ action: "send", to: "gapc", body: "SAY should not run" })).text, /\(compacting; reads it afterwards\)\.$/);
+	assert.match((await team.call({ action: "abort", id: "gapc" })).text, /^\[settled\] subagent gapc /);
+	const before = requestsBy("gapc").length;
+	await sleep(5000);
+	assert.equal(requestsBy("gapc").length, before, "the held message woke the member");
+	assert.ok(!team.messages(mark).some((m) => m.customType === "subagent-result"), "a run or compaction followed the abort");
 });
 
 const teamMessages = async (parent) =>

@@ -72,10 +72,14 @@ interface TopicRecord {
 
 export interface TeamHost {
 	isRunning(name: string): boolean;
+	/** The member's state as the roster shows it: running, compacting, stopped, stopped (error), or stopped (aborted). */
+	state(name: string): string;
 	/** Who started the member's current or last run: main, or the member whose message woke it. Main itself: main. */
 	startedBy(name: string): string;
 	/** The main agent aborted the member, so only its direct message wakes it. */
 	locked(name: string): boolean;
+	/** Lifts the lock: the main agent's direct message authorizes the member's next run. */
+	unlock(name: string): void;
 	/** Starts a stopped member's next run for a direct message from `by`. */
 	wake(name: string, by: string): void;
 	/** Delivers a message to the main agent. */
@@ -126,6 +130,11 @@ export function createTeam(pi: ExtensionAPI, host: TeamHost) {
 	const ping = (name: string) => {
 		for (const wake of [...(waiters.get(name) ?? [])]) wake();
 	};
+	/** Queues a notice for running member `name`'s next pull and ends its wait. */
+	const tell = (name: string, text: string) => {
+		notices.set(name, [...(notices.get(name) ?? []), text]);
+		ping(name);
+	};
 
 	const append = (...records: (MemberRecord | MessageRecord | TopicRecord)[]) => {
 		// The first write creates the log, which starts with the team's id.
@@ -140,7 +149,7 @@ export function createTeam(pi: ExtensionAPI, host: TeamHost) {
 		return name;
 	};
 
-	const state = (name: string) => (name === MAIN ? "main agent" : host.isRunning(name) ? "running" : "stopped");
+	const state = (name: string) => (name === MAIN ? "main agent" : host.state(name));
 
 	const roster = () =>
 		[
@@ -216,7 +225,14 @@ export function createTeam(pi: ExtensionAPI, host: TeamHost) {
 	const route = (message: MessageRecord, name: string) => {
 		if (name === MAIN) return MAIN;
 		if (host.isRunning(name)) return `${name} (running)`;
-		if (message.to === BOARD) return `${name} (stopped; board posts do not wake)`;
+		const compacting = host.state(name) === "compacting";
+		if (message.to === BOARD) return `${name} (${compacting ? "compacting" : "stopped"}; board posts do not wake)`;
+		// The member's process exit routes the message again, as for a message that reached a run after its last read.
+		if (compacting) {
+			// As when it wakes a stopped member; a later abort locks it again.
+			if (message.from === MAIN) host.unlock(name);
+			return `${name} (compacting; reads it afterwards)`;
+		}
 		const block: Block | undefined = message.hop1 ? "hop" : message.from !== MAIN && host.locked(name) ? "abort" : undefined;
 		if (!block) {
 			wake(name, message);
@@ -495,11 +511,18 @@ export function createTeam(pi: ExtensionAPI, host: TeamHost) {
 				if (message.from === MAIN || !(locked || message.hop1)) continue;
 				tellMain(message, name, locked ? "abort" : "hop");
 				if (locked || !host.isRunning(message.from)) continue;
-				notices.set(message.from, [
-					...(notices.get(message.from) ?? []),
+				tell(
+					message.from,
 					`[team] #${message.seq} to ${name} was not delivered: ${name} stopped before reading it, and your run cannot wake it. It waits in ${name}'s inbox; the main agent was told.\n\n`,
-				]);
-				ping(message.from);
+				);
+			}
+		},
+
+		/** Tells each running member other than `except` that sent `name` a direct message at or after `since` that `name` stopped on an error. */
+		stoppedOnError(name: string, since: number, except: string) {
+			const senders = new Set(messages.filter((message) => message.to !== BOARD && message.to.includes(name) && message.at >= since).map((message) => message.from));
+			for (const sender of senders) {
+				if (sender !== MAIN && sender !== except && host.isRunning(sender)) tell(sender, `[team] ${name} stopped on an error; the main agent was told.\n\n`);
 			}
 		},
 

@@ -1,5 +1,5 @@
 // Scripted OpenAI-compatible endpoint for the end-to-end test; logs every request body.
-// Team messages (user messages starting with "[team") are skipped, except that a woken member's launch note
+// Team messages and subagent notices (user messages starting with "[team" or "[subagent]") are skipped, except that a woken member's launch note
 // ("... sent you a team message. Act on ...") is replaced by the body of the last team message its run starts with,
 // without the board digest that may follow it.
 // The last other message decides the reply:
@@ -16,7 +16,8 @@
 //   "TEAMS <a> || <b> ..."            → a `team` call with <a>
 //   "RELOAD"                         → a `reload_now` tool call
 //   "BASH <command>"                 → a `bash` tool call running <command>
-//   "[settled|aborted|error] ..."    → "notified" (a delivered subagent result)
+//   "[settled|aborted|error|compacted] ..." → "notified" (a delivered subagent result)
+//   "FAIL <message>"                 → a stream that fails with <message>
 //   "SLOW <ms> <rest>"               → wait, then handle <rest>
 //   "HANG"                           → never answer
 //   "TOOLS?"                         → the declared tool names
@@ -34,7 +35,7 @@ const callOf = (m) => script(m).replace(/^SLOW \d+ /, "");
 const sleep = (ms) => new Promise((done) => setTimeout(done, ms));
 const CALLS = /^CALLS (\d+) (\{.*?\}) \|\| (\{.*\})$/s;
 const WOKEN = /sent you a team message\. Act on your team messages/;
-const isTeam = (m) => m.role === "user" && text(m).startsWith("[team");
+const isTeam = (m) => m.role === "user" && /^\[(team|subagent\])/.test(text(m));
 /** The body of the last team message in a run's start message. */
 const lastBody = (start) => text(start).split(/\[team #\d+\][^\n]*:\n/).at(-1).split("\n[team] Board: ")[0].trim();
 
@@ -69,13 +70,14 @@ async function reply(body) {
 	const calls = said.match(CALLS);
 	if (calls) return { call: calls[2] };
 	if (said.startsWith("CALL ")) return { call: said.slice(5).replace(/ HOLD$/, "") };
-	if (/^\[(settled|aborted|error)\]/.test(said)) return { content: "notified" };
+	if (/^\[(settled|aborted|error|compacted)\]/.test(said)) return { content: "notified" };
 	const slow = said.match(/^SLOW (\d+) ([\s\S]*)$/);
 	if (slow) {
 		await sleep(Number(slow[1]));
 		said = slow[2];
 	}
 	if (said === "HANG") return { hang: true };
+	if (said.startsWith("FAIL ")) return { fail: said.slice(5) };
 	if (said.startsWith("TEAM ")) return { call: said.slice(5), name: "team" };
 	if (said.startsWith("TEAMS ")) return { call: said.slice(6).split(" || ")[0], name: "team" };
 	if (said === "RELOAD") return { call: "{}", name: "reload_now" };
@@ -99,6 +101,8 @@ http
 			const answer = await reply(body);
 			res.writeHead(200, { "content-type": "text/event-stream" });
 			if (answer.hang) return; // the client aborts
+			// An error event in the stream, which the OpenAI SDK raises with its message.
+			if (answer.fail) return res.end(`data: ${JSON.stringify({ error: { message: answer.fail } })}\n\n`);
 			const chunk = (choices, extra = {}) =>
 				res.write(`data: ${JSON.stringify({ id: "c", object: "chat.completion.chunk", created: 0, model: "fake-model", choices, ...extra })}\n\n`);
 			const delta = answer.call

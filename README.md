@@ -20,18 +20,20 @@ To try it for one run: `pi -e /path/to/pi-subagent-rpc-extension`. Subagents do 
 |---|---|---|
 | `run` | `name`, `description`, `message`, `model`, `cwd`, `args`, `waitMs` | Hires a member named `name`, announces it on the board, and starts it on `message`. |
 | `status` | `id`, `waitMs` | Reports progress or the result. Without `id`, lists every member. |
-| `abort` | `id` | Stops the current run. A run that Pi has not started yet, or that does not stop within 10 seconds, is killed; a wake still waiting for the previous process never starts. The member then wakes only for a direct message from the main agent. |
+| `abort` | `id` | Stops the current run or compaction and cancels a queued compaction. A run that Pi has not started yet, or that does not stop within 10 seconds, is killed; a wake still waiting for the previous process never starts. The member then wakes only for a direct message from the main agent. |
+| `compact` | `id`, `instructions`, `message`, `waitMs` | Compacts the member's context with Pi's compaction; see [Compaction](#compaction). |
 
 - `name`: required, and the member's id. Names are 2 to 24 lowercase letters, digits, or hyphens, start with a letter, and do not end with a hyphen. `main`, `all`, and `team` are reserved, and a name is used once per team: `run` on an existing member fails, and a direct message gives it more work.
 - `description`: required, the member's lasting role rather than its current task, in one line of at most 100 characters, such as `runs the e2e suite and reports failures`. The team roster shows it, and hiring posts `joined: <name> — <description>` to the board from `main`.
-- `message`: the task. A member starts with an empty conversation, so `message` carries the context it needs.
+- `message`: the task. A member starts with an empty conversation, so `message` carries the context it needs. For `compact`, the task the member runs once compacted.
+- `instructions`: for `compact`, Pi's custom instructions for the summary, saying what it keeps; up to 4000 characters.
 - `model`: a Pi model pattern, `provider/id[:thinking]`. Default: the parent's current model and thinking level.
 - `cwd`: the member's working directory, relative to the parent's. Default: the parent's.
 - `args`: extra Pi command-line options, such as `--tools`, `--no-extensions`, `-e`, `--no-mcp`, or `--thinking`. The extension sets the mode, session, and model flags itself and rejects them here, along with args that remove the `team` tool.
 
 ## Waiting and results
 
-`run` and `status` wait up to `waitMs` (default 30000, maximum 240000); `waitMs: 0` returns at once. A member that finishes in time returns its final reply as the tool result. Otherwise the result is a progress report and the member keeps running:
+`run`, `status`, and `compact` wait up to `waitMs` (default 30000, maximum 240000); `waitMs: 0` returns at once. A member that finishes in time returns its final reply as the tool result. Otherwise the result is a progress report and the member keeps running:
 
 ```text
 [running] subagent reviewer · openai/gpt-5 · turn 4 · bash (npm test -- --reporter dot) 2m10s · last event 3s ago · 5m02s · 48.2K in · 3.1K out · 1.2M cached · $0.42
@@ -39,6 +41,18 @@ To try it for one run: `pi -e /path/to/pi-subagent-rpc-extension`. Subagents do 
 ```
 
 The status line of a progress report shows each running tool with its main argument, such as its command, path, code, or query, in one line cut to about 60 characters. The status line of a progress report or result ends with the run's token usage, summed over its model replies: input tokens, cache writes included; output tokens; cache reads, when there are any; and the cost, when the model has a price.
+
+Once known, the status line also shows the member's context as `ctx 212K/300K 71%`: the context tokens of its last model reply, or Pi's estimate after its last compaction, against its [compact point](#compaction). The context stays known across runs. A run that did not settle ends its status line with how it ended:
+
+```text
+[error] subagent tester · openai/gpt-5 · 3 turns · 2m10s · 48.2K in · 3.1K out · ctx 52K/300K 17% · stream error: stream disconnected before completion: stream closed before response.completed (Pi retried 0 times)
+[aborted] subagent tester · openai/gpt-5 · 2 turns · 41s · 20.1K in · 1.2K out · ctx 31K/300K 10% · by an extension
+```
+
+- `[error]`: the error in one line, followed in full when it is longer, and, for a failed model request, how many times Pi retried it. Retries are Pi's own; a progress report shows one in progress as `retrying (2/3): <error>`.
+- `[aborted]`: `by main` after `abort`, or `by an extension` when an extension inside the member aborted the run, such as with `ctx.abort()`.
+
+The main agent also gets `subagent-notice` messages, which never start a turn: about Pi's compaction of a running member, about a member's message that woke a member whose last run ended in an error or was aborted (`[subagent] tester resumed (woken by reviewer) after its run ended in an error.`), and about an error in a run that a member's message started while that member still runs, since the final reply goes to that member. When a run ends in an error, each running member that sent it a direct message during the run gets `[team] tester stopped on an error; the main agent was told.`
 
 Each result for the main agent reaches it once; after a move in the session tree, each member's latest result also reaches the new branch once if that branch lacks it. A result that no tool call returned arrives as a `subagent-result` message. Team messages for the main agent arrive the same way, as `team-message` messages:
 
@@ -51,12 +65,33 @@ A later tool call about a delivered member shows its status line, where the resu
 Results about one member end with the other members still running, up to three:
 
 ```text
-(Background: reviewer running 4m10s, tester running 12m00s · no event 9m00s.)
+(Background: reviewer running 4m10s · ctx 212K/300K 71%, tester compacting 12s, coder running 12m00s · no event 9m00s.)
 ```
 
-`no event` appears after a minute without activity. A progress report or footer entry with no active tool and an old last event points to a stalled member.
+`no event` appears after a minute without activity; `compacting` marks a member in a [compaction](#compaction) run. A progress report or footer entry with no active tool and an old last event points to a stalled member.
 
 Progress reports and results also show a `Notices:` line with the last three `ctx.ui.notify` texts that the member's extensions sent after the run started, such as the reason an extension stopped it.
+
+## Compaction
+
+Pi compacts a running member's context itself once the context passes the member's compact point: the model's context window minus `compaction.reserveTokens` from Pi's settings, which `compaction.modelOverrides` sets per model. For example, a 1M-token model with
+
+```json
+{ "compaction": { "modelOverrides": { "some-provider/big-model": { "reserveTokens": 700000 } } } }
+```
+
+compacts above about 300K tokens. The `ctx` share uses the same compact point, read through Pi's settings for the member's working directory; with `compaction.enabled` set to false, it uses the context window. During a compaction the progress report shows `compacting`. Afterwards the run's status line shows `compacted 312K→24K (threshold)`, with `overflow` or `manual` for the other kinds, or `compaction failed: <reason>`, and the main agent gets a `subagent-notice`.
+
+`compact` compacts a member on request; a member that is past about 60% of its compact point and about to take a new or unrelated task, or that holds much the next task does not need, is a candidate.
+
+- A stopped member compacts at once in a process of its own. A result of its last run that the main agent has not received arrives first. Meanwhile the member's state is `compacting`, and it is never woken: a direct message to it shows `compacting; reads it afterwards` and is routed when the compaction ends, as for a message that reached a run after its last read.
+- A running member compacts after its current run's process exits, and the result reads `Compaction queued after the current run.` A second `compact` before the compaction ends fails.
+- `abort` cancels a queued compaction or stops the compaction in progress, after which Pi records no compaction, and locks the member as after any abort.
+- A compacted member's result reads `[compacted] subagent tester · openai/gpt-5 · 18s · ctx 24K/300K 8% · compacted 312K→24K (manual)`; Pi's `Nothing to compact (session too small)` and `Already compacted` also end as `[compacted]`, with that text. A failure, such as an extension that cancels the compaction or a provider error, ends as `[error] … · compaction failed: <reason>`, with the extensions' notices.
+- With `message`, a compacted member then runs on `message` as if the main agent started it, which also unlocks a member the main agent aborted; that run's result arrives as usual and its status line shows the compaction. After a failure the member does not run, and the result starts a turn.
+- Without `message`, a result that `waitMs` does not cover arrives as a `subagent-result` that starts no turn, and a locked member stays locked.
+
+The member's extensions take part in both kinds of compaction as in any Pi session, for example through `session_before_compact`.
 
 ## The `team` tool
 
@@ -67,7 +102,7 @@ The main agent (`main`) and every member have it.
 | `send` | `body`, `to`, `mentions`, `replyTo` | Posts to the board (no `to`) or sends one direct message to `to`, a member name, `main`, or a list of them. Returns `#seq` and what happened for each recipient. |
 | `history` | `with`, `query`, `before`, `limit` | Reads the board, or the caller's direct messages with `with`; for the main agent, every direct message of the member named in `with`. `query` matches text case-insensitively. Oldest first, at most `limit` messages (default 20, maximum 50) and 16000 characters; `before=<seq>` pages back. |
 | `wait` | `ms` | Returns once a message for the caller is pending, or after `ms` (default 30000, maximum 240000). The messages follow the tool result. |
-| `members` | | Members with their states and roles, such as `- tester: running — runs the e2e suite and reports failures`, and the topic. |
+| `members` | | Members with their states (`running`, `compacting`, `stopped`, `stopped (error)`, or `stopped (aborted)`) and roles, such as `- tester: running — runs the e2e suite and reports failures`, and the topic. |
 | `topic` | `body` | Sets the topic (main agent only). |
 
 `body` holds up to 4000 characters and `topic` up to 2000. Larger content belongs in files in the shared working tree, with the path in the message.
@@ -97,6 +132,7 @@ A direct message to a stopped member wakes it: the member runs again in its own 
 | Recipient | Result |
 |---|---|
 | Running member | `running`: it reads the message at its next safe point. |
+| Member in a compaction run | `compacting; reads it afterwards`: once the compaction ends, the message is routed as for a stopped member. |
 | Stopped, direct message from the main agent, or from a member that `run` or the main agent's message started | `woken`. |
 | Stopped, direct message from a run that another member's message woke | Not woken: such a run cannot start others. |
 | Stopped, direct message from a member after the main agent aborted the recipient | Not woken: only the main agent's direct message wakes it. |
