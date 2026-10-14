@@ -306,6 +306,65 @@ await step("after Esc, a later result does not start a turn; the next prompt end
 	await waitEvent((e) => e.type === "agent_settled", mark);
 });
 
+for (const aborted of [true, false]) {
+	await step(`a result arriving during an earlier settle handler ${aborted ? "does not undo Esc" : "still wakes a normally settled parent"}`, async () => {
+		const member = aborted ? "settle-aborted" : "settle-normal";
+		const gate = join(WORK_DIR, `settle-${aborted}`);
+		const extension = `${gate}.ts`;
+		fs.writeFileSync(extension, `import { existsSync } from "node:fs";
+export default function (pi) {
+	let held = false;
+	const wait = async (path) => { while (!existsSync(path)) await new Promise((done) => setTimeout(done, 20)); };
+	pi.on("before_agent_start", async (event) => {
+		if (event.prompt === "SAY settle-result") await wait(${JSON.stringify(`${gate}-child`)});
+		if (event.prompt === "HANG" || event.prompt === "SAY settle-parent") held = true;
+	});
+	pi.on("agent_settled", async (_event, ctx) => {
+		if (!held) return;
+		held = false;
+		ctx.ui.notify("settle held", "info");
+		await wait(${JSON.stringify(`${gate}-parent`)});
+	});
+}
+`);
+		// The fixture's awaited handler runs before the subagent extension's suspension update.
+		const p = startParent(["--session-dir", join(WORK_DIR, `settle-sessions-${aborted}`), "--no-extensions", "-e", extension, "-e", fileURLToPath(new URL("..", import.meta.url))]);
+		current = p;
+		try {
+			await p.call({ action: "run", name: member, message: "SAY settle-result", args: ["-e", extension], waitMs: 0 });
+			const { sessionFile } = (await p.request({ type: "get_state" })).data;
+			const final = join(sessionFile.replace(/\.jsonl$/, ""), "subagents", member, "final.md");
+			const from = p.events.length;
+			p.prompt(aborted ? "HANG" : "SAY settle-parent");
+			await p.waitEvent((e) => e.type === "agent_start", from);
+			const stop = aborted ? p.request({ type: "abort" }) : undefined;
+			await p.waitEvent((e) => e.type === "extension_ui_request" && e.message === "settle held", from);
+			fs.writeFileSync(`${gate}-child`, "");
+			await until(() => fs.existsSync(final));
+			// The parent wrote the final reply; let its completion callback finish before releasing settlement.
+			await p.request({ type: "get_state" });
+			fs.writeFileSync(`${gate}-parent`, "");
+			const settled = await p.waitEvent((e) => e.type === "agent_settled", from);
+			assert.equal(settled.aborted, aborted);
+			if (!aborted) {
+				const started = await p.waitEvent((e) => e.type === "agent_start", p.events.indexOf(settled) + 1);
+				await p.waitEvent((e) => e.type === "agent_settled", p.events.indexOf(started));
+			}
+			// RPC abort responds after Pi is idle, including any wrongly restarted run.
+			if (stop) assert.equal((await stop).success, true);
+			assert.equal(p.events.slice(from).filter((e) => e.type === "agent_start").length, aborted ? 1 : 2);
+			const { entries } = (await p.request({ type: "get_entries" })).data;
+			const results = entries.filter((e) => e.type === "custom_message" && e.customType === "subagent-result" && e.details?.id === member);
+			assert.equal(results.length, 1);
+			assert.match(results[0].content, /settle-result\s*$/);
+		} finally {
+			fs.writeFileSync(`${gate}-child`, "");
+			fs.writeFileSync(`${gate}-parent`, "");
+			await p.close();
+		}
+	});
+}
+
 await step("a result returned by a call is not delivered again", async () => {
 	const from = events.length;
 	const r = await call({ action: "run", name: "quick", message: "SLOW 300 SAY quick", waitMs: 10_000 });
@@ -737,24 +796,30 @@ await step("a direct message to several members from a run woken by a member wak
 	);
 });
 
-await step("a member the main agent aborted wakes only for the main agent's direct message", async () => {
-	await run({ name: "locked", message: "HANG", waitMs: 300 });
-	assert.match((await team.call({ action: "abort", id: "locked", retire: false })).text, /^\[aborted\]/);
-	const from = team.events.length;
-	// The notice ends run's wait, as a team message does, and joins the session after that tool call.
-	const knock = await run({ name: "knocker", message: TEAM({ action: "send", to: "locked", body: "SAY knocked" }) });
-	assert.match(knock.text, /Returned early: subagent messages follow this result\./);
-	const notice = await team.waitMessage("team-notice", from, 1000);
-	assert.match(notice.content, /^\[team\] #\d+ knocker → locked is waiting in locked's inbox: you stopped locked with abort, so knocker's message cannot wake it\./);
-	const toolEnd = team.events.findIndex((e, i) => i >= from && e.type === "tool_execution_end");
-	const settled = team.events.findIndex((e, i) => i > toolEnd && e.type === "agent_settled");
-	assert.ok(toolEnd < notice.at && notice.at < settled, "the notice did not join after the tool call");
-	assert.match(await report("knocker", from), /team: Sent #\d+ to locked \(stopped, not woken: the main agent stopped it; the main agent was told\)\.$/);
-	const mark = team.events.length;
-	const woke = await teamCall({ action: "send", to: "locked", body: "SAY unlocked" });
-	assert.match(woke.text, /^Sent #\d+ to locked \(woken\)\.$/);
-	assert.match(await report("locked", mark), /^\[settled\] subagent locked.*unlocked$/s);
-});
+for (const stopped of [false, true]) {
+	await step(`a ${stopped ? "stopped" : "running"} member the main agent aborted wakes only for the main agent's direct message`, async () => {
+		const name = stopped ? "locked-stopped" : "locked";
+		const sender = stopped ? "knocker-stopped" : "knocker";
+		await run({ name, message: stopped ? "SAY ready" : "HANG", waitMs: stopped ? 30_000 : 300 });
+		assert.match((await team.call({ action: "abort", id: name, retire: false })).text, stopped ? /^\[settled\]/ : /^\[aborted\]/);
+		const before = requestsBy(name).length;
+		const from = team.events.length;
+		// The notice ends run's wait, as a team message does, and joins the session after that tool call.
+		const knock = await run({ name: sender, message: TEAM({ action: "send", to: name, body: "SAY knocked" }) });
+		assert.match(knock.text, /Returned early: subagent messages follow this result\./);
+		const notice = await team.waitMessage("team-notice", from, 1000);
+		assert.ok(notice.content.includes(`${sender} → ${name} is waiting in ${name}'s inbox: you stopped ${name} with abort, so ${sender}'s message cannot wake it.`), notice.content);
+		const toolEnd = team.events.findIndex((e, i) => i >= from && e.type === "tool_execution_end");
+		const settled = team.events.findIndex((e, i) => i > toolEnd && e.type === "agent_settled");
+		assert.ok(toolEnd < notice.at && notice.at < settled, "the notice did not join after the tool call");
+		assert.ok((await report(sender, from)).includes(`to ${name} (stopped, not woken: the main agent stopped it; the main agent was told).`));
+		assert.equal(requestsBy(name).length, before, "the member's message woke the aborted recipient");
+		const mark = team.events.length;
+		const woke = await teamCall({ action: "send", to: name, body: "SAY unlocked" });
+		assert.ok(woke.text.endsWith(`to ${name} (woken).`), woke.text);
+		assert.match(await report(name, mark), /^\[settled\] subagent .*unlocked$/s);
+	});
+}
 
 await step("abort stops a woken member before its run starts; extension notices from the run show in its result", async () => {
 	const slow = join(WORK_DIR, "slow-start-extension.ts");
@@ -1893,7 +1958,7 @@ await step("of many team messages a branch lacks, the latest ten arrive in full 
 	}
 });
 
-await step("a result that arrives while a prompt's run is starting finds the board digest already on the branch", async () => {
+await step("a result arriving while a prompt's run is starting and its board digest each arrive once", async () => {
 	const pre = startParent(["--session-dir", treeSessions, ...treeArgs]);
 	current = pre;
 	try {
@@ -1902,13 +1967,13 @@ await step("a result that arrives while a prompt's run is starting finds the boa
 		await until(() => requestsBy("whiskey").length >= 2);
 		const from = pre.events.length;
 		pre.prompt("SAY preflight");
-		const result = await resultArrives(pre, from);
+		await resultArrives(pre, from);
 		const answered = await pre.waitEvent((e) => e.type === "message_end" && e.message.role === "assistant" && text(e.message) === "preflight", from);
-		await pre.waitEvent((e) => e.type === "agent_settled", pre.events.indexOf(answered));
+		const settled = await pre.waitEvent((e) => e.type === "agent_settled", pre.events.indexOf(answered));
+		assert.equal(settled.aborted, false);
 		await sleep(1000);
-		const prompted = pre.events.findIndex((e, i) => i >= from && e.type === "message_start" && e.message.role === "user" && text(e.message) === "SAY preflight");
-		assert.ok(prompted === -1 || result.at < prompted, "the result came after the prompt joined the session");
 		const { entries } = (await pre.request({ type: "get_entries" })).data;
+		assert.equal(entries.filter((e) => e.customType === "subagent-result" && e.details?.id === "whiskey").length, 1);
 		assert.equal(entries.filter((e) => e.customType === "team-notice" && e.content.includes("whiskey news")).length, 1);
 	} finally {
 		await pre.close();

@@ -2,7 +2,7 @@
  * One run of a subagent: a `pi --mode rpc` process that lives from its launch command, a prompt or a compaction,
  * until the run concludes. It reports events, child requests, and the run's end to its owner.
  */
-import { type ChildProcessWithoutNullStreams, spawn } from "node:child_process";
+import { spawn } from "node:child_process";
 import { randomBytes } from "node:crypto";
 import { readFileSync } from "node:fs";
 import { join } from "node:path";
@@ -12,6 +12,7 @@ import { CHILD_ENV, type Reply, type Request, TAG } from "./protocol.ts";
 
 const ABORT_WAIT_MS = 10_000;
 const KILL_AFTER_MS = 5_000;
+const TERM_WAIT_MS = 1_000;
 const STDERR_CHARS = 2_000;
 const DIALOGS = new Set(["select", "confirm", "input", "editor"]);
 
@@ -43,14 +44,6 @@ export interface Run {
 
 const hex = () => randomBytes(4).toString("hex");
 
-function killTree(child: ChildProcessWithoutNullStreams) {
-	if (child.exitCode !== null || child.signalCode !== null) return;
-	// shortcut: on POSIX only Pi itself is signalled; its tool processes rely on Pi's own cleanup.
-	if (process.platform === "win32" && child.pid) {
-		spawn("taskkill", ["/PID", String(child.pid), "/T", "/F"], { stdio: "ignore", windowsHide: true }).on("error", () => child.kill());
-	} else child.kill("SIGKILL");
-}
-
 /** The promise's value, or undefined once `ms` pass or `signal` aborts. */
 function within<T>(promise: Promise<T>, ms: number, signal?: AbortSignal) {
 	return new Promise<T | undefined>((done) => {
@@ -80,6 +73,25 @@ export function startRun(options: { cwd: string; args: string[]; launch: Launch;
 		stdio: "pipe",
 		windowsHide: true,
 	});
+	let killTimer: ReturnType<typeof setTimeout> | undefined;
+	let killAt = Infinity;
+	const killTree = (grace = TERM_WAIT_MS) => {
+		if (child.exitCode !== null || child.signalCode !== null) return;
+		if (process.platform === "win32" && child.pid) {
+			spawn("taskkill", ["/PID", String(child.pid), "/T", "/F"], { stdio: "ignore", windowsHide: true }).on("error", () => child.kill());
+		} else {
+			// shortcut: an unresponsive Pi may leave descendants; use OS isolation if hard cleanup guarantees are required.
+			if (!killTimer) child.kill("SIGTERM");
+			const deadline = Date.now() + grace;
+			if (deadline >= killAt) return;
+			killAt = deadline;
+			clearTimeout(killTimer);
+			killTimer = setTimeout(() => {
+				if (child.exitCode === null && child.signalCode === null) child.kill("SIGKILL");
+			}, grace).unref();
+		}
+	};
+	child.once("exit", () => clearTimeout(killTimer));
 	const launchId = `run-${hex()}`;
 	/** The launch command got its response. */
 	let replied = false;
@@ -111,14 +123,16 @@ export function startRun(options: { cwd: string; args: string[]; launch: Launch;
 		if (finished) return;
 		finished = true;
 		concluded.abort();
-		child.stdin.end();
-		setTimeout(() => killTree(child), KILL_AFTER_MS).unref();
+		if (process.platform === "win32") {
+			child.stdin.end();
+			setTimeout(killTree, KILL_AFTER_MS).unref();
+		} else killTree(KILL_AFTER_MS);
 		owner.onEnd(status, error, abortedBy);
 	};
 
 	const fail = (error: string) => {
 		finish("error", error);
-		killTree(child);
+		killTree();
 	};
 
 	// A stop during a tool can end with an assistant error, so the abort decides first.
@@ -249,13 +263,13 @@ export function startRun(options: { cwd: string; args: string[]; launch: Launch;
 			// Pi drops an abort that arrives before its run starts, so a run that has not started ends with its process.
 			if (!begun) {
 				finish("aborted", null, "main");
-				killTree(child);
+				killTree();
 				return exited;
 			}
 			write({ type: "abort" });
 			await within(new Promise((done) => concluded.signal.addEventListener("abort", done)), ABORT_WAIT_MS, signal);
 			if (finished) return;
-			killTree(child);
+			killTree();
 			await exited;
 		},
 		async shutdown() {
@@ -264,10 +278,12 @@ export function startRun(options: { cwd: string; args: string[]; launch: Launch;
 				aborting = true;
 				write({ type: "abort" });
 			}
-			child.stdin.end();
+			// EOF removes Pi's signal handlers before disposal; TERM must reach them while tool cleanup is still registered.
+			if (process.platform === "win32") child.stdin.end();
+			else killTree(3_000);
 			if ((await within(exited.then(() => true), 3_000)) === undefined) {
-				killTree(child);
-				await within(exited, 2_000);
+				killTree();
+				await within(exited, TERM_WAIT_MS + 2_000);
 			}
 		},
 	};

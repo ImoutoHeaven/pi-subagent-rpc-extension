@@ -373,8 +373,7 @@ export default function setupParent(pi: ExtensionAPI) {
 		return `\n\n(Background: ${shown.join(", ")}${more}.)`;
 	};
 
-	// The board digest joins the branch just ahead of what starts a run: a prompt, or a message, for which Pi runs no before_agent_start.
-	// It joins at once, so a message that arrives before that run starts finds it on the branch.
+	// The board digest joins the branch before a run starts, from a prompt or a delivered message.
 	const digestFirst = () => {
 		const digest = parent && team.mainDigest(parent.sessionManager.getBranch());
 		if (digest) pi.sendMessage(digest, { triggerTurn: false });
@@ -386,7 +385,7 @@ export default function setupParent(pi: ExtensionAPI) {
 		// Providers join consecutive messages into one text; the blank line keeps them apart.
 		const content = `${text.trimEnd()}\n\n`;
 		const label = `subagent ${agentId}: ${customType.replace(/^subagent-/, "").replace("-", " ")}`;
-		if (!parent || parent.isIdle()) {
+		if (!parent || (!inRun && parent.isIdle())) {
 			const triggers = !suspended && !quiet;
 			if (triggers) digestFirst();
 			pi.sendMessage({ customType, content, display: true, details }, { triggerTurn: triggers });
@@ -1054,7 +1053,7 @@ export default function setupParent(pi: ExtensionAPI) {
 			// Retired before its run stops, so nothing wakes the member in between.
 			if (params.retire) team.retire(agent.id);
 			// A queued compaction holds messages until its run's process exits, which then routes them.
-			if (busy(agent) || agent.queued) agent.locked = true;
+			agent.locked = true;
 			await halt(agent, signal);
 			if (!params.retire) return result(agent);
 			const unread = team.unread(agent.id);

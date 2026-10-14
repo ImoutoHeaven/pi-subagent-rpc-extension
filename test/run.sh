@@ -10,4 +10,6 @@ cp -r /ext/src /ext/tsconfig.json /tmp/types/
 (cd /tmp/types && npx tsc -p tsconfig.json)
 echo "typecheck ok"
 
-PI_CLI="$(realpath "$(command -v pi)")" bash /ext/test/local.sh
+export PI_CLI="$(realpath "$(command -v pi)")"
+node /ext/test/rpc-posix.mjs
+bash /ext/test/local.sh
