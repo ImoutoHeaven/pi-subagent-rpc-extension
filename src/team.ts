@@ -77,7 +77,7 @@ interface RetireRecord {
 
 export interface TeamHost {
 	isRunning(name: string): boolean;
-	/** The member's state as the roster shows it: running, compacting, stopped, stopped (error), or stopped (aborted). */
+	/** The member's state as the roster shows it: running, compacting, or stopped, with why it stopped or who alone wakes it, such as stopped (error; only main wakes it). */
 	state(name: string): string;
 	/** Who started the member's current or last run: main, or the member whose message woke it. Main itself: main. */
 	startedBy(name: string): string;

@@ -20,8 +20,8 @@ To try it for one run: `pi -e /path/to/pi-subagent-rpc-extension`. Subagents do 
 |---|---|---|
 | `run` | `name`, `description`, `message`, `model`, `cwd`, `args`, `waitMs` | Hires a member named `name`, announces it on the board, and starts it on `message`. |
 | `status` | `id`, `waitMs` | Reports progress or the result. Without `id`, lists every member. |
-| `abort` | `id`, `retire` | Stops the member's run or compaction, if any, and cancels a queued compaction. A run that Pi has not started yet, or that does not stop within 10 seconds, is killed; a wake still waiting for the previous process never starts. The member then wakes only for a direct message from the main agent. With `retire: true`, the member, running or stopped, also leaves the team. |
-| `compact` | `id`, `instructions`, `message`, `wake`, `waitMs` | Compacts the member's context with Pi's compaction; see [Compaction](#compaction). |
+| `abort` | `id`, `retire` | Stops the member's run or compaction, if any, and cancels a queued compaction. A run that Pi has not started yet, or that does not stop within 10 seconds, is killed; a wake still waiting for the previous process never starts. The member then wakes only for a direct message from the main agent, and its status header ends with ` · only your direct message wakes it`, with `, 2 unread waiting` when direct messages wait in its inbox; the roster shows it as `stopped (only main wakes it)`. With `retire: true`, the member, running or stopped, also leaves the team. |
+| `compact` | `id`, `instructions`, `message`, `wake`, `when`, `waitMs` | Compacts the member's context with Pi's compaction; see [Compaction](#compaction). |
 | `switch` | `id`, `model`, `thinking`, `when`, `message`, `waitMs` | Moves the member to another model or thinking level, from its next run or, with `when: now`, at once; see [Switching models](#switching-models). |
 
 - `name`: required, and the member's id. Names are 2 to 24 lowercase letters, digits, or hyphens, start with a letter, and do not end with a hyphen. `main`, `all`, and `team` are reserved, and a name is used once per team: `run` on an existing or retired member fails, and a direct message gives an existing member more work.
@@ -32,7 +32,7 @@ To try it for one run: `pi -e /path/to/pi-subagent-rpc-extension`. Subagents do 
 - `wake`: for `compact`, default `true`; `false` requires `message`. See [Compaction](#compaction).
 - `model`: a Pi model pattern, `provider/id[:thinking]`. Default: the parent's current model and thinking level. For `switch`, the member's new model.
 - `thinking`: for `switch`, a Pi thinking level: `off`, `minimal`, `low`, `medium`, `high`, `xhigh`, or `max`.
-- `when`: for `switch`, `now` or `next`; required while the member runs, compacts, or has a compaction queued, and ignored for a stopped member. See [Switching models](#switching-models).
+- `when`: `now` or `next`, ignored for a stopped member. For `switch`, required while the member runs, compacts, or has a compaction queued; see [Switching models](#switching-models). For `compact`, required while the member runs; see [Compaction](#compaction).
 - `cwd`: the member's working directory, relative to the parent's. Default: the parent's.
 - `args`: extra Pi command-line options, such as `--tools`, `--no-extensions`, `-e`, or `--no-mcp`. The extension sets the mode, session, model, provider, and thinking flags itself and rejects them here, along with args that remove the `team` tool; `model` carries the provider and thinking level.
 
@@ -92,7 +92,10 @@ compacts above about 300K tokens. The `ctx` share uses the same compact point, r
 `compact` compacts a member on request; a member that is past about 60% of its compact point and about to take a new or unrelated task, or that holds much the next task does not need, is a candidate.
 
 - A stopped member compacts at once in a process of its own. A result of its last run that the main agent has not received arrives first. Meanwhile the member's state is `compacting`, and it is never woken: a direct message to it shows `compacting; reads it afterwards` and is routed when the compaction ends, as for a message that reached a run after its last read.
-- A running member compacts after its current run's process exits, and the result reads `Compaction queued after the current run.` A second `compact` before the compaction ends fails.
+- A running member needs `when`; without it, `compact` fails with `tester is running: compact requires when: now or next`.
+  - `next`: the member compacts after its current run's process exits, and the result reads `Compaction queued after the current run.`
+  - `now`: in one call, the run stops as with `abort` and the compaction starts. Until it starts, the member counts as running, so a member's direct message meanwhile shows `running` and is routed when the compaction ends. The member's lock stays as it was before the stop. The stopped run's final reply goes where an aborted run's goes; the result shows its state, then the compaction's. A call cancelled during the stop, as with Esc, starts no compaction: the member ends as after `abort`, and the result begins `tester: the call was cancelled, so it stopped without compacting.`
+- A second `compact` before the compaction ends fails.
 - `abort` cancels a queued compaction or stops the compaction in progress, and locks the member as after any abort. A compaction stopped before Pi records it leaves the context as it was.
 - A compacted member's result reads `[compacted] subagent tester · openai/gpt-5:high · 18s · ctx 24K/300K 8% · compacted 312K→24K (manual)`; Pi's `Nothing to compact (session too small)` and `Already compacted` also end as `[compacted]`, with that text. A failure, such as an extension that cancels the compaction or a provider error, ends as `[error] … · compaction failed: <reason>`, with the extensions' notices.
 - With `message`, a compacted member then runs on `message` as if the main agent started it, which also unlocks a member the main agent aborted; that run's result arrives as usual and its status line shows the compaction. After a failure the member does not run, and the result starts a turn.
@@ -123,7 +126,7 @@ The main agent (`main`) and every member have it.
 | `send` | `body`, `to`, `mentions`, `replyTo` | Posts to the board (no `to`) or sends one direct message to `to`, a member name, `main`, or a list of them. Returns `#seq` and what happened for each recipient. |
 | `history` | `with`, `query`, `before`, `limit` | Reads the board, or the caller's direct messages with `with`; for the main agent, every direct message of the member named in `with`. `query` matches text case-insensitively. Oldest first, at most `limit` messages (default 20, maximum 50) and 16000 characters; `before=<seq>` pages back. |
 | `wait` | `ms` | Returns once a message for the caller is pending, or after `ms` (default 30000, maximum 240000). The messages follow the tool result. |
-| `members` | | Members with their states (`running`, `compacting`, `stopped`, `stopped (error)`, or `stopped (aborted)`) and roles, such as `- tester: running — runs the e2e suite and reports failures`, and the topic. Retired members are left out, here and in a member's preamble. |
+| `members` | | Members with their states (`running`, `compacting`, `stopped`, `stopped (error)`, `stopped (only main wakes it)` for a member the main agent aborted, or `stopped (error; only main wakes it)`) and roles, such as `- tester: running — runs the e2e suite and reports failures`, and the topic. Retired members are left out, here and in a member's preamble. |
 | `topic` | `body` | Sets the topic (main agent only). |
 
 `body` holds up to 8000 characters and `topic` up to 2000; a longer one fails with its length, as in `body is 8312 characters, over 8000`. Larger content belongs in files in the shared working tree, with the path in the message.

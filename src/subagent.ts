@@ -295,7 +295,14 @@ export default function setupParent(pi: ExtensionAPI) {
 		return next === modelLabel(modelChoice(agent.runArgs)) ? "" : ` · next run: ${next}`;
 	};
 
-	const header = (agent: Agent) => statusLine(agent) + nextRun(agent);
+	/** ` · only your direct message wakes it, 2 unread waiting` for a stopped member the main agent aborted; nothing wakes a retired one. */
+	const lockNote = (agent: Agent) => {
+		if (!agent.locked || busy(agent) || agent.queued || team.isRetired(agent.id)) return "";
+		const unread = team.unread(agent.id).length;
+		return ` · only your direct message wakes it${unread ? `, ${unread} unread waiting` : ""}`;
+	};
+
+	const header = (agent: Agent) => statusLine(agent) + nextRun(agent) + lockNote(agent);
 
 	const statusLine = (agent: Agent) => {
 		const now = Date.now();
@@ -490,7 +497,8 @@ export default function setupParent(pi: ExtensionAPI) {
 			if (status === "running" || status === "compacting") return status;
 			// From the end of the run until its process exits and the queued compaction starts, so no message wakes the member in between.
 			if (agent?.queued) return "compacting";
-			return status === "error" || status === "aborted" ? `stopped (${status})` : "stopped";
+			const why = [status === "error" ? "error" : "", agent?.locked ? "only main wakes it" : ""].filter(Boolean).join("; ");
+			return why ? `stopped (${why})` : "stopped";
 		},
 		startedBy: (name) => agents.get(name)?.startedBy ?? MAIN,
 		locked: (name) => Boolean(agents.get(name)?.locked),
@@ -775,6 +783,29 @@ export default function setupParent(pi: ExtensionAPI) {
 		}
 	};
 
+	/**
+	 * Stops a running member for a `when: now` call, as abort does; returns the stopped run's state, or undefined when the call was
+	 * cancelled, as with Esc, after which the member stays as after abort. Locked meanwhile, in case of that; counted as running until
+	 * the call starts the member again, so no message meanwhile wakes it or reaches the main agent as stuck.
+	 */
+	const stopNow = async (agent: Agent, signal?: AbortSignal) => {
+		const locked = agent.locked;
+		agent.locked = true;
+		agent.restarting = true;
+		try {
+			await halt(agent, signal);
+		} finally {
+			agent.restarting = false;
+		}
+		if (signal?.aborted) {
+			// The user stopped the main agent, so no new work starts. Its exit, if over, skipped routing its unread messages.
+			if (!agent.run) team.afterRun(agent.id);
+			return undefined;
+		}
+		agent.locked = locked;
+		return `${consume(agent).text}\n\n`;
+	};
+
 	const register = (id: string, cwd: string, dir: string, launchArgs: string[], status: Status) => {
 		const agent: Agent = {
 			id,
@@ -869,7 +900,7 @@ export default function setupParent(pi: ExtensionAPI) {
 		when: Type.Optional(
 			StringEnum(["now", "next"] as const, {
 				description:
-					"switch (required while the member runs, compacts, or has a compaction queued): now stops that as abort does and runs the member on message with the new settings at once, and needs message; next applies the settings from its next run. A stopped member ignores it.",
+					"switch (required while the member runs, compacts, or has a compaction queued), compact (required while it runs): now stops that as abort does, then, for switch, runs the member on message with the new settings at once, which needs message, and for compact, compacts it at once. next leaves the current run alone: switch applies the settings from its next run, and compact queues the compaction after the run. A stopped member ignores it.",
 			}),
 		),
 		retire: Type.Optional(
@@ -909,9 +940,9 @@ export default function setupParent(pi: ExtensionAPI) {
 		label: "Subagent",
 		description: [
 			"Delegate work to a Pi subagent: a separate Pi process with its own session that loads tools, extensions, skills, and MCP servers like a normal Pi launch.",
-			"run hires a named team member, announces it on the board, and starts it on message; its name is its id, and its description is the role the team roster shows. status reports progress or the result (without id: lists subagents). abort stops a member's run or compaction, if any, and cancels a queued compaction; a member you aborted wakes only for your direct message. retire (required with abort): true also removes the member from the team, whether it runs or not; retire members you will not use again. A retired member's name is not reused, and status with its id still shows its last result.",
+			"run hires a named team member, announces it on the board, and starts it on message; its name is its id, and its description is the role the team roster shows. status reports progress or the result (without id: lists subagents). abort stops a member's run or compaction, if any, and cancels a queued compaction; a member you aborted wakes only for your direct message, and its status says so. retire (required with abort): true also removes the member from the team, whether it runs or not; retire members you will not use again. A retired member's name is not reused, and status with its id still shows its last result.",
 			"Two ways to give work: a fresh member with a self-contained message suits a different domain or a new task; a stopped member, compacted with instructions that keep what helps and then messaged, suits continuing its work, or similar work its earlier context helps with.",
-			"compact compacts a member's context; instructions go to the compaction that runs as Pi's custom instructions, and how they shape the summary depends on that compaction. Pi compacts a running member by itself at its compact point, a Pi setting; status lines show ctx: the member's context tokens against that point. Compact a member yourself when it is past about 60% of its compact point and is about to take a new or unrelated task, or holds much that the next task does not need. A stopped member compacts at once, a running one after its current run. With message and wake true (the default), the member then runs on message as if you sent it. With wake false, message is written word for word into its context after the summary, marked as yours, and the member stays stopped until something wakes it; use it for what the member's next task needs word for word, without starting that task. Without message or with wake false, a result you did not wait for arrives without starting a turn, unless your message could not be written.",
+			"compact compacts a member's context; instructions go to the compaction that runs as Pi's custom instructions, and how they shape the summary depends on that compaction. Pi compacts a running member by itself at its compact point, a Pi setting; status lines show ctx: the member's context tokens against that point. Compact a member yourself when it is past about 60% of its compact point and is about to take a new or unrelated task, or holds much that the next task does not need. A stopped member compacts at once. A running member needs when: next compacts it after its current run, and now stops that run as abort does and compacts it in the same call. With message and wake true (the default), the member then runs on message as if you sent it. With wake false, message is written word for word into its context after the summary, marked as yours, and the member stays stopped until something wakes it; use it for what the member's next task needs word for word, without starting that task. Without message or with wake false, a result you did not wait for arrives without starting a turn, unless your message could not be written.",
 			"switch moves a member to another model or thinking level; it keeps its name, session, and context. A stopped member uses the new settings from its next run, and with message runs on them at once. A busy member needs when: next leaves its current run or compaction on the old settings, and its status shows `next run:` until then; now, with message, stops it as abort does and runs it on message with the new settings in the same call. A new model starts without the prompt cache, so its next request pays full input price for the whole context; compact first when the context is large.",
 			`run, status, compact, and switch with message wait up to waitMs (default ${DEFAULT_WAIT_MS}, max ${MAX_WAIT_MS}) and return the result if it finishes in time, otherwise its progress while it keeps running. To wait longer, call status again; each wait of up to ${MAX_WAIT_MS / 60_000} minutes keeps the prompt cache warm. Or end your turn: every result and message for you starts your next turn, and notices that start none arrive with it.`,
 			"Members talk with you and each other through the team tool. A member starts with an empty conversation, so put the context it needs in message. A direct team message to a stopped member wakes it in its own session. A run woken by a member's message sends its final reply to that member, or to you when that member has stopped.",
@@ -956,13 +987,20 @@ export default function setupParent(pi: ExtensionAPI) {
 				if (!wake && !params.message) throw new Error("compact with wake: false requires message, which the member finds in its context after the summary");
 				if (agent.status === "compacting" || agent.queued) throw new Error(`${agent.id} is already compacting or has a compaction queued`);
 				const request = { instructions, message: params.message || undefined, wake };
+				let stopped = "";
 				if (agent.status === "running") {
-					agent.queued = request;
-					return { content: [{ type: "text", text: `${header(agent)}\n\nCompaction queued after the current run.${footer(agent)}` }], details: undefined };
+					if (!params.when) throw new Error(`${agent.id} is running: compact requires when: now or next`);
+					if (params.when === "next") {
+						agent.queued = request;
+						return { content: [{ type: "text", text: `${header(agent)}\n\nCompaction queued after the current run.${footer(agent)}` }], details: undefined };
+					}
+					const state = await stopNow(agent, signal);
+					if (state === undefined) return result(agent, undefined, `${agent.id}: the call was cancelled, so it stopped without compacting.\n\n`);
+					stopped = state;
 				}
 				compact(agent, request);
 				await waitFor(agent, waitMs, signal, true);
-				return result(agent);
+				return result(agent, undefined, stopped);
 			}
 			if (params.action === "switch") {
 				const pattern = params.model?.trim() || undefined;
@@ -999,21 +1037,11 @@ export default function setupParent(pi: ExtensionAPI) {
 				if (!params.message) return { content: [{ type: "text", text: `${agent.id} now runs on ${target} from its next run (was ${was()}).${cache}` }], details: undefined };
 				let stopped = "";
 				if (now) {
-					// Locked as by abort, in case the call is cancelled; counted as running until the next run launches,
-					// so no message meanwhile wakes the member or reaches the main agent as stuck.
-					agent.locked = true;
-					agent.restarting = true;
-					try {
-						await halt(agent, signal);
-					} finally {
-						agent.restarting = false;
-					}
-					if (signal?.aborted) {
-						// The user stopped the main agent, so no new work starts: the member ends as aborted. Its exit, if over, skipped routing its unread messages.
-						if (!agent.run) team.afterRun(agent.id);
+					const state = await stopNow(agent, signal);
+					if (state === undefined) {
 						return result(agent, undefined, `${agent.id} now runs on ${target} from its next run (was ${was()}).${cache} The call was cancelled, so it stopped without running on message.\n\n`);
 					}
-					stopped = `${consume(agent).text}\n\n`;
+					stopped = state;
 				}
 				const line = `${agent.id} now runs on ${target} (was ${was()}).${cache}\n\n`;
 				// As the main agent's task, the run unlocks the member.
