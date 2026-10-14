@@ -522,7 +522,7 @@ await step("run requires a valid name, a one-line description, and args that kee
 		[{ message: "SAY x" }, /requires name/],
 		[{ name: "nodesc", description: undefined, message: "SAY x" }, /requires description/],
 		[{ name: "nodesc", description: "  ", message: "SAY x" }, /requires description/],
-		[{ name: "nodesc", description: "x".repeat(101), message: "SAY x" }, /one line of at most 100 characters/],
+		[{ name: "nodesc", description: "x".repeat(101), message: "SAY x" }, /description is 101 characters, over 100/],
 		[{ name: "nodesc", description: "two\nlines", message: "SAY x" }, /one line of at most 100 characters/],
 		[{ name: "toolless", args: ["--tools", "read"], message: "SAY x" }, /remove the team tool/],
 		[{ name: "main", message: "SAY x" }, /reserved/],
@@ -1158,7 +1158,7 @@ fs.writeFileSync(
 			ctx.abort();
 			return { cancel: true };
 		}
-		return { compaction: { summary: "fixed summary", firstKeptEntryId: event.preparation.firstKeptEntryId, tokensBefore: event.preparation.tokensBefore } };
+		return { compaction: { summary: "fixed summary: " + (event.customInstructions ?? ""), firstKeptEntryId: event.preparation.firstKeptEntryId, tokensBefore: event.preparation.tokensBefore } };
 	});
 }
 `,
@@ -1236,6 +1236,86 @@ await step("the main agent's direct message to a member it aborted, sent during 
 	const compacted = await team.waitMessage("subagent-result", mark);
 	assert.match(compacted.content, /^\[compacted\] subagent lockc /);
 	assert.match(await report("lockc", compacted.at + 1), /unlocked$/);
+});
+
+/** Hires member `name` and aborts its second run, so it is locked. */
+const lockedMember = async (name, args) => {
+	await run({ name, model: "fake/fake-keep", args, message: `SAY ${name} ready` });
+	await teamCall({ action: "send", to: name, body: "HANG" });
+	await until(() => requestsBy(name).length > 1);
+	assert.match((await team.call({ action: "abort", id: name, retire: false })).text, /^\[aborted\] /);
+};
+const KEPT = "KEEP this\n  word for word: #1 {x}";
+const keptText = `written after the compaction for your next run:\n${KEPT}\n`;
+
+for (const [kind, name, args] of [
+	["Pi's own compaction", "keeppi", []],
+	["an extension's compaction", "keepext", ["-e", compactor]],
+]) {
+	await step(`compact with wake false under ${kind} writes the message after the summary without a run; a locked member stays locked; its next run reads summary, message, then its messages`, async () => {
+		await lockedMember(name, args);
+		const before = requestsBy(name).length;
+		const r = await team.call({ action: "compact", id: name, instructions: "keep the plan", message: KEPT, wake: false });
+		assert.match(r.text, new RegExp(`^\\[compacted\\] subagent ${name} [^\\n]* \\(manual\\)\\n\\nYour message waits in its context for its next run\\.$`));
+		// The member is still locked: a member's message does not wake it.
+		let mark = team.events.length;
+		await run({ name: `${name}-knock`, message: TEAM({ action: "send", to: name, body: "SAY knocked" }) });
+		assert.match(await report(`${name}-knock`, mark), new RegExp(`Sent #\\d+ to ${name} \\(stopped, not woken: the main agent stopped it; the main agent was told\\)\\.$`));
+		assert.equal(requestsBy(name).length, before, "the member ran");
+		mark = team.events.length;
+		assert.match((await teamCall({ action: "send", to: name, body: "SAY after keep" })).text, /\(woken\)\.$/);
+		assert.match(await report(name, mark), /after keep$/);
+		const seen = requestsBy(name).at(-1).messages.map(rawText);
+		const context = seen.join("\n");
+		const order = ["<summary>", keptText, "→ you (direct):\nSAY knocked", "→ you (direct):\nSAY after keep"].map((part) => context.indexOf(part));
+		assert.ok(order[0] >= 0 && order.every((index, i) => i === 0 || index > order[i - 1]), JSON.stringify(order));
+		assert.equal(context.split(keptText).length, 2, "the message is not there once");
+		const summary = seen.find((m) => m.includes("<summary>"));
+		// The instructions reach the compaction: Pi's summarizer prompt, or the extension that writes the summary.
+		if (args.length) assert.ok(summary.includes("fixed summary: keep the plan"), summary);
+		else assert.ok(requests().some((body) => body.messages.some((m) => rawText(m).includes("Additional focus: keep the plan"))), "Pi's summarizer did not get the instructions");
+	});
+}
+
+await step("compact with wake false writes nothing when the compaction fails, and its result starts a turn", async () => {
+	await lockedMember("keepfail", ["-e", compactor]);
+	const from = team.events.length;
+	const r = await team.call({ action: "compact", id: "keepfail", instructions: "CANCEL", message: KEPT, wake: false, waitMs: 0 });
+	assert.match(r.text, /^\[compacting\] /);
+	const result = await team.waitMessage("subagent-result", from);
+	assert.match(result.content, /^\[error\] subagent keepfail [^\n]* · compaction failed: Compaction cancelled\n\nYour message was not written to its context: no compaction completed\.\n\nNotices: compaction refused$/);
+	assert.ok(team.events.slice(from, result.at).some((e) => e.type === "agent_start"), "the result started no turn");
+	await team.waitEvent((e) => e.type === "agent_settled", result.at);
+	const mark = team.events.length;
+	await teamCall({ action: "send", to: "keepfail", body: "SAY after failure" });
+	assert.match(await report("keepfail", mark), /after failure$/);
+	assert.ok(!requestsBy("keepfail").at(-1).messages.some((m) => rawText(m).includes(keptText)), "the message was written");
+});
+
+await step("compact and team limits: wake false needs message, wake is for compact only, and length errors state the length; a body of 8000 characters is sent", async () => {
+	for (const [args, error] of [
+		[{ action: "compact", id: "keeppi", wake: false }, /compact with wake: false requires message/],
+		[{ action: "status", id: "keeppi", wake: true }, /wake applies to compact only/],
+		[{ action: "compact", id: "keeppi", instructions: "i".repeat(4001) }, /instructions are 4001 characters, over 4000; put what the member must keep word for word in message: with wake: true \(the default\) it runs on message once compacted; with wake: false message stays in its context and it stays stopped$/],
+		[{ action: "run", name: "longrole", description: "d".repeat(101), message: "SAY x" }, /description is 101 characters, over 100/],
+	]) {
+		const r = await team.call(args);
+		assert.ok(r.isError, r.text);
+		assert.match(r.text, error);
+	}
+	for (const [args, error] of [
+		[{ action: "send", to: "keeppi", body: "b".repeat(8001) }, /body is 8001 characters, over 8000; /],
+		[{ action: "topic", body: "t".repeat(2001) }, /topic is 2001 characters, over 2000; /],
+	]) {
+		const r = await teamCall(args);
+		assert.ok(r.isError, r.text);
+		assert.match(r.text, error);
+	}
+	const from = team.events.length;
+	await run({ name: "longbody", message: TEAM({ action: "send", to: "main", body: "y".repeat(8000) }) });
+	const note = await team.waitMessage("team-message", from);
+	assert.ok(note.content.endsWith(`\n${"y".repeat(8000)}`), note.content.slice(0, 200));
+	await finished("longbody");
 });
 
 const slowExit = join(WORK_DIR, "slow-exit-extension.ts");

@@ -90,6 +90,15 @@ export default function setupChild(pi: ExtensionAPI) {
 		if (messages.length) return { entries: [...event.entries, ...drafts(messages, cursor)] };
 	});
 
+	// A compaction the main agent asked for may carry its message, which joins the session after the summary without starting a run.
+	pi.on("session_compact", async (event, ctx) => {
+		if (event.reason !== "manual") return;
+		const { text: message } = await ask(ctx, { op: "compacted" });
+		if (message === undefined) return;
+		const content = `[team] main → you (direct), written after the compaction for your next run:\n${message}\n\n`;
+		pi.sendMessage({ customType: TEAM_MESSAGE, content, display: true, details: { from: "main" } }, { triggerTurn: false });
+	});
+
 	// A message that arrived while the member wrote its final reply continues the same run; a digest alone never does, so it is not asked for.
 	pi.on("agent_before_settle", async (event, ctx) => {
 		if (event.outcome !== "completed") return;

@@ -22,6 +22,7 @@ import { type AbortedBy, type Launch, type Run, type RunStatus, startRun } from 
 import { createTeam, DESCRIPTION_CHARS } from "./team.ts";
 
 const MAX_RESULT_CHARS = 16_000;
+const INSTRUCTIONS_CHARS = 4_000;
 const NARRATION_LINES = 3;
 const NARRATION_CHARS = 300;
 const ERROR_CHARS = 200;
@@ -62,10 +63,14 @@ const RETURNED = "was returned to you earlier";
  */
 type Status = RunStatus | "running" | "stopped" | "compacting" | "compacted";
 
-/** A compaction the main agent asked for: Pi's custom instructions, and the message the member runs on afterwards. */
+/**
+ * A compaction the main agent asked for: Pi's custom instructions, and its message, which the member runs on afterwards (`wake`)
+ * or finds in its context after the summary.
+ */
 interface Compaction {
 	instructions?: string;
 	message?: string;
+	wake: boolean;
 }
 
 interface Agent {
@@ -108,6 +113,9 @@ interface Agent {
 	queued: Compaction | null;
 	/** The message a compaction run continues with once the member is compacted. */
 	next?: string;
+	/** The message a compaction run writes after the summary, for the member's next run; `kept` once handed to the member. */
+	keep?: string;
+	kept: boolean;
 	/** Where the final result went, completing "Its result …": SENT, RETURNED, or to the member that woke the run; null until it went somewhere. */
 	delivered: string | null;
 	/** The child sent its start request in this run, so the extension loaded in it. */
@@ -306,6 +314,12 @@ export default function setupParent(pi: ExtensionAPI) {
 		return `[running] ${id} · turn ${agent.turns + 1} · ${activity} · last event ${duration(now - agent.lastEventAt)} ago · ${duration(now - agent.startedAt)}${usageText(agent.usage)}${context}${compaction}`;
 	};
 
+	/** Whether a compaction run wrote the main agent's message into the member's context. */
+	const keptLine = (agent: Agent) => {
+		if (!agent.compactOnly || agent.keep === undefined || busy(agent)) return "";
+		return agent.kept ? "Your message waits in its context for its next run." : "Your message was not written to its context: no compaction completed.";
+	};
+
 	const noticeLine = (agent: Agent) => (agent.notices.length ? `Notices: ${agent.notices.join(" | ")}` : "");
 
 	/** Marks the run's result seen in the details of an entry that shows it, so a branch without one gets the result again. */
@@ -322,7 +336,7 @@ export default function setupParent(pi: ExtensionAPI) {
 				: agent.lastText;
 		// The header holds the error in one line; one that does not fit follows in full.
 		const error = agent.error && oneLine(agent.error, ERROR_CHARS) !== agent.error ? agent.error : "";
-		return [header(agent), agent.woken, error, noticeLine(agent), text].filter(Boolean).join("\n\n");
+		return [header(agent), agent.woken, error, keptLine(agent), noticeLine(agent), text].filter(Boolean).join("\n\n");
 	};
 
 	/**
@@ -440,7 +454,8 @@ export default function setupParent(pi: ExtensionAPI) {
 	const deliver = (agent: Agent) => {
 		if (agent.delivered || shuttingDown) return;
 		agent.delivered = SENT;
-		notify("subagent-result", agent.id, report(agent), { ...runKey(agent), status: agent.status }, agent.compactOnly && agent.next === undefined);
+		const lost = agent.keep !== undefined && !agent.kept;
+		notify("subagent-result", agent.id, report(agent), { ...runKey(agent), status: agent.status }, agent.compactOnly && agent.next === undefined && !lost);
 	};
 
 	/** Tells the main agent about a member without starting a turn. */
@@ -504,6 +519,12 @@ export default function setupParent(pi: ExtensionAPI) {
 	const answer = async (agent: Agent, request: Request, signal: AbortSignal): Promise<Reply> => {
 		if (shuttingDown) return { error: "the main agent's session is ending" };
 		if (request.op === "start") agent.greeted = true;
+		// Only a compaction the main agent asked for carries its message, once.
+		if (request.op === "compacted") {
+			if (!agent.compactOnly || agent.keep === undefined || agent.kept) return { ok: true };
+			agent.kept = true;
+			return { ok: true, text: agent.keep };
+		}
 		return team.answer(agent.id, request, signal);
 	};
 
@@ -686,6 +707,8 @@ export default function setupParent(pi: ExtensionAPI) {
 			abortedBy: undefined,
 			compaction: "",
 			next: undefined,
+			keep: undefined,
+			kept: false,
 			delivered: null,
 			greeted: false,
 			woken: "",
@@ -729,9 +752,10 @@ export default function setupParent(pi: ExtensionAPI) {
 	};
 
 	/** Starts a compaction run, which continues with `message` once the member is compacted. */
-	const compact = (agent: Agent, { instructions, message }: Compaction) => {
+	const compact = (agent: Agent, { instructions, message, wake }: Compaction) => {
 		launch(agent, { type: "compact", ...(instructions ? { customInstructions: instructions } : {}) }, MAIN);
-		agent.next = message;
+		if (wake) agent.next = message;
+		else agent.keep = message;
 	};
 
 	/** Stops the member's run or compaction, if any, and cancels a queued compaction; the caller returns the stopped run's state. */
@@ -775,6 +799,7 @@ export default function setupParent(pi: ExtensionAPI) {
 			retries: 0,
 			abortedBy: undefined,
 			compactOnly: false,
+			kept: false,
 			compaction: "",
 			queued: null,
 			delivered: null,
@@ -815,10 +840,20 @@ export default function setupParent(pi: ExtensionAPI) {
 		message: Type.Optional(
 			Type.String({
 				description:
-					"run: the task. compact: a task the member runs once compacted, as if you sent it. switch: a task the member runs at once on the new settings, as if you sent it; for a busy member, with when: now.",
+					"run: the task. compact: with wake true, a task the member runs once compacted, as if you sent it; with wake false, your message written word for word into its context after the summary, for its next run. switch: a task the member runs at once on the new settings, as if you sent it; for a busy member, with when: now.",
 			}),
 		),
-		instructions: Type.Optional(Type.String({ description: `compact: what the summary must keep, up to ${BODY_CHARS} characters.` })),
+		instructions: Type.Optional(
+			Type.String({
+				description: `compact: Pi's custom instructions for the compaction that runs, up to ${INSTRUCTIONS_CHARS} characters; how they shape the summary depends on that compaction.`,
+			}),
+		),
+		wake: Type.Optional(
+			Type.Boolean({
+				description:
+					"compact: true (default) runs the member on message once compacted. false, which requires message, writes message into its context after the summary and leaves it stopped; it reads message when it next runs.",
+			}),
+		),
 		name: Type.Optional(
 			Type.String({ description: "run (required): the new member's name, 2-24 lowercase letters, digits, or hyphens, starting with a letter. Each name is used once." }),
 		),
@@ -862,6 +897,7 @@ export default function setupParent(pi: ExtensionAPI) {
 		model?: string;
 		thinking?: string;
 		retire?: boolean;
+		wake?: boolean;
 		when?: "now" | "next";
 		cwd?: string;
 		args?: string[];
@@ -875,7 +911,7 @@ export default function setupParent(pi: ExtensionAPI) {
 			"Delegate work to a Pi subagent: a separate Pi process with its own session that loads tools, extensions, skills, and MCP servers like a normal Pi launch.",
 			"run hires a named team member, announces it on the board, and starts it on message; its name is its id, and its description is the role the team roster shows. status reports progress or the result (without id: lists subagents). abort stops a member's run or compaction, if any, and cancels a queued compaction; a member you aborted wakes only for your direct message. retire (required with abort): true also removes the member from the team, whether it runs or not; retire members you will not use again. A retired member's name is not reused, and status with its id still shows its last result.",
 			"Two ways to give work: a fresh member with a self-contained message suits a different domain or a new task; a stopped member, compacted with instructions that keep what helps and then messaged, suits continuing its work, or similar work its earlier context helps with.",
-			"compact compacts a member's context; instructions say what the summary keeps. Pi compacts a running member by itself at its compact point, a Pi setting; status lines show ctx: the member's context tokens against that point. Compact a member yourself when it is past about 60% of its compact point and is about to take a new or unrelated task, or holds much that the next task does not need. A stopped member compacts at once, a running one after its current run. With message, the member then runs on message as if you sent it; without, a result you did not wait for arrives without starting a turn.",
+			"compact compacts a member's context; instructions go to the compaction that runs as Pi's custom instructions, and how they shape the summary depends on that compaction. Pi compacts a running member by itself at its compact point, a Pi setting; status lines show ctx: the member's context tokens against that point. Compact a member yourself when it is past about 60% of its compact point and is about to take a new or unrelated task, or holds much that the next task does not need. A stopped member compacts at once, a running one after its current run. With message and wake true (the default), the member then runs on message as if you sent it. With wake false, message is written word for word into its context after the summary, marked as yours, and the member stays stopped until something wakes it; use it for what the member's next task needs word for word, without starting that task. Without message or with wake false, a result you did not wait for arrives without starting a turn, unless your message could not be written.",
 			"switch moves a member to another model or thinking level; it keeps its name, session, and context. A stopped member uses the new settings from its next run, and with message runs on them at once. A busy member needs when: next leaves its current run or compaction on the old settings, and its status shows `next run:` until then; now, with message, stops it as abort does and runs it on message with the new settings in the same call. A new model starts without the prompt cache, so its next request pays full input price for the whole context; compact first when the context is large.",
 			`run, status, compact, and switch with message wait up to waitMs (default ${DEFAULT_WAIT_MS}, max ${MAX_WAIT_MS}) and return the result if it finishes in time, otherwise its progress while it keeps running. To wait longer, call status again; each wait of up to ${MAX_WAIT_MS / 60_000} minutes keeps the prompt cache warm. Or end your turn: every result and message for you starts your next turn, and notices that start none arrive with it.`,
 			"Members talk with you and each other through the team tool. A member starts with an empty conversation, so put the context it needs in message. A direct team message to a stopped member wakes it in its own session. A run woken by a member's message sends its final reply to that member, or to you when that member has stopped.",
@@ -886,6 +922,7 @@ export default function setupParent(pi: ExtensionAPI) {
 		async execute(_toolCallId, params: Params, signal, _onUpdate, ctx) {
 			parent = ctx;
 			const waitMs = Math.min(params.waitMs ?? DEFAULT_WAIT_MS, MAX_WAIT_MS);
+			if (params.wake !== undefined && params.action !== "compact") throw new Error("wake applies to compact only");
 			if (params.action === "status" && !params.id) {
 				const listed = [...agents.values()].filter((agent) => !team.isRetired(agent.id));
 				return { content: [{ type: "text", text: listed.length ? listed.map(header).join("\n") : "No subagents." }], details: undefined };
@@ -910,9 +947,15 @@ export default function setupParent(pi: ExtensionAPI) {
 			}
 			if (params.action === "compact") {
 				const instructions = params.instructions?.trim();
-				if (instructions && instructions.length > BODY_CHARS) throw new Error(`instructions exceed ${BODY_CHARS} characters`);
+				if (instructions && instructions.length > INSTRUCTIONS_CHARS) {
+					throw new Error(
+						`instructions are ${instructions.length} characters, over ${INSTRUCTIONS_CHARS}; put what the member must keep word for word in message: with wake: true (the default) it runs on message once compacted; with wake: false message stays in its context and it stays stopped`,
+					);
+				}
+				const wake = params.wake ?? true;
+				if (!wake && !params.message) throw new Error("compact with wake: false requires message, which the member finds in its context after the summary");
 				if (agent.status === "compacting" || agent.queued) throw new Error(`${agent.id} is already compacting or has a compaction queued`);
-				const request = { instructions, message: params.message || undefined };
+				const request = { instructions, message: params.message || undefined, wake };
 				if (agent.status === "running") {
 					agent.queued = request;
 					return { content: [{ type: "text", text: `${header(agent)}\n\nCompaction queued after the current run.${footer(agent)}` }], details: undefined };

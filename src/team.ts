@@ -288,7 +288,7 @@ export function createTeam(pi: ExtensionAPI, host: TeamHost) {
 	const send = (from: string, params: TeamParams) => {
 		const body = params.body?.trim() ?? "";
 		if (!body) throw new Error("send requires body");
-		if (body.length > BODY_CHARS) throw new Error(`body exceeds ${BODY_CHARS} characters; put the content in a file in the shared working tree and send its path`);
+		if (body.length > BODY_CHARS) throw new Error(`body is ${body.length} characters, over ${BODY_CHARS}; put the content in a file in the shared working tree and send its path`);
 		let to = typeof params.to === "string" ? [params.to] : params.to;
 		let notify: string[];
 		if (to) {
@@ -363,7 +363,7 @@ export function createTeam(pi: ExtensionAPI, host: TeamHost) {
 		if (caller !== MAIN) throw new Error("only the main agent sets the topic");
 		const body = params.body?.trim() ?? "";
 		if (!body) throw new Error("topic requires body");
-		if (body.length > TOPIC_CHARS) throw new Error(`topic exceeds ${TOPIC_CHARS} characters; put the details in a file and name it in the topic`);
+		if (body.length > TOPIC_CHARS) throw new Error(`topic is ${body.length} characters, over ${TOPIC_CHARS}; put the details in a file and name it in the topic`);
 		append({ t: "topic", at: Date.now(), body });
 		topic = body;
 		return "Topic set.";
@@ -499,7 +499,8 @@ export function createTeam(pi: ExtensionAPI, host: TeamHost) {
 			if (members.has(name)) throw new Error(`${name} is already a member; send it a direct message with team send`);
 			const role = description.trim();
 			if (!role) throw new Error("run requires description: the member's lasting role, in one line");
-			if (role.length > DESCRIPTION_CHARS || /[\r\n\u2028\u2029]/.test(role)) throw new Error(`description must be one line of at most ${DESCRIPTION_CHARS} characters`);
+			if (/[\r\n\u2028\u2029]/.test(role)) throw new Error(`description must be one line of at most ${DESCRIPTION_CHARS} characters`);
+			if (role.length > DESCRIPTION_CHARS) throw new Error(`description is ${role.length} characters, over ${DESCRIPTION_CHARS}; name the member's lasting role in one line`);
 			const member: MemberRecord = { t: "member", name, description: role, cwd, args };
 			// A board post that notifies no one; one write with the member record, so a failed write leaves neither.
 			const post: MessageRecord = { t: "msg", seq: lastSeq() + 1, at: Date.now(), from: MAIN, to: BOARD, notify: [], body: `joined: ${name} — ${role}` };

@@ -14,7 +14,7 @@ export const CHILD_ENV = "PI_SUBAGENT_CHILD";
 export const TEAM_MESSAGE = "team-message";
 export const DEFAULT_WAIT_MS = 30_000;
 export const MAX_WAIT_MS = 240_000;
-export const BODY_CHARS = 4_000;
+export const BODY_CHARS = 8_000;
 export const TOPIC_CHARS = 2_000;
 
 export const teamParameters = Type.Object({
@@ -59,6 +59,8 @@ export type Request =
 	 */
 	| { op: "inbox"; seen: number[]; board?: number }
 	| { op: "wait"; seen: number[]; ms: number }
+	/** After a manual compaction: the reply's `text`, if any, is the main agent's message to append after the summary. */
+	| { op: "compacted" }
 	| ({ op: "team" } & TeamParams);
 
 /** `board`: the caller's board cursor after a digest. `covered`: the seqs of the messages a history call showed. */
