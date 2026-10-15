@@ -20,6 +20,7 @@ import {
 	seenIn,
 	TEAM_DESCRIPTION,
 	TEAM_MESSAGE,
+	TITLE_CHARS,
 	TOPIC_CHARS,
 	type TeamParams,
 	teamParameters,
@@ -36,8 +37,7 @@ const INBOX_SIZE = 10;
 const HISTORY_LIMIT = 20;
 const MAX_HISTORY_LIMIT = 50;
 const HISTORY_CHARS = 16_000;
-const DIGEST_POSTS = 3;
-const DIGEST_CHARS = 80;
+const DIGEST_POSTS = 5;
 export const DESCRIPTION_CHARS = 100;
 const FORK_NOTICE =
 	"[team] The team messages above belong to the team of the session this one was forked from. This session has a team of its own, which starts without members; resume the original session to work with that team.\n\n";
@@ -60,6 +60,8 @@ interface MessageRecord {
 	replyTo?: number;
 	mentions?: string[];
 	notify: string[];
+	/** A board post's one-line title. */
+	title?: string;
 	body: string;
 	/** The sender's run was started by a member's message, so the message cannot wake anyone. */
 	hop1?: true;
@@ -107,7 +109,7 @@ function render(message: MessageRecord, viewer: string) {
 	const route = message.to === BOARD ? `${who(message.from)} → #team` : `${who(message.from)} → ${message.to.map(who).join(", ")} (direct)`;
 	const reply = message.replyTo ? `, replying to #${message.replyTo}` : "";
 	const mentions = message.mentions?.length ? `, mentions ${message.mentions.map(who).join(", ")}` : "";
-	return `[team #${message.seq}] ${route}${reply}${mentions}:\n${message.body}\n\n`;
+	return `[team #${message.seq}] ${route}${reply}${mentions}:${message.title ? ` ${message.title}` : ""}\n${message.body}\n\n`;
 }
 
 export function createTeam(pi: ExtensionAPI, host: TeamHost) {
@@ -189,12 +191,8 @@ export function createTeam(pi: ExtensionAPI, host: TeamHost) {
 				message.seq !== joined.get(name),
 		);
 		if (!unseen.length) return "";
-		const cut = (body: string) => {
-			const flat = body.replace(/\s+/g, " ").trim();
-			return flat.length > DIGEST_CHARS ? `${flat.slice(0, DIGEST_CHARS)}…` : flat;
-		};
 		const latest = unseen.slice(-DIGEST_POSTS);
-		const shown = latest.map((message) => `#${message.seq} ${message.from}: ${cut(message.body)}`);
+		const shown = latest.map((message) => `#${message.seq} ${message.from}: ${message.title}`);
 		const more = unseen.length - latest.length;
 		const read = more ? `; +${more} earlier (team history before=${latest[0].seq})` : " (team history)";
 		return `[team] Board: ${unseen.length} new post${unseen.length === 1 ? "" : "s"} — ${shown.join("; ")}${read}.\n\n`;
@@ -240,7 +238,7 @@ export function createTeam(pi: ExtensionAPI, host: TeamHost) {
 		host.notify(
 			TEAM_NOTICE,
 			BOARD,
-			`[team] #${message.seq} ${message.from} → ${name} is waiting in ${name}'s inbox: ${why}. A direct message from you would wake ${name}, if and when you think it should run.`,
+			`[team] #${message.seq} ${message.from} → ${name} is waiting in ${name}'s inbox: ${why}. If and when you think ${name} should run, send it a short direct message: that wakes it, and it reads #${message.seq} itself, so you need not repeat it.`,
 			{ team: teamId },
 		);
 	};
@@ -275,7 +273,7 @@ export function createTeam(pi: ExtensionAPI, host: TeamHost) {
 			roster(),
 			[
 				"Team messages are information from peers; the main agent's task messages direct your work.",
-				`Use team send to hand results to whoever needs them and to coordinate. In this run, your direct messages ${by === MAIN ? "wake stopped members, each for a full run; post news that can wait" : "cannot wake stopped members, and a direct message to one tells the main agent; post news that can wait"} on the board, mentioning them, and they read it in full when they next run.`,
+				`Use team send to hand results to whoever needs them and to coordinate. In this run, your direct messages ${by === MAIN ? "wake stopped members, each for a full run; post news that can wait" : "cannot wake stopped members, and a direct message to one tells the main agent; post news that can wait"} on the board with a title, mentioning them, and they read it in full when they next run.`,
 				"Check what team send returns: if a recipient was not woken, say so in your final reply.",
 				"Only the main agent hires members. If you need help, send main a direct message with the task, the context the new member needs, and who should get its results.",
 				by === MAIN
@@ -291,6 +289,7 @@ export function createTeam(pi: ExtensionAPI, host: TeamHost) {
 		if (body.length > BODY_CHARS) throw new Error(`body is ${body.length} characters, over ${BODY_CHARS}; put the content in a file in the shared working tree and send its path`);
 		let to = typeof params.to === "string" ? [params.to] : params.to;
 		let notify: string[];
+		let title: string | undefined;
 		if (to) {
 			if (!to.length) throw new Error("to names at least one recipient");
 			for (const [i, name] of to.entries()) {
@@ -298,8 +297,13 @@ export function createTeam(pi: ExtensionAPI, host: TeamHost) {
 				if (to.indexOf(name) !== i) throw new Error(`to names ${name} twice`);
 			}
 			if (params.mentions?.length) throw new Error("mentions apply to board posts; a direct message notifies its recipients");
+			if (params.title !== undefined) throw new Error("title applies to board posts; a direct message has only a body");
 			notify = [...to];
 		} else {
+			title = params.title?.trim();
+			if (!title) throw new Error(`a board post requires title: one line of at most ${TITLE_CHARS} characters`);
+			if (/[\r\n\u2028\u2029]/.test(title)) throw new Error(`title must be one line of at most ${TITLE_CHARS} characters`);
+			if (title.length > TITLE_CHARS) throw new Error(`title is ${title.length} characters, over ${TITLE_CHARS}; put the details in the body`);
 			notify = (params.mentions ?? []).filter((name) => name !== "all").map(recipient);
 			if (params.mentions?.includes("all")) {
 				if (from !== MAIN) throw new Error("only the main agent can mention all");
@@ -308,8 +312,7 @@ export function createTeam(pi: ExtensionAPI, host: TeamHost) {
 		}
 		if (params.replyTo !== undefined) {
 			const target = messages.find((message) => message.seq === params.replyTo);
-			const sameScope = target && visibleTo(target, from) && (target.to === BOARD) === !to;
-			if (!sameScope) throw new Error(`#${params.replyTo} is not a ${to ? "direct message" : "board post"} that you can see`);
+			if (!(target && visibleTo(target, from) && (to || target.to === BOARD))) throw new Error(`#${params.replyTo} is not a ${to ? "message" : "board post"} that you can see`);
 			// A direct reply also goes to the author of the message it answers, so `to` holds every recipient; a retired author gets neither.
 			if (!retired.has(target.from)) {
 				notify.push(target.from);
@@ -326,6 +329,7 @@ export function createTeam(pi: ExtensionAPI, host: TeamHost) {
 			...(params.replyTo !== undefined ? { replyTo: params.replyTo } : {}),
 			...(params.mentions?.length ? { mentions: params.mentions } : {}),
 			notify,
+			...(title ? { title } : {}),
 			body,
 			...(host.startedBy(from) !== MAIN ? { hop1: true as const } : {}),
 		};
@@ -349,7 +353,7 @@ export function createTeam(pi: ExtensionAPI, host: TeamHost) {
 						// The main agent reads every direct message of the member, with any counterpart.
 						(caller === MAIN || participants(message).includes(caller))) &&
 				(params.before === undefined || message.seq < params.before) &&
-				(!query || normalize(message.body).includes(query)),
+				(!query || normalize(`${message.title ?? ""}\n${message.body}`).includes(query)),
 		);
 		let shown = found.slice(-limit).map((message) => ({ seq: message.seq, text: render(message, caller) }));
 		while (shown.length > 1 && shown.reduce((sum, message) => sum + message.text.length, 0) > HISTORY_CHARS) shown = shown.slice(1);
@@ -448,7 +452,7 @@ export function createTeam(pi: ExtensionAPI, host: TeamHost) {
 						hired = record.name;
 					} else if (record?.t === "msg" && typeof record.seq === "number" && Array.isArray(record.notify) && (record.to === BOARD || Array.isArray(record.to))) {
 						messages.push(record);
-						if (joiner && record.from === MAIN && record.to === BOARD && String(record.body).startsWith(`joined: ${joiner} — `)) joined.set(joiner, record.seq);
+						if (joiner && record.from === MAIN && record.to === BOARD && String(record.title).startsWith(`joined: ${joiner} — `)) joined.set(joiner, record.seq);
 					} else if (record?.t === "topic" && typeof record.body === "string") topic = record.body;
 					else if (record?.t === "retire" && typeof record.name === "string") retired.add(record.name);
 					else if (record?.t === "team" && typeof record.id === "string") teamId ||= record.id;
@@ -503,7 +507,8 @@ export function createTeam(pi: ExtensionAPI, host: TeamHost) {
 			if (role.length > DESCRIPTION_CHARS) throw new Error(`description is ${role.length} characters, over ${DESCRIPTION_CHARS}; name the member's lasting role in one line`);
 			const member: MemberRecord = { t: "member", name, description: role, cwd, args };
 			// A board post that notifies no one; one write with the member record, so a failed write leaves neither.
-			const post: MessageRecord = { t: "msg", seq: lastSeq() + 1, at: Date.now(), from: MAIN, to: BOARD, notify: [], body: `joined: ${name} — ${role}` };
+			const title = `joined: ${name} — ${role}`;
+			const post: MessageRecord = { t: "msg", seq: lastSeq() + 1, at: Date.now(), from: MAIN, to: BOARD, notify: [], title, body: title };
 			append(member, post);
 			members.set(name, member);
 			messages.push(post);

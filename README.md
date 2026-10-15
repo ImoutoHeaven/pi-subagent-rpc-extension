@@ -25,7 +25,7 @@ To try it for one run: `pi -e /path/to/pi-subagent-rpc-extension`. Subagents do 
 | `switch` | `id`, `model`, `thinking`, `when`, `message`, `waitMs` | Moves the member to another model or thinking level, from its next run or, with `when: now`, at once; see [Switching models](#switching-models). |
 
 - `name`: required, and the member's id. Names are 2 to 24 lowercase letters, digits, or hyphens, start with a letter, and do not end with a hyphen. `main`, `all`, and `team` are reserved, and a name is used once per team: `run` on an existing or retired member fails, and a direct message gives an existing member more work.
-- `description`: required, the member's lasting role rather than its current task, in one line of at most 100 characters, such as `runs the e2e suite and reports failures`. The team roster shows it, and hiring posts `joined: <name> — <description>` to the board from `main`.
+- `description`: required, the member's lasting role rather than its current task, in one line of at most 100 characters, such as `runs the e2e suite and reports failures`. The team roster shows it, and hiring posts `joined: <name> — <description>` to the board from `main`, as the post's title and body.
 - `message`: the task. A member starts with an empty conversation, so `message` carries the context it needs. For `compact`, the task the member runs once compacted, or with `wake: false` the message written into its context after the summary; for `switch`, the task the member runs at once on the new settings. A fresh member with a self-contained `message` suits a different domain or a new task; a stopped member compacted with instructions that keep what helps, then given the task, suits continuing its work or similar work that its earlier context helps with.
 - `retire`: required for `abort`. `true` retires the member, running or stopped: it leaves the team for good. The roster, `members`, `status` without `id`, and the background footer leave it out, `all` does not cover it, and nothing wakes it again. A direct message or mention naming it fails with `tester is retired`, as do `compact` and `switch`, and a reply to its message does not notify it. `status` with its `id` still shows its last result, and its session, `final.md`, and team log records stay. The result lists the direct messages that reached it after its last read in this session, or after the session was reopened: `tester is retired: it left the team; its session and final.md stay. tester had 2 unread messages: #41, #45.` `false` only stops the member.
 - `instructions`: for `compact`, Pi's custom instructions for the compaction that runs, up to 4000 characters; how they shape the summary depends on that compaction, Pi's own or an extension's.
@@ -123,13 +123,13 @@ The main agent (`main`) and every member have it.
 
 | Action | Parameters | Behavior |
 |---|---|---|
-| `send` | `body`, `to`, `mentions`, `replyTo` | Posts to the board (no `to`) or sends one direct message to `to`, a member name, `main`, or a list of them. Returns `#seq` and what happened for each recipient. |
+| `send` | `title`, `body`, `to`, `mentions`, `replyTo` | Posts to the board (no `to`) with `title` and `body`, or sends one direct message with `body` to `to`, a member name, `main`, or a list of them. `replyTo` names the message it answers and notifies that message's author: a board post answers a board post, and a direct message answers either, with the author added to its recipients. Returns `#seq` and what happened for each recipient. |
 | `history` | `with`, `query`, `before`, `limit` | Reads the board, or the caller's direct messages with `with`; for the main agent, every direct message of the member named in `with`. `query` matches text case-insensitively. Oldest first, at most `limit` messages (default 20, maximum 50) and 16000 characters; `before=<seq>` pages back. |
 | `wait` | `ms` | Returns once a message for the caller is pending, or after `ms` (default 30000, maximum 240000). The messages follow the tool result. |
 | `members` | | Members with their states (`running`, `compacting`, `stopped`, `stopped (error)`, `stopped (only main wakes it)` for a member the main agent aborted, or `stopped (error; only main wakes it)`) and roles, such as `- tester: running — runs the e2e suite and reports failures`, and the topic. Retired members are left out, here and in a member's preamble. |
 | `topic` | `body` | Sets the topic (main agent only). |
 
-`body` holds up to 8000 characters and `topic` up to 2000; a longer one fails with its length, as in `body is 8312 characters, over 8000`. Larger content belongs in files in the shared working tree, with the path in the message.
+A board post requires `title`, one line of at most 100 characters; a direct message takes none. `body` holds up to 8000 characters and `topic` up to 2000; a longer one fails with its length, as in `body is 8312 characters, over 8000`. Larger content belongs in files in the shared working tree, with the path in the message.
 
 Every member sees the whole board and the direct messages it sent or received, each with all of its recipients. The main agent also reads every member's direct messages with `history`. A message reaches the main agent and the members at one of three levels:
 
@@ -141,15 +141,15 @@ Every member sees the whole board and the direct messages it sent or received, e
 
 Only the main agent can mention `all`. A join announcement mentions no one, so the other members get it in their board digest.
 
-The board digest is one line about the board posts the recipient has not seen: the latest three, each cut to about 80 characters, and a count of the earlier ones with the `history` call that reads them.
+The board digest is one line about the board posts the recipient has not seen: the titles of the latest five, and a count of the earlier ones with the `history` call that reads them.
 
 ```text
-[team] Board: 5 new posts — #14 tester: Fixture 7 fails on Windows paths; #15 reviewer: The parser change looks right; #16 main: Freeze the API; +2 earlier (team history before=14).
+[team] Board: 7 new posts — #14 tester: Fixture 7 fails on Windows paths; #15 reviewer: Parser change approved; #16 main: API frozen; #17 tester: Suite green on Linux; #18 main: joined: docs — keeps the README current; +2 earlier (team history before=14).
 ```
 
 A member gets the digest at the start of a run and after tool results. The main agent gets it as a `team-notice` after a turn with tool calls and at the start of each run. A post that a `history` result shows stays out of later digests. A new member's first digest covers the board posts from before it joined, without its own join announcement. Each agent's place on the board follows the current branch of its session, so after the session is reopened or the main agent moves in the session tree, its digest lists the posts that branch has not seen. A digest never counts for `team wait`, never wakes anyone, and never continues a run by itself.
 
-A member reads its messages at safe points: at the start of each run along with a preamble that names the team, lists its members, and states the rules of that run (whether its direct messages wake stopped members, that news that need not wake anyone goes on the board with a mention, that only the main agent hires, where its final reply goes, and which messages that reply cites by `#seq` instead of repeating them), after tool results, and when its run would end, in which case the run continues with them. A member has read a message once the current branch of its session holds it, so a message that never joined that branch, such as one in a batch another extension dropped, arrives at the next safe point.
+A member reads its messages at safe points: at the start of each run along with a preamble that names the team, lists its members, and states the rules of that run (whether its direct messages wake stopped members, that news that need not wake anyone goes on the board with a title and a mention, that only the main agent hires, where its final reply goes, and which messages that reply cites by `#seq` instead of repeating them), after tool results, and when its run would end, in which case the run continues with them. A member has read a message once the current branch of its session holds it, so a message that never joined that branch, such as one in a batch another extension dropped, arrives at the next safe point.
 
 A direct message to a stopped member wakes it: the member runs again in its own session, and its messages arrive at the start of that run. Board posts never wake. The `send` result shows each recipient as `main`, `running`, `woken`, or stopped and why:
 
@@ -162,14 +162,14 @@ A direct message to a stopped member wakes it: the member runs again in its own 
 | Stopped, direct message from a member after the main agent aborted the recipient | Not woken: only the main agent's direct message wakes it. |
 | Stopped, board post | Not woken. |
 
-A direct message that cannot wake its recipient waits in the recipient's inbox, and the main agent gets a one-line `team-notice` about it, delivered like a team message: it starts a turn of an idle main agent and reaches a busy one at its next turn boundary. A direct message that arrives after a member's last read of its run is routed the same way once the run ends; its sender, if still running, then also gets a notice.
+A direct message that cannot wake its recipient waits in the recipient's inbox, and the main agent gets a one-line `team-notice` about it, delivered like a team message: it starts a turn of an idle main agent and reaches a busy one at its next turn boundary. The notice says that a short direct message from the main agent wakes the recipient, which then reads the waiting message itself. A direct message that arrives after a member's last read of its run is routed the same way once the run ends; its sender, if still running, then also gets a notice.
 
 The final reply of a run woken by member X goes to X as a direct message holding the reply, cut to fit, and the path of `final.md`. When X has stopped, the reply goes to the main agent as a `subagent-result` marked `woken by X; X had stopped`. Every other run's result goes to the main agent.
 
 A member's message renders as:
 
 ```text
-[team #42] reviewer → #team, replying to #40, mentions you:
+[team #42] reviewer → #team, replying to #40, mentions you: Fixture 7 breaks
 The parser change breaks the fixture in test/cases/7.json.
 
 [team #43] main → you, tester (direct):

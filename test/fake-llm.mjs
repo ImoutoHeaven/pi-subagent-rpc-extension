@@ -38,7 +38,7 @@ const CALLS = /^CALLS (\d+) (\{.*?\}) \|\| (\{.*\})$/s;
 const WOKEN = /^.* sent you a team message\. Act on your team messages\.$/;
 const isTeam = (m) => m.role === "user" && /^\[(team|subagent\])/.test(text(m));
 /** The body of the last team message in a run's start message. */
-const lastBody = (start) => text(start).split(/\[team #\d+\][^\n]*:\n/).at(-1).split("\n[team] Board: ")[0].trim();
+const lastBody = (start) => text(start).split(/\[team #\d+\][^\n]*\n/).at(-1).split("\n[team] Board: ")[0].trim();
 
 async function reply(body) {
 	const messages = body.messages.flatMap((m, i, all) =>
