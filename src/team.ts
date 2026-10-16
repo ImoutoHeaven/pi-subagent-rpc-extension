@@ -37,7 +37,9 @@ const INBOX_SIZE = 10;
 const HISTORY_LIMIT = 20;
 const MAX_HISTORY_LIMIT = 50;
 const HISTORY_CHARS = 16_000;
-const DIGEST_POSTS = 5;
+const DIGEST_THREADS = 5;
+/** A collapsed body in a thread view keeps this much of its first line. */
+const BRIEF_CHARS = 100;
 export const DESCRIPTION_CHARS = 100;
 const FORK_NOTICE =
 	"[team] The team messages above belong to the team of the session this one was forked from. This session has a team of its own, which starts without members; resume the original session to work with that team.\n\n";
@@ -102,15 +104,14 @@ const text = (body: string, details?: object) => ({ content: [{ type: "text" as 
 /** The sender and recipients of a direct message; none for a board post. */
 const participants = (message: MessageRecord) => (message.to === BOARD ? [] : [message.from, ...message.to]);
 const visibleTo = (message: MessageRecord, name: string) => message.to === BOARD || participants(message).includes(name);
-
-/** One message as its viewer reads it. Ends with a blank line, which keeps consecutive messages apart. */
-function render(message: MessageRecord, viewer: string) {
-	const who = (name: string) => (name === viewer ? "you" : name);
-	const route = message.to === BOARD ? `${who(message.from)} → #team` : `${who(message.from)} → ${message.to.map(who).join(", ")} (direct)`;
-	const reply = message.replyTo ? `, replying to #${message.replyTo}` : "";
-	const mentions = message.mentions?.length ? `, mentions ${message.mentions.map(who).join(", ")}` : "";
-	return `[team #${message.seq}] ${route}${reply}${mentions}:${message.title ? ` ${message.title}` : ""}\n${message.body}\n\n`;
-}
+/** Whether history shows `message` to `name`: the main agent reads every message. */
+const sees = (name: string, message: MessageRecord) => name === MAIN || visibleTo(message, name);
+const plural = (n: number, one: string, many: string) => `${n} ${n === 1 ? one : many}`;
+const add = <K, V>(groups: Map<K, V[]>, key: K, value: V) => {
+	const group = groups.get(key) ?? [];
+	groups.set(key, group);
+	group.push(value);
+};
 
 export function createTeam(pi: ExtensionAPI, host: TeamHost) {
 	/** `<session base>/team.jsonl`, created by the first record written to it. */
@@ -121,6 +122,25 @@ export function createTeam(pi: ExtensionAPI, host: TeamHost) {
 	const members = new Map<string, MemberRecord>();
 	const retired = new Set<string>();
 	let messages: MessageRecord[] = [];
+	/** Each message's thread root by seq: a reply joins the thread of the message it answers. The log is append-only, so a root never changes. */
+	const roots = new Map<number, MessageRecord>();
+	const rootOf = (message: MessageRecord) => roots.get(message.seq) as MessageRecord;
+	/** Adds a message from the log to the team's messages and to `roots`. */
+	const track = (message: MessageRecord) => {
+		messages.push(message);
+		roots.set(message.seq, (message.replyTo !== undefined && roots.get(message.replyTo)) || message);
+	};
+
+	/** One message as its viewer reads it; it cites the message it answers and its thread by id. Ends with a blank line, which keeps consecutive messages apart. */
+	const render = (message: MessageRecord, viewer: string) => {
+		const who = (name: string) => (name === viewer ? "you" : name);
+		const route = message.to === BOARD ? `${who(message.from)} → #team` : `${who(message.from)} → ${message.to.map(who).join(", ")} (direct)`;
+		const root = rootOf(message);
+		const thread = `#${root.seq}${root.title ? ` "${root.title}"` : ""}`;
+		const reply = message.replyTo === undefined ? "" : `, replying to ${message.replyTo === root.seq ? thread : `#${message.replyTo} in ${thread}`}`;
+		const mentions = message.mentions?.length ? `, mentions ${message.mentions.map(who).join(", ")}` : "";
+		return `[team #${message.seq}] ${route}${reply}${mentions}:${message.title ? ` ${message.title}` : ""}\n${message.body}\n\n`;
+	};
 	let topic = "";
 	/** Held `wait` requests by member. */
 	const waiters = new Map<string, Set<() => void>>();
@@ -179,7 +199,13 @@ export function createTeam(pi: ExtensionAPI, host: TeamHost) {
 	const due = (name: string, seen: Set<number>) => messages.filter((message) => message.notify.includes(name) && !seen.has(message.seq));
 	const pendingCount = (name: string, seen: Set<number>) => due(name, seen).length + (notices.get(name)?.length ?? 0);
 
-	/** One line about the board posts after `cursor` that `name` did not write, was not notified of, and whose seq `seen` lacks, without its join announcement; empty when there are none. */
+	/** A thread's latest activity for `viewer`, the key board history pages by: the highest seq in it that the viewer can see. */
+	const activity = (root: MessageRecord, viewer: string) => (messages.findLast((message) => rootOf(message) === root && sees(viewer, message)) ?? root).seq;
+
+	/**
+	 * One line about the board posts after `cursor` that `name` did not write, was not notified of, and whose seq `seen` lacks, without its join announcement,
+	 * by thread; empty when there are none.
+	 */
 	const digest = (name: string, cursor: number, seen: Set<number>) => {
 		const unseen = messages.filter(
 			(message) =>
@@ -191,11 +217,22 @@ export function createTeam(pi: ExtensionAPI, host: TeamHost) {
 				message.seq !== joined.get(name),
 		);
 		if (!unseen.length) return "";
-		const latest = unseen.slice(-DIGEST_POSTS);
-		const shown = latest.map((message) => `#${message.seq} ${message.from}: ${message.title}`);
-		const more = unseen.length - latest.length;
-		const read = more ? `; +${more} earlier (team history before=${latest[0].seq})` : " (team history)";
-		return `[team] Board: ${unseen.length} new post${unseen.length === 1 ? "" : "s"} — ${shown.join("; ")}${read}.\n\n`;
+		const threads = new Map<MessageRecord, MessageRecord[]>();
+		for (const message of unseen) add(threads, rootOf(message), message);
+		/** The unseen posts by thread, in the order of each thread's latest unseen post. */
+		const all = [...threads].sort(([, a], [, b]) => a[a.length - 1].seq - b[b.length - 1].seq);
+		const by = (posts: MessageRecord[]) => `(${posts.map((message) => `#${message.seq} ${message.from}`).join(", ")})`;
+		const shown = all.slice(-DIGEST_THREADS).map(([root, posts]) => {
+			if (posts[0] !== root) return `#${root.seq} "${root.title}": ${plural(posts.length, "new reply", "new replies")} ${by(posts)}`;
+			const replies = posts.slice(1);
+			return `#${root.seq} ${root.from}: ${root.title}${replies.length ? `, ${plural(replies.length, "reply", "replies")} ${by(replies)}` : ""}`;
+		});
+		const earlier = all.slice(0, -DIGEST_THREADS);
+		// History before this key lists every earlier thread.
+		const key = () => Math.max(...earlier.map(([root]) => activity(root, name))) + 1;
+		const read = earlier.length ? `; +${earlier.length} earlier (team history before=${key()})` : " (team history)";
+		const inThreads = all.length < unseen.length ? ` in ${plural(all.length, "thread", "threads")}` : "";
+		return `[team] Board: ${plural(unseen.length, "new post", "new posts")}${inThreads} — ${shown.join("; ")}${read}.\n\n`;
 	};
 
 	/** The messages for `name` that `seen` lacks, at most INBOX_SIZE; with `cursor`, the member's board cursor, also the digest of the board posts after it that `seen` lacks. */
@@ -287,6 +324,7 @@ export function createTeam(pi: ExtensionAPI, host: TeamHost) {
 		const body = params.body?.trim() ?? "";
 		if (!body) throw new Error("send requires body");
 		if (body.length > BODY_CHARS) throw new Error(`body is ${body.length} characters, over ${BODY_CHARS}; put the content in a file in the shared working tree and send its path`);
+		if (params.replyTo !== undefined && params.title !== undefined) throw new Error("title names a thread; a reply has only a body");
 		let to = typeof params.to === "string" ? [params.to] : params.to;
 		let notify: string[];
 		let title: string | undefined;
@@ -300,10 +338,11 @@ export function createTeam(pi: ExtensionAPI, host: TeamHost) {
 			if (params.title !== undefined) throw new Error("title applies to board posts; a direct message has only a body");
 			notify = [...to];
 		} else {
-			title = params.title?.trim();
-			if (!title) throw new Error(`a board post requires title: one line of at most ${TITLE_CHARS} characters`);
-			if (/[\r\n\u2028\u2029]/.test(title)) throw new Error(`title must be one line of at most ${TITLE_CHARS} characters`);
-			if (title.length > TITLE_CHARS) throw new Error(`title is ${title.length} characters, over ${TITLE_CHARS}; put the details in the body`);
+			// A reply joins its thread, which the title of its first post names.
+			title = params.replyTo === undefined ? (params.title?.trim() ?? "") : undefined;
+			if (title === "") throw new Error(`a board post requires title: one line of at most ${TITLE_CHARS} characters`);
+			if (title && /[\r\n\u2028\u2029]/.test(title)) throw new Error(`title must be one line of at most ${TITLE_CHARS} characters`);
+			if (title && title.length > TITLE_CHARS) throw new Error(`title is ${title.length} characters, over ${TITLE_CHARS}; put the details in the body`);
 			notify = (params.mentions ?? []).filter((name) => name !== "all").map(recipient);
 			if (params.mentions?.includes("all")) {
 				if (from !== MAIN) throw new Error("only the main agent can mention all");
@@ -334,33 +373,100 @@ export function createTeam(pi: ExtensionAPI, host: TeamHost) {
 			...(host.startedBy(from) !== MAIN ? { hop1: true as const } : {}),
 		};
 		append(message);
-		messages.push(message);
+		track(message);
 		for (const name of notify) ping(name);
 		if (notify.includes(MAIN)) host.notify(TEAM_MESSAGE, from, render(message, MAIN), details(message));
 		if (!notify.length) return `Posted #${message.seq}. It notified nobody; members see it in history.`;
 		return `Sent #${message.seq} to ${notify.map((name) => route(message, name)).join(", ")}.`;
 	};
 
-	const history = (caller: string, params: TeamParams) => {
-		if (params.with !== undefined && known(params.with) === caller) throw new Error("with names another member");
-		const limit = Math.min(params.limit ?? HISTORY_LIMIT, MAX_HISTORY_LIMIT);
-		const query = params.query ? normalize(params.query) : "";
-		const found = messages.filter(
-			(message) =>
-				(params.with === undefined
-					? message.to === BOARD
-					: participants(message).includes(params.with) &&
-						// The main agent reads every direct message of the member, with any counterpart.
-						(caller === MAIN || participants(message).includes(caller))) &&
-				(params.before === undefined || message.seq < params.before) &&
-				(!query || normalize(`${message.title ?? ""}\n${message.body}`).includes(query)),
-		);
-		let shown = found.slice(-limit).map((message) => ({ seq: message.seq, text: render(message, caller) }));
-		while (shown.length > 1 && shown.reduce((sum, message) => sum + message.text.length, 0) > HISTORY_CHARS) shown = shown.slice(1);
-		const covered = shown.map((message) => message.seq);
+	/** Lists history `items`, ascending by key, in the caller's order within the limit and the character budget, dropping from the far end, and names the call that reads on. */
+	const page = (items: { key: number; text: string; covered: number[] }[], params: TeamParams) => {
+		const newest = params.order !== "oldest";
+		let shown = (newest ? [...items].reverse() : items).slice(0, Math.min(params.limit ?? HISTORY_LIMIT, MAX_HISTORY_LIMIT));
+		while (shown.length > 1 && shown.reduce((sum, item) => sum + item.text.length, 0) > HISTORY_CHARS) shown = shown.slice(0, -1);
+		const covered = shown.flatMap((item) => item.covered);
 		if (!shown.length) return { text: "No messages.", covered };
-		const older = found.length > shown.length ? `Older messages exist: history before=${shown[0].seq}.\n\n` : "";
-		return { text: older + shown.map((message) => message.text).join("").trimEnd(), covered };
+		const far = shown[shown.length - 1].key;
+		const more = items.length > shown.length ? (newest ? `More: history before=${far}.` : `More: history order=oldest after=${far}.`) : "";
+		return { text: (shown.map((item) => item.text).join("") + more).trimEnd(), covered };
+	};
+
+	/** The board as threads by latest activity, each its first post and a count of its replies, or the caller's direct messages `with` a member, or one thread. */
+	const history = (caller: string, params: TeamParams) => {
+		if (params.thread !== undefined) return thread(caller, params);
+		if (params.with !== undefined && known(params.with) === caller) throw new Error("with names another member");
+		const query = params.query ? normalize(params.query) : "";
+		const matches = (message: MessageRecord) => !query || normalize(`${message.title ?? ""}\n${message.body}`).includes(query);
+		const inRange = (key: number) => (params.before === undefined || key < params.before) && (params.after === undefined || key > params.after);
+		if (params.with !== undefined) {
+			const found = messages.filter(
+				(message) =>
+					participants(message).includes(params.with as string) &&
+					// The main agent reads every direct message of the member, with any counterpart.
+					(caller === MAIN || participants(message).includes(caller)) &&
+					inRange(message.seq) &&
+					matches(message),
+			);
+			return page(found.map((message) => ({ key: message.seq, text: render(message, caller), covered: [message.seq] })), params);
+		}
+		const threads = new Map<MessageRecord, MessageRecord[]>();
+		for (const message of messages) {
+			if (rootOf(message).to === BOARD && sees(caller, message)) add(threads, rootOf(message), message);
+		}
+		const items = [...threads].flatMap(([root, posts]) => {
+			const key = posts[posts.length - 1].seq;
+			const found = posts.filter(matches);
+			if (!inRange(key) || !found.length) return [];
+			const replies = found.filter((message) => message !== root);
+			const lines = [
+				posts.length > 1 ? `\n${plural(posts.length - 1, "reply", "replies")}, latest #${key}` : "",
+				query && replies.length ? `\nmatches ${replies.map((message) => `#${message.seq}`).join(", ")}` : "",
+			];
+			return [{ key, text: `${render(root, caller).trimEnd()}${lines.join("")}\n\n`, covered: [root.seq] }];
+		});
+		return page(items.sort((a, b) => a.key - b.key), params);
+	};
+
+	/**
+	 * The thread of message `params.thread` from its highest ancestor the caller can see, as a tree of the messages it can see.
+	 * Over the budget, bodies collapse to their first line, oldest first and the top message last; `covered` holds the messages shown in full.
+	 */
+	const thread = (caller: string, params: TeamParams) => {
+		if ([params.with, params.query, params.before, params.after].some((value) => value !== undefined)) throw new Error("thread shows one whole thread; it takes no with, query, before, or after");
+		const target = messages.find((message) => message.seq === params.thread);
+		if (!(target && sees(caller, target))) throw new Error(`#${params.thread} is not a message that you can see`);
+		const all = messages.filter((message) => rootOf(message) === rootOf(target));
+		const bySeq = new Map(all.map((message) => [message.seq, message]));
+		const up = (message: MessageRecord) => bySeq.get(message.replyTo ?? 0);
+		let top = target;
+		for (let parent = up(target); parent; parent = up(parent)) if (sees(caller, parent)) top = parent;
+		// A message hangs under its nearest ancestor the caller can see.
+		const children = new Map<MessageRecord, MessageRecord[]>();
+		for (const message of all) {
+			if (!sees(caller, message)) continue;
+			let parent = up(message);
+			while (parent && !sees(caller, parent)) parent = up(parent);
+			if (parent) add(children, parent, message);
+		}
+		const show = (message: MessageRecord, depth: number, body: string) => render({ ...message, body }, caller).replace(/^(?=.)/gm, "  ".repeat(depth));
+		const nodes: { message: MessageRecord; depth: number; text: string; full: boolean }[] = [];
+		const visit = (message: MessageRecord, depth: number) => {
+			nodes.push({ message, depth, text: show(message, depth, message.body), full: true });
+			for (const child of children.get(message) ?? []) visit(child, depth + 1);
+		};
+		visit(top, 0);
+		const header = `Thread #${top.seq}${top.title ? ` "${top.title}"` : ""} · ${plural(nodes.length, "message", "messages")}\n\n`;
+		let total = nodes.reduce((sum, node) => sum + node.text.length, header.length);
+		for (const node of [...nodes.slice(1).sort((a, b) => a.message.seq - b.message.seq), nodes[0]]) {
+			if (total <= HISTORY_CHARS) break;
+			const first = node.message.body.split("\n", 1)[0].slice(0, BRIEF_CHARS);
+			if (first === node.message.body) continue;
+			const text = show(node.message, node.depth, `${first} …`);
+			total += text.length - node.text.length;
+			Object.assign(node, { text, full: false });
+		}
+		return { text: (header + nodes.map((node) => node.text).join("")).trimEnd(), covered: nodes.filter((node) => node.full).map((node) => node.message.seq) };
 	};
 
 	const setTopic = (caller: string, params: TeamParams) => {
@@ -451,7 +557,7 @@ export function createTeam(pi: ExtensionAPI, host: TeamHost) {
 						members.set(record.name, record);
 						hired = record.name;
 					} else if (record?.t === "msg" && typeof record.seq === "number" && Array.isArray(record.notify) && (record.to === BOARD || Array.isArray(record.to))) {
-						messages.push(record);
+						track(record);
 						if (joiner && record.from === MAIN && record.to === BOARD && String(record.title).startsWith(`joined: ${joiner} — `)) joined.set(joiner, record.seq);
 					} else if (record?.t === "topic" && typeof record.body === "string") topic = record.body;
 					else if (record?.t === "retire" && typeof record.name === "string") retired.add(record.name);
@@ -481,7 +587,7 @@ export function createTeam(pi: ExtensionAPI, host: TeamHost) {
 			const earlier = rest.slice(0, Math.max(0, rest.length - INBOX_SIZE));
 			const count = (list: MessageRecord[]) =>
 				list.length === 1 ? `1 team message to or from you (#${list[0].seq})` : `${list.length} team messages to or from you (#${list[0].seq} to #${list[list.length - 1].seq})`;
-			const read = "read them in full with team history (with: a member, for direct messages)";
+			const read = "read them with team history (with: a member, for direct messages; thread: a #seq, for a thread)";
 			const notice = [
 				earlier.length ? `[team] Not shown here: ${count(earlier)}, earlier than those below; ${read}.\n\n` : "",
 				inSummary.length ? `[team] The branch summary covers ${count(inSummary)}; ${read}.\n\n` : "",
@@ -511,7 +617,7 @@ export function createTeam(pi: ExtensionAPI, host: TeamHost) {
 			const post: MessageRecord = { t: "msg", seq: lastSeq() + 1, at: Date.now(), from: MAIN, to: BOARD, notify: [], title, body: title };
 			append(member, post);
 			members.set(name, member);
-			messages.push(post);
+			track(post);
 			joined.set(name, post.seq);
 			return details(post);
 		},

@@ -123,13 +123,13 @@ The main agent (`main`) and every member have it.
 
 | Action | Parameters | Behavior |
 |---|---|---|
-| `send` | `title`, `body`, `to`, `mentions`, `replyTo` | Posts to the board (no `to`) with `title` and `body`, or sends one direct message with `body` to `to`, a member name, `main`, or a list of them. `replyTo` names the message it answers and notifies that message's author: a board post answers a board post, and a direct message answers either, with the author added to its recipients. Returns `#seq` and what happened for each recipient. |
-| `history` | `with`, `query`, `before`, `limit` | Reads the board, or the caller's direct messages with `with`; for the main agent, every direct message of the member named in `with`. `query` matches text case-insensitively. Oldest first, at most `limit` messages (default 20, maximum 50) and 16000 characters; `before=<seq>` pages back. |
+| `send` | `title`, `body`, `to`, `mentions`, `replyTo` | Posts to the board (no `to`) with `body`, or sends one direct message with `body` to `to`, a member name, `main`, or a list of them. A board post with `title` starts a thread. `replyTo` names the message it answers, joins its thread, and notifies that message's author: a board post answers a board post, and a direct message answers either, with the author added to its recipients. Returns `#seq` and what happened for each recipient. |
+| `history` | `with`, `query`, `before`, `after`, `order`, `limit`, `thread` | Lists the board's threads, each its first post in full and a line such as `3 replies, latest #51`, by latest activity: the highest `#seq` in the thread that the caller can see. With `with`, lists the caller's direct messages with that member; for the main agent, every direct message of the member. `query` matches text case-insensitively; a thread matches on any of its messages and names the matching replies. Newest first, or oldest first with `order: "oldest"`; `before=<seq>` and `after=<seq>` page; at most `limit` items (default 20, maximum 50) and 16000 characters. `thread=<seq>` shows the whole thread of that message as an indented tree, with the direct messages in it that the caller can see (the main agent sees all); over 16000 characters, the oldest bodies collapse to their first line. |
 | `wait` | `ms` | Returns once a message for the caller is pending, or after `ms` (default 30000, maximum 240000). The messages follow the tool result. |
 | `members` | | Members with their states (`running`, `compacting`, `stopped`, `stopped (error)`, `stopped (only main wakes it)` for a member the main agent aborted, or `stopped (error; only main wakes it)`) and roles, such as `- tester: running — runs the e2e suite and reports failures`, and the topic. Retired members are left out, here and in a member's preamble. |
 | `topic` | `body` | Sets the topic (main agent only). |
 
-A board post requires `title`, one line of at most 100 characters; a direct message takes none. `body` holds up to 8000 characters and `topic` up to 2000; a longer one fails with its length, as in `body is 8312 characters, over 8000`. Larger content belongs in files in the shared working tree, with the path in the message.
+A title names a thread: a board post that starts one requires `title`, one line of at most 100 characters, and a reply or a direct message takes none. `body` holds up to 8000 characters and `topic` up to 2000; a longer one fails with its length, as in `body is 8312 characters, over 8000`. Larger content belongs in files in the shared working tree, with the path in the message.
 
 Every member sees the whole board and the direct messages it sent or received, each with all of its recipients. The main agent also reads every member's direct messages with `history`. A message reaches the main agent and the members at one of three levels:
 
@@ -141,10 +141,10 @@ Every member sees the whole board and the direct messages it sent or received, e
 
 Only the main agent can mention `all`. A join announcement mentions no one, so the other members get it in their board digest.
 
-The board digest is one line about the board posts the recipient has not seen: the titles of the latest five, and a count of the earlier ones with the `history` call that reads them.
+The board digest is one line about the board posts the recipient has not seen, grouped by thread: the latest five threads, each a new thread with its title and any new replies, or an older thread with its new replies, and a count of the earlier threads with the `history` call that lists them.
 
 ```text
-[team] Board: 7 new posts — #14 tester: Fixture 7 fails on Windows paths; #15 reviewer: Parser change approved; #16 main: API frozen; #17 tester: Suite green on Linux; #18 main: joined: docs — keeps the README current; +2 earlier (team history before=14).
+[team] Board: 9 new posts in 7 threads — #15 reviewer: Parser change approved; #16 main: API frozen; #18 main: joined: docs — keeps the README current; #12 "Fixture 7 fails on Windows paths": 2 new replies (#17 tester, #19 main); #20 tester: Suite green on Linux, 1 reply (#21 main); +2 earlier (team history before=15).
 ```
 
 A member gets the digest at the start of a run and after tool results. The main agent gets it as a `team-notice` after a turn with tool calls and at the start of each run. A post that a `history` result shows stays out of later digests. A new member's first digest covers the board posts from before it joined, without its own join announcement. Each agent's place on the board follows the current branch of its session, so after the session is reopened or the main agent moves in the session tree, its digest lists the posts that branch has not seen. A digest never counts for `team wait`, never wakes anyone, and never continues a run by itself.
@@ -169,12 +169,17 @@ The final reply of a run woken by member X goes to X as a direct message holding
 A member's message renders as:
 
 ```text
-[team #42] reviewer → #team, replying to #40, mentions you: Fixture 7 breaks
+[team #42] reviewer → #team, mentions you: Fixture 7 breaks
 The parser change breaks the fixture in test/cases/7.json.
 
-[team #43] main → you, tester (direct):
-Fix the fixture named in #42, then rerun the suite.
+[team #43] main → you, tester (direct), replying to #42 "Fixture 7 breaks":
+Fix the fixture, then rerun the suite.
+
+[team #44] tester → main (direct), replying to #43 in #42 "Fixture 7 breaks":
+Fixed; the suite is green.
 ```
+
+A reply cites the message it answers and its thread by `#seq` and the thread's title; `team history thread=<seq>` reads them.
 
 ## Sessions and processes
 

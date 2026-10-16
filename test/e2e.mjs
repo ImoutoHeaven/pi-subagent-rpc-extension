@@ -705,13 +705,15 @@ await step("a direct message names each recipient once, never its sender, and on
 	}
 });
 
-await step("a board post requires a one-line title of at most 100 characters; a direct message takes none", async () => {
+await step("a board post requires a one-line title of at most 100 characters; a direct message and a reply take none", async () => {
 	for (const [params, error] of [
 		[{ body: "x" }, /a board post requires title: one line of at most 100 characters/],
 		[{ title: " ", body: "x" }, /a board post requires title: one line of at most 100 characters/],
 		[{ title: "two\nlines", body: "x" }, /title must be one line of at most 100 characters/],
 		[{ title: "t".repeat(101), body: "x" }, /title is 101 characters, over 100; put the details in the body/],
 		[{ to: "ann", title: "x", body: "x" }, /title applies to board posts; a direct message has only a body/],
+		[{ title: "x", body: "x", replyTo: 1 }, /title names a thread; a reply has only a body/],
+		[{ to: "ann", title: "x", body: "x", replyTo: 1 }, /title names a thread; a reply has only a body/],
 	]) {
 		const r = await teamCall({ action: "send", ...params });
 		assert.ok(r.isError, r.text);
@@ -726,9 +728,9 @@ await step("a direct message can answer a board post and also goes to its author
 	const sent = await teamCall({ action: "send", to: "ann", replyTo: Number(post), body: "SAY taken" });
 	const seq = sent.text.match(/^Sent #(\d+) to ann \(woken\), asker \(woken\)\.$/)?.[1] ?? assert.fail(sent.text);
 	for (const id of ["ann", "asker"]) assert.match(await report(id, mark), /taken/);
-	assert.match(rawText(requestsBy("asker").at(-1).messages.at(-1)), new RegExp(`\\[team #${seq}\\] main → ann, you \\(direct\\), replying to #${post}:\\nSAY taken\\n`));
+	assert.match(rawText(requestsBy("asker").at(-1).messages.at(-1)), new RegExp(`\\[team #${seq}\\] main → ann, you \\(direct\\), replying to #${post} "Who takes the parser\\?":\\nSAY taken\\n`));
 	assert.match((await teamCall({ action: "history" })).text, new RegExp(`\\[team #${post}\\] asker → #team: Who takes the parser\\?\\nThe parser needs an owner\\.`));
-	const r = await teamCall({ action: "send", title: "x", body: "x", replyTo: Number(seq) });
+	const r = await teamCall({ action: "send", body: "x", replyTo: Number(seq) });
 	assert.ok(r.isError, r.text);
 	assert.match(r.text, new RegExp(`#${seq} is not a board post that you can see`));
 });
@@ -1006,7 +1008,7 @@ await step("after team history on the board, no digest repeats those posts", asy
 	await finished("mike");
 	const seenBy = requestsBy("mike");
 	assert.equal(seenBy.length, 3);
-	assert.match(rawText(seenBy[1].messages.at(-1)), /main → #team: read in history\nread in history$/);
+	assert.match(rawText(seenBy[1].messages.at(-1)), /main → #team: read in history\nread in history\n\nMore: history before=\d+\.$/);
 	assert.ok(!seenBy.some((body) => body.messages.some((m) => DIGEST.test(rawText(m)))), "a digest repeated posts read in history");
 });
 
@@ -1021,7 +1023,7 @@ await step("a member's history marks only the posts it shows; the next digest li
 	const seenBy = requestsBy("xray");
 	assert.equal(seenBy.length, 3);
 	const afterHistory = seenBy[1].messages;
-	assert.equal(rawText(afterHistory.at(-2)), `Older messages exist: history before=${seqs[6]}.\n\n[team #${seqs[6]}] main → #team: post 7\nbody 7`);
+	assert.equal(rawText(afterHistory.at(-2)), `[team #${seqs[6]}] main → #team: post 7\nbody 7\n\nMore: history before=${seqs[6]}.`);
 	assert.equal(
 		text(afterHistory.at(-1)),
 		`[team] Board: 6 new posts — ${[1, 2, 3, 4, 5].map((i) => `#${seqs[i]} main: ${titles[i]}`).join("; ")}; +1 earlier (team history before=${seqs[1]}).`,
@@ -1034,7 +1036,7 @@ await step("a post a member read in history stays out of its digest when it is w
 	await until(() => requestsBy("zulu").length > 0);
 	await teamCall({ action: "send", title: "read by zulu", body: "read by zulu" });
 	await finished("zulu");
-	assert.match(rawText(requestsBy("zulu").at(-1).messages.at(-1)), /main → #team: read by zulu\nread by zulu$/);
+	assert.match(rawText(requestsBy("zulu").at(-1).messages.at(-1)), /main → #team: read by zulu\nread by zulu\n\nMore: history before=\d+\.$/);
 	const seq = (await teamCall({ action: "send", title: "after zulu", body: "after zulu" })).text.match(/^Posted #(\d+)\./)[1];
 	const mark = team.events.length;
 	assert.match((await teamCall({ action: "send", to: "zulu", body: "SAY zulu again" })).text, /\(woken\)\.$/);
@@ -1064,7 +1066,7 @@ await step("a new member's first digest lists the board posts from before it joi
 	// Every pre-hire board post counts, so the earlier steps' posts add to "before hotel 0".
 	assert.ok(Number(earlier) >= 1 && Number(count) === Number(earlier) + 5, start);
 	assert.doesNotMatch(start, /joined: hotel/);
-	assert.match(rawText(seenBy[1].messages.at(-1)), new RegExp(`\\[team #${during}\\] main → #team: during hotel\\nduring hotel$`));
+	assert.match(rawText(seenBy[1].messages.at(-1)), new RegExp(`\\[team #${during}\\] main → #team: during hotel\\nduring hotel\\n\\nMore: history before=${during}\\.$`));
 	assert.ok(!seenBy.some((body) => body.messages.some((m) => DIGEST.test(rawText(m)))), "a digest repeated a post read in history");
 	const mark = team.events.length;
 	assert.match((await teamCall({ action: "send", to: "hotel", body: "SAY hotel again" })).text, /\(woken\)\.$/);
@@ -1128,7 +1130,7 @@ await step("the main agent's history marks only the posts it shows; its next dig
 	// yankee's final reply is the result of its last post.
 	const last = Number(result.content.match(/Posted #(\d+)\./)[1]);
 	const shown = team.events.slice(from).find((e) => e.type === "tool_execution_end" && e.toolName === "team");
-	assert.match(shown.result.content[0].text, new RegExp(`\\[team #${last}\\] yankee → #team: yankee 3\\nyankee 3$`));
+	assert.equal(shown.result.content[0].text, `[team #${last}] yankee → #team: yankee 3\nyankee 3\n\nMore: history before=${last}.`);
 	assert.deepEqual(shown.result.details.covered, [last]);
 	assert.deepEqual(
 		team.messages(from).filter((m) => m.customType === "team-notice").map((m) => m.content),
@@ -1165,6 +1167,119 @@ await step("a run that a member's result starts gets the digest ahead of that re
 	);
 	const answered = requestFor("[settled] subagent oscar").messages;
 	assert.equal(text(answered.at(-2)), digest);
+});
+
+/** The seq in a send result: `Posted #n.` or `Sent #n to ...`. */
+const seqOf = (result) => Number(result.text.match(/^(?:Posted|Sent) #(\d+)/)?.[1] ?? assert.fail(result.text));
+/** The `covered` details of the main agent's last team tool result. */
+const lastCovered = () => team.events.findLast((e) => e.type === "tool_execution_end" && e.toolName === "team").result.details?.covered;
+
+await step("a reply cites what it answers and its thread; the digest groups new posts by thread", async () => {
+	const fixture = seqOf(await teamCall({ action: "send", title: "Fixture 7 breaks", body: "fixture" }));
+	await run({ name: "digester", message: `SLOW 6000 ${TEAM({ action: "members" })}`, waitMs: 0 });
+	await until(() => requestsBy("digester").length > 0);
+	const a1 = seqOf(await teamCall({ action: "send", replyTo: fixture, body: "a1" }));
+	const c = [];
+	for (const n of [1, 2, 3, 4]) c.push(seqOf(await teamCall({ action: "send", title: `c${n}`, body: `c${n}` })));
+	const a2 = seqOf(await teamCall({ action: "send", replyTo: a1, body: "a2" }));
+	const suite = seqOf(await teamCall({ action: "send", title: "Suite green", body: "suite" }));
+	const b1 = seqOf(await teamCall({ action: "send", replyTo: suite, body: "b1" }));
+	await finished("digester");
+	const next = requestsBy("digester").at(-1).messages;
+	assert.equal(next.at(-2).role, "tool");
+	assert.equal(
+		text(next.at(-1)),
+		`[team] Board: 8 new posts in 6 threads — #${c[1]} main: c2; #${c[2]} main: c3; #${c[3]} main: c4; #${fixture} "Fixture 7 breaks": 2 new replies (#${a1} main, #${a2} main); #${suite} main: Suite green, 1 reply (#${b1} main); +1 earlier (team history before=${c[0] + 1}).`,
+	);
+	assert.equal(
+		(await teamCall({ action: "history", thread: a2 })).text,
+		[
+			`Thread #${fixture} "Fixture 7 breaks" · 3 messages`,
+			"",
+			`[team #${fixture}] you → #team: Fixture 7 breaks`,
+			"fixture",
+			"",
+			`  [team #${a1}] you → #team, replying to #${fixture} "Fixture 7 breaks":`,
+			"  a1",
+			"",
+			`    [team #${a2}] you → #team, replying to #${a1} in #${fixture} "Fixture 7 breaks":`,
+			"    a2",
+		].join("\n"),
+	);
+	assert.deepEqual(lastCovered(), [fixture, a1, a2]);
+});
+
+await step("board history lists threads by latest activity, newest or oldest first, and pages with before and after; a query matches replies", async () => {
+	const p = [];
+	for (const n of [1, 2, 3]) p.push(seqOf(await teamCall({ action: "send", title: `P${n}`, body: `p${n}` })));
+	const q = seqOf(await teamCall({ action: "send", replyTo: p[0], body: "needle-7f3 in a reply" }));
+	const item = (i) => `[team #${p[i]}] you → #team: P${i + 1}\np${i + 1}${i === 0 ? `\n1 reply, latest #${q}` : ""}`;
+	const history = async (params) => (await teamCall({ action: "history", after: p[0] - 1, ...params })).text;
+	assert.equal(await history({}), [item(0), item(2), item(1)].join("\n\n"));
+	assert.equal(await history({ limit: 2 }), `${item(0)}\n\n${item(2)}\n\nMore: history before=${p[2]}.`);
+	assert.equal(await history({ before: p[2] }), item(1));
+	assert.equal(await history({ order: "oldest", limit: 2 }), `${item(1)}\n\n${item(2)}\n\nMore: history order=oldest after=${p[2]}.`);
+	assert.equal(await history({ order: "oldest", after: p[2] }), item(0));
+	assert.deepEqual(lastCovered(), [p[0]]);
+	assert.equal((await teamCall({ action: "history", query: "NEEDLE-7F3" })).text, `${item(0)}\nmatches #${q}`);
+});
+
+await step("a thread shows the messages its viewer can see as a tree, board and direct together; over the budget, the oldest bodies collapse first", async () => {
+	await run({ name: "reader", message: "SAY reader ready" });
+	await run({ name: "outsider", message: "SAY outsider ready" });
+	const root = Number((await run({ name: "writer", message: TEAM({ action: "send", title: "Thread root", body: "root body" }) })).text.match(/team: Posted #(\d+)/)[1]);
+	const board = await teamCall({ action: "send", replyTo: root, body: "board reply" });
+	assert.match(board.text, /to writer \(stopped; board posts do not wake\)\.$/);
+	const onward = TEAM({ action: "send", to: "reader", replyTo: root, body: "SAY between members zq-private" });
+	let mark = team.events.length;
+	const direct = seqOf(await teamCall({ action: "send", to: "writer", replyTo: seqOf(board), body: onward }));
+	await report("writer", mark);
+	await finished("reader");
+	const sent = requestsBy("writer").flatMap((body) => body.messages).map(rawText).find((t) => /^Sent #\d+ to reader \(woken\)\.$/.test(t)) ?? assert.fail("writer did not wake reader");
+	const between = seqOf({ text: sent });
+	const title = `#${root} "Thread root"`;
+	const top = [`[team #${root}] writer → #team: Thread root`, "root body", ""];
+	const boardReply = (who) => [`  [team #${seqOf(board)}] ${who} → #team, replying to ${title}:`, "  board reply"];
+	assert.equal(
+		(await teamCall({ action: "history", thread: direct })).text,
+		[
+			`Thread ${title} · 4 messages`,
+			"",
+			...top,
+			...boardReply("you"),
+			"",
+			`    [team #${direct}] you → writer (direct), replying to #${seqOf(board)} in ${title}:`,
+			`    ${onward}`,
+			"",
+			`  [team #${between}] writer → reader (direct), replying to ${title}:`,
+			"  SAY between members zq-private",
+		].join("\n"),
+	);
+	// A third member sees neither direct message, in the thread or in board history; the main agent sees both.
+	const boardItem = (replies, latest) => `${top.slice(0, 2).join("\n")}\n${replies}, latest #${latest}`;
+	const privateMatch = `${boardItem("3 replies", between)}\nmatches #${direct}, #${between}`;
+	assert.equal((await teamCall({ action: "history", after: root - 1 })).text, boardItem("3 replies", between));
+	assert.equal((await teamCall({ action: "history", query: "ZQ-PRIVATE" })).text, privateMatch);
+	mark = team.events.length;
+	const outsiderCalls = [{ thread: direct }, { thread: root }, { after: root - 1 }, { query: "ZQ-PRIVATE" }].map((params) => ({ action: "history", ...params }));
+	await teamCall({ action: "send", to: "outsider", body: TEAMS(outsiderCalls) });
+	await report("outsider", mark);
+	const shown = requestsBy("outsider").at(-1).messages.filter((m) => m.role === "tool").map(rawText).slice(-4);
+	assert.match(shown[0], new RegExp(`#${direct} is not a message that you can see`));
+	assert.equal(shown[1], [`Thread ${title} · 2 messages`, "", ...top, ...boardReply("main")].join("\n"));
+	assert.equal(shown[2], boardItem("1 reply", seqOf(board)));
+	assert.equal(shown[3], "No messages.");
+	const mixed = await teamCall({ action: "history", thread: root, query: "x" });
+	assert.ok(mixed.isError, mixed.text);
+	assert.match(mixed.text, /thread shows one whole thread; it takes no with, query, before, or after/);
+	// Three long replies pass the budget; the oldest collapses to its first line.
+	const long = [];
+	for (const n of [1, 2, 3]) long.push(seqOf(await teamCall({ action: "send", replyTo: root, body: `long ${n}\n${"y".repeat(6000)}` })));
+	const collapsed = (await teamCall({ action: "history", thread: root })).text;
+	assert.ok(collapsed.length <= 16_000, `${collapsed.length}`);
+	assert.ok(collapsed.includes(`\n  [team #${long[0]}] you → #team, replying to ${title}:\n  long 1 …\n\n`), collapsed.slice(0, 2000));
+	assert.ok(collapsed.endsWith(`long 3\n  ${"y".repeat(6000)}`));
+	assert.deepEqual(lastCovered(), [root, seqOf(board), direct, between, long[1], long[2]]);
 });
 
 await step("a team member without the extension fails its run", async () => {
@@ -1828,7 +1943,7 @@ await step("board posts an agent missed before its session closed show in its di
 		await reopened.waitEvent((e) => e.type === "agent_settled", (await reopened.waitMessage("subagent-result", woken)).at);
 		assert.match(
 			text(requestsBy("sam").at(-1).messages.at(-1)),
-			new RegExp(`main → you \\(direct\\):\\nSAY sam woken\\n\\n\\[team\\] Board: \\d+ new posts — [^\\n]*#${forMain} alpha: missed by main; \\+\\d+ earlier \\(team history before=\\d+\\)\\.$`),
+			new RegExp(`main → you \\(direct\\):\\nSAY sam woken\\n\\n\\[team\\] Board: \\d+ new posts in \\d+ threads — [^\\n]*#${forMain} alpha: missed by main; \\+\\d+ earlier \\(team history before=\\d+\\)\\.$`),
 		);
 	} finally {
 		await reopened.close();
@@ -1947,7 +2062,7 @@ await step("after a move to a team message with a summary, that message arrives 
 		const back = after(branch, target.parentId);
 		assert.deepEqual(back.slice(0, 3), [
 			["branch_summary", ""],
-			["team-notice", `[team] The branch summary covers 1 team message to or from you (#${dm + 1}); read them in full with team history (with: a member, for direct messages).`],
+			["team-notice", `[team] The branch summary covers 1 team message to or from you (#${dm + 1}); read them with team history (with: a member, for direct messages; thread: a #seq, for a thread).`],
 			["team-message", `[team #${dm}] uniform → you (direct):\nsummarized`],
 		]);
 		assert.deepEqual(branch.at(-3).details.covered, [dm + 1]);
@@ -1984,7 +2099,7 @@ await step("of many team messages a branch lacks, the latest ten arrive in full 
 	let leaf = "";
 	for (const expected of [
 		[
-			["team-notice", `[team] Not shown here: 2 team messages to or from you (#${first} to #${first + 1}), earlier than those below; read them in full with team history (with: a member, for direct messages).`],
+			["team-notice", `[team] Not shown here: 2 team messages to or from you (#${first} to #${first + 1}), earlier than those below; read them with team history (with: a member, for direct messages; thread: a #seq, for a thread).`],
 			...Array.from({ length: 10 }, (_, i) => ["team-message", `[team #${first + 2 + i}] uniform → you (direct):\nmissed ${2 + i}`]),
 		],
 		[],
