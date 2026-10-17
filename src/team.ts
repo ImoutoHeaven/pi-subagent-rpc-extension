@@ -38,8 +38,6 @@ const HISTORY_LIMIT = 20;
 const MAX_HISTORY_LIMIT = 50;
 const HISTORY_CHARS = 16_000;
 const DIGEST_THREADS = 5;
-/** A collapsed body in a thread view keeps this much of its first line. */
-const BRIEF_CHARS = 100;
 export const DESCRIPTION_CHARS = 100;
 const FORK_NOTICE =
 	"[team] The team messages above belong to the team of the session this one was forked from. This session has a team of its own, which starts without members; resume the original session to work with that team.\n\n";
@@ -430,10 +428,10 @@ export function createTeam(pi: ExtensionAPI, host: TeamHost) {
 
 	/**
 	 * The thread of message `params.thread` from its highest ancestor the caller can see, as a tree of the messages it can see.
-	 * Over the budget, bodies collapse to their first line, oldest first and the top message last; `covered` holds the messages shown in full.
+	 * Pages select messages by seq, then show them in tree order; `after` is the highest seq on the page, not its last tree node.
 	 */
 	const thread = (caller: string, params: TeamParams) => {
-		if ([params.with, params.query, params.before, params.after].some((value) => value !== undefined)) throw new Error("thread shows one whole thread; it takes no with, query, before, or after");
+		if ([params.with, params.query, params.before].some((value) => value !== undefined)) throw new Error("thread takes no with, query, or before; use after to continue");
 		const target = messages.find((message) => message.seq === params.thread);
 		if (!(target && sees(caller, target))) throw new Error(`#${params.thread} is not a message that you can see`);
 		const all = messages.filter((message) => rootOf(message) === rootOf(target));
@@ -449,24 +447,33 @@ export function createTeam(pi: ExtensionAPI, host: TeamHost) {
 			while (parent && !sees(caller, parent)) parent = up(parent);
 			if (parent) add(children, parent, message);
 		}
-		const show = (message: MessageRecord, depth: number, body: string) => render({ ...message, body }, caller).replace(/^(?=.)/gm, "  ".repeat(depth));
-		const nodes: { message: MessageRecord; depth: number; text: string; full: boolean }[] = [];
-		const visit = (message: MessageRecord, depth: number) => {
-			nodes.push({ message, depth, text: show(message, depth, message.body), full: true });
-			for (const child of children.get(message) ?? []) visit(child, depth + 1);
-		};
-		visit(top, 0);
-		const header = `Thread #${top.seq}${top.title ? ` "${top.title}"` : ""} · ${plural(nodes.length, "message", "messages")}\n\n`;
-		let total = nodes.reduce((sum, node) => sum + node.text.length, header.length);
-		for (const node of [...nodes.slice(1).sort((a, b) => a.message.seq - b.message.seq), nodes[0]]) {
-			if (total <= HISTORY_CHARS) break;
-			const first = node.message.body.split("\n", 1)[0].slice(0, BRIEF_CHARS);
-			if (first === node.message.body) continue;
-			const text = show(node.message, node.depth, `${first} …`);
-			total += text.length - node.text.length;
-			Object.assign(node, { text, full: false });
+		const nodes: { message: MessageRecord; depth: number }[] = [];
+		const stack = [{ message: top, depth: 0 }];
+		while (stack.length) {
+			const node = stack.pop()!;
+			nodes.push(node);
+			for (const child of [...(children.get(node.message) ?? [])].reverse()) stack.push({ message: child, depth: node.depth + 1 });
 		}
-		return { text: (header + nodes.map((node) => node.text).join("")).trimEnd(), covered: nodes.filter((node) => node.full).map((node) => node.message.seq) };
+		const header = `Thread #${top.seq}${top.title ? ` "${top.title}"` : ""} · ${plural(nodes.length, "message", "messages")}\n\n`;
+		const more = (seq: number) => `More: history thread=${target.seq} after=${seq}.`;
+		const budget = HISTORY_CHARS - header.length - more(lastSeq()).length - 2;
+		const remaining = nodes.filter(({ message }) => message.seq > (params.after ?? 0)).sort((a, b) => a.message.seq - b.message.seq);
+		const shown = new Map<number, string>();
+		let total = 0;
+		for (const { message, depth } of remaining.slice(0, params.limit ?? MAX_HISTORY_LIMIT)) {
+			let flat = render(message, caller);
+			// An unusually large recipient list may shorten the routing line, never the message body.
+			if (flat.length > budget) flat = `${flat.slice(0, budget - message.body.length - 4)}…\n${message.body}\n\n`;
+			let text = flat.replace(/^(?=.)/gm, "  ".repeat(Math.min(depth, 8)));
+			if (text.length > budget) text = flat;
+			if (total + text.length > budget) break;
+			shown.set(message.seq, text);
+			total += text.length;
+		}
+		const covered = nodes.map(({ message }) => message.seq).filter((seq) => shown.has(seq));
+		if (!covered.length) return { text: "No messages.", covered };
+		const next = shown.size < remaining.length ? more(Math.max(...shown.keys())) : "";
+		return { text: (header + covered.map((seq) => shown.get(seq)).join("") + next).trimEnd(), covered };
 	};
 
 	const setTopic = (caller: string, params: TeamParams) => {

@@ -1224,7 +1224,7 @@ await step("board history lists threads by latest activity, newest or oldest fir
 	assert.equal((await teamCall({ action: "history", query: "NEEDLE-7F3" })).text, `${item(0)}\nmatches #${q}`);
 });
 
-await step("a thread shows the messages its viewer can see as a tree, board and direct together; over the budget, the oldest bodies collapse first", async () => {
+await step("a thread shows only visible messages as a tree and pages full bodies within its budget", async () => {
 	await run({ name: "reader", message: "SAY reader ready" });
 	await run({ name: "outsider", message: "SAY outsider ready" });
 	const root = Number((await run({ name: "writer", message: TEAM({ action: "send", title: "Thread root", body: "root body" }) })).text.match(/team: Posted #(\d+)/)[1]);
@@ -1261,25 +1261,85 @@ await step("a thread shows the messages its viewer can see as a tree, board and 
 	assert.equal((await teamCall({ action: "history", after: root - 1 })).text, boardItem("3 replies", between));
 	assert.equal((await teamCall({ action: "history", query: "ZQ-PRIVATE" })).text, privateMatch);
 	mark = team.events.length;
-	const outsiderCalls = [{ thread: direct }, { thread: root }, { after: root - 1 }, { query: "ZQ-PRIVATE" }].map((params) => ({ action: "history", ...params }));
+	const outsiderCalls = [{ thread: direct }, { thread: root }, { after: root - 1 }, { query: "ZQ-PRIVATE" }, { thread: root, after: root, limit: 1 }].map((params) => ({ action: "history", ...params }));
 	await teamCall({ action: "send", to: "outsider", body: TEAMS(outsiderCalls) });
 	await report("outsider", mark);
-	const shown = requestsBy("outsider").at(-1).messages.filter((m) => m.role === "tool").map(rawText).slice(-4);
+	const shown = requestsBy("outsider").at(-1).messages.filter((m) => m.role === "tool").map(rawText).slice(-5);
 	assert.match(shown[0], new RegExp(`#${direct} is not a message that you can see`));
 	assert.equal(shown[1], [`Thread ${title} · 2 messages`, "", ...top, ...boardReply("main")].join("\n"));
 	assert.equal(shown[2], boardItem("1 reply", seqOf(board)));
 	assert.equal(shown[3], "No messages.");
+	assert.equal(shown[4], [`Thread ${title} · 2 messages`, "", ...boardReply("main")].join("\n"));
 	const mixed = await teamCall({ action: "history", thread: root, query: "x" });
 	assert.ok(mixed.isError, mixed.text);
-	assert.match(mixed.text, /thread shows one whole thread; it takes no with, query, before, or after/);
-	// Three long replies pass the budget; the oldest collapses to its first line.
+	assert.match(mixed.text, /thread takes no with, query, or before; use after to continue/);
+	// Three long replies need two pages; neither page shortens a body.
 	const long = [];
 	for (const n of [1, 2, 3]) long.push(seqOf(await teamCall({ action: "send", replyTo: root, body: `long ${n}\n${"y".repeat(6000)}` })));
-	const collapsed = (await teamCall({ action: "history", thread: root })).text;
-	assert.ok(collapsed.length <= 16_000, `${collapsed.length}`);
-	assert.ok(collapsed.includes(`\n  [team #${long[0]}] you → #team, replying to ${title}:\n  long 1 …\n\n`), collapsed.slice(0, 2000));
-	assert.ok(collapsed.endsWith(`long 3\n  ${"y".repeat(6000)}`));
-	assert.deepEqual(lastCovered(), [root, seqOf(board), direct, between, long[1], long[2]]);
+	const first = (await teamCall({ action: "history", thread: root })).text;
+	assert.ok(first.length <= 16_000, `${first.length}`);
+	assert.ok(first.includes(`long 1\n  ${"y".repeat(6000)}`));
+	assert.ok(first.includes(`long 2\n  ${"y".repeat(6000)}`));
+	assert.ok(first.endsWith(`More: history thread=${root} after=${long[1]}.`));
+	assert.deepEqual(lastCovered(), [root, seqOf(board), direct, between, long[0], long[1]]);
+	const next = (await teamCall({ action: "history", thread: root, after: long[1] })).text;
+	assert.ok(next.endsWith(`long 3\n  ${"y".repeat(6000)}`));
+	assert.deepEqual(lastCovered(), [long[2]]);
+});
+
+await step("thread continuation bounds wide and deep trees without skipping or repeating message bodies", async () => {
+	const session = join(WORK_DIR, "history-budget.jsonl");
+	fs.writeFileSync(session, `${JSON.stringify({ type: "session", version: 3, id: "history-budget", timestamp: new Date().toISOString(), cwd: join(WORK_DIR, "project") })}\n`);
+	const records = [{ t: "team", id: "history-budget" }];
+	const cases = [];
+	for (const [root, count, chain] of [[1, 500, false], [1000, 100, true], [2000, 3, true]]) {
+		const posts = Array.from({ length: count }, (_, i) => ({
+			t: "msg", seq: root + i, at: Date.now(), from: "main", to: "team", notify: [],
+			...(i ? { replyTo: chain ? root + i - 1 : i === 49 ? root + 1 : root } : { title: `History budget ${root}` }),
+			body: root === 2000 && i === 2 ? `${"x\n".repeat(3998)}end` : `[body:${root + i}]`,
+		}));
+		records.push(...posts);
+		cases.push(posts);
+	}
+	const recipients = Array.from({ length: 700 }, (_, i) => `recipient-${String(i).padStart(14, "0")}`);
+	records.push(...recipients.map((name) => ({ t: "member", name, description: "history recipient", cwd: join(WORK_DIR, "project"), args: [] })));
+	const routing = { t: "msg", seq: 3000, at: Date.now(), from: "main", to: recipients, notify: recipients, body: "r".repeat(8000) };
+	records.push(routing);
+	cases.push([routing]);
+	fs.mkdirSync(session.replace(/\.jsonl$/, ""));
+	fs.writeFileSync(join(session.replace(/\.jsonl$/, ""), "team.jsonl"), records.map((r) => JSON.stringify(r)).join("\n") + "\n");
+	const p = startParent(["--session", session]);
+	current = p;
+	try {
+		for (const posts of cases) {
+			const root = posts[0].seq;
+			let after = 0;
+			const read = [];
+			for (let pages = 0; ; pages++) {
+				assert.ok(pages < posts.length, "continuation did not finish");
+				const result = await p.call({ action: "history", thread: root, ...(after ? { after } : {}), ...(root === 1000 ? { limit: 4 } : {}) }, "team");
+				assert.ok(!result.isError, result.text);
+				assert.ok(result.text.length <= 16_000, `thread page has ${result.text.length} characters`);
+				const covered = p.events.findLast((e) => e.type === "tool_execution_end" && e.toolName === "team").result.details.covered;
+				assert.ok(covered.length > 0 && covered.length <= (root === 1000 ? 4 : 50));
+				for (const seq of covered) {
+					assert.ok(!read.includes(seq), `message #${seq} repeated`);
+					assert.ok(result.text.replace(/^ +/gm, "").includes(posts.find((m) => m.seq === seq).body), `message #${seq} body was shortened`);
+				}
+				read.push(...covered);
+				const more = result.text.match(/More: history thread=(\d+) after=(\d+)\.$/);
+				if (!more) break;
+				assert.equal(Number(more[1]), root);
+				assert.equal(Number(more[2]), Math.max(...covered));
+				assert.ok(Number(more[2]) > after, "cursor did not advance");
+				after = Number(more[2]);
+			}
+			assert.deepEqual(read.sort((a, b) => a - b), posts.map((m) => m.seq));
+			assert.equal((await p.call({ action: "history", thread: root, after: posts.at(-1).seq }, "team")).text, "No messages.");
+		}
+	} finally {
+		await p.close();
+	}
 });
 
 await step("a team member without the extension fails its run", async () => {
