@@ -627,9 +627,15 @@ export default function setupParent(pi: ExtensionAPI) {
 		}
 		if (agent.switchAt) {
 			agent.switchAt = false;
-			const target = modelLabel(modelChoice(agent.launchArgs));
+			const asked = modelChoice(agent.launchArgs);
 			const failed = await switchRun(agent, run);
-			notice(agent, failed ? `could not switch at its safe point (${failed}); it runs on ${target} from its next run.` : `switched to ${target} at its safe point.`);
+			if (failed) notice(agent, `could not switch at its safe point (${failed}); it runs on ${modelLabel(asked)} from its next run.`);
+			else {
+				// The state response updates the member's model and thinking level: what Pi set, after fitting the level to the model.
+				await run.command({ type: "get_state" });
+				const fitted = asked.thinking && agent.thinking && asked.thinking !== agent.thinking ? `; Pi fits ${asked.thinking} to the levels the model supports` : "";
+				notice(agent, `switched to ${agent.model}:${agent.thinking} at its safe point${fitted}.`);
+			}
 		}
 		if (agent.queued) {
 			const { instructions, message } = agent.queued;
@@ -929,7 +935,9 @@ export default function setupParent(pi: ExtensionAPI) {
 			agent.restarting = false;
 		}
 		if (signal?.aborted) {
-			// The user stopped the main agent, so no new work starts. Its exit, if over, skipped routing its unread messages.
+			// The user stopped the main agent, so no new work starts, even for a direct message it sent meanwhile, which lifted the lock.
+			// Its exit, if over, skipped routing its unread messages.
+			agent.locked = true;
 			if (!agent.run) team.afterRun(agent.id);
 			return undefined;
 		}

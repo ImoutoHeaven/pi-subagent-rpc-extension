@@ -1598,6 +1598,7 @@ await step("compact and team limits: wake false needs message, wake is for compa
 	for (const [args, error] of [
 		[{ action: "send", to: "keeppi", body: "b".repeat(8001) }, /body is 8001 characters, over 8000; /],
 		[{ action: "topic", body: "t".repeat(2001) }, /topic is 2001 characters, over 2000; /],
+		[{ action: "topic" }, /topic requires body, which holds the topic text/],
 	]) {
 		const r = await teamCall(args);
 		assert.ok(r.isError, r.text);
@@ -1878,6 +1879,25 @@ await step("abort stops a running member at its next safe point: a member in tea
 	);
 });
 
+await step("the main agent's direct message sent while an abort waits for the member's safe point wakes it once the run has stopped, ahead of a member's earlier message", async () => {
+	// A slow tool holds the safe point back while a member and then the main agent send.
+	await run({ name: "abortdm", message: "BASH sleep 10", waitMs: 0 });
+	await until(() => requestsBy("abortdm").length > 0);
+	const from = team.events.length;
+	assert.match((await team.call({ action: "abort", id: "abortdm", retire: false })).text, / · stops at its next safe point\n/);
+	await run({ name: "abortpeer", message: TEAM({ action: "send", to: "abortdm", body: "SAY from peer" }), waitMs: 0 });
+	assert.match(await report("abortpeer", from), /\nteam: Sent #\d+ to abortdm \(running\)\.(\n|$)/);
+	assert.match((await teamCall({ action: "send", to: "abortdm", body: "SAY rewoken" })).text, /^Sent #\d+ to abortdm \(running\)\.$/);
+	const aborted = await resultOf("abortdm", from);
+	assert.match(aborted, /^\[aborted\] subagent abortdm [^\n]* · by main(\n|$)/);
+	assert.doesNotMatch(aborted, /only your direct message wakes it/);
+	const woken = await team.waitEvent((e) => asMessage(e)?.customType === "subagent-result" && asMessage(e).details?.id === "abortdm" && asMessage(e).content.trimEnd().endsWith("rewoken"), from);
+	// The run the main agent's message started reports to it.
+	assert.match(asMessage(woken).content.trimEnd(), /^\[settled\] subagent abortdm [^\n]*\n\nrewoken$/);
+	await team.waitEvent((e) => e.type === "agent_settled", team.events.indexOf(woken));
+	assert.ok(!team.messages(from).some((m) => m.customType === "team-notice" && m.content.includes("abortdm's inbox")), "the message was reported stuck");
+});
+
 await step("compact at a running member's next safe point compacts it within its run, which then continues on the main agent's message; the main agent gets a notice", async () => {
 	await waiting("safec", { model: "fake/fake-keep" });
 	const before = await compactionsOf("safec");
@@ -1918,7 +1938,19 @@ await step("a safe-point switch matches models as Pi does, and a thinking switch
 	assert.equal(first.reasoning_effort, "low");
 	assert.equal(later.length, 2);
 	for (const body of later) assert.deepEqual([body.model, body.reasoning_effort], ["fake-think", "high"]);
-	assert.ok(team.messages(from).some((m) => m.content === "[subagent] fuzzy switched to fake-think:high at its safe point."), "no notice of the switch");
+	assert.ok(team.messages(from).some((m) => m.content === "[subagent] fuzzy switched to fake/fake-think:high at its safe point."), "no notice of the switch");
+});
+
+await step("a safe-point switch names the thinking level Pi set when Pi fits the asked level to the model", async () => {
+	// fake/fake-model does not reason, so Pi turns any level off.
+	await waiting("clampsw");
+	const from = team.events.length;
+	await team.call({ action: "switch", id: "clampsw", thinking: "high" });
+	await resultOf("clampsw", from);
+	assert.ok(
+		team.messages(from).some((m) => m.content === "[subagent] clampsw switched to fake/fake-model:off at its safe point; Pi fits high to the levels the model supports."),
+		team.messages(from).map((m) => m.content).join("\n"),
+	);
 });
 
 await step("a switch that arrives while another applies at a safe point applies at the next safe point", async () => {

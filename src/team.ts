@@ -294,7 +294,11 @@ export function createTeam(pi: ExtensionAPI, host: TeamHost) {
 	/** Routes `message` to one recipient; returns the state its sender sees. */
 	const route = (message: MessageRecord, name: string) => {
 		if (name === MAIN) return MAIN;
-		if (host.isRunning(name)) return `${name} (running)`;
+		if (host.isRunning(name)) {
+			// An abort waiting for the member's safe point has locked it; the main agent's direct message lifts that, so the stopped run's exit wakes it with this message.
+			if (message.from === MAIN && message.to !== BOARD) host.unlock(name);
+			return `${name} (running)`;
+		}
 		const compacting = host.state(name) === "compacting";
 		if (message.to === BOARD) return `${name} (${compacting ? "compacting" : "stopped"}; board posts do not wake)`;
 		// The member's process exit routes the message again, as for a message that reached a run after its last read.
@@ -494,7 +498,7 @@ export function createTeam(pi: ExtensionAPI, host: TeamHost) {
 	const setTopic = (caller: string, params: TeamParams) => {
 		if (caller !== MAIN) throw new Error("only the main agent sets the topic");
 		const body = params.body?.trim() ?? "";
-		if (!body) throw new Error("topic requires body");
+		if (!body) throw new Error("topic requires body, which holds the topic text");
 		if (body.length > TOPIC_CHARS) throw new Error(`topic is ${body.length} characters, over ${TOPIC_CHARS}; put the details in a file and name it in the topic`);
 		append({ t: "topic", at: Date.now(), body });
 		topic = body;
@@ -695,7 +699,9 @@ export function createTeam(pi: ExtensionAPI, host: TeamHost) {
 			// A member the main agent aborted stays stopped; only the main agent hears about its unread messages.
 			const locked = host.locked(name);
 			// The waking message and those before it never wake the member again; their senders learn the outcome from its result.
-			const waker = locked ? undefined : left.find((message) => !message.hop1 && message.seq > (wokeBy.get(name) ?? 0));
+			const eligible = (message: MessageRecord) => !message.hop1 && message.seq > (wokeBy.get(name) ?? 0);
+			// The main agent's message comes first, so a run it restarts reports to it and may wake others.
+			const waker = locked ? undefined : (left.find((message) => message.from === MAIN && eligible(message)) ?? left.find(eligible));
 			if (waker) return wake(name, waker);
 			for (const message of left) {
 				if (message.from === MAIN || !(locked || message.hop1)) continue;
