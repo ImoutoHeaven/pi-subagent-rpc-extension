@@ -36,8 +36,15 @@ export interface Run {
 	readonly exited: Promise<void>;
 	/** Ends the run as an error and kills the process. */
 	fail(error: string): void;
-	/** Aborts; kills the process if its run has not started, or does not conclude within 10 seconds. */
-	stop(signal?: AbortSignal): Promise<void>;
+	/**
+	 * Aborts; kills the process if its run has not started, or does not conclude within 10 seconds.
+	 * `atBoundary`: the child aborts its run itself at the safe point it reached, so no abort command is sent.
+	 */
+	stop(signal?: AbortSignal, atBoundary?: boolean): Promise<void>;
+	/** Sends an RPC command and resolves to its response; a run that ends first resolves it as failed. */
+	command(record: object): Promise<{ success: boolean; error?: string; data?: any }>;
+	/** Commands the same process runs, in order, once its current run stops, instead of the run concluding; an abort from the parent cancels them. */
+	chain(commands: Launch[]): void;
 	/** Ends the process whatever its state, for the end of the parent session. */
 	shutdown(): Promise<void>;
 }
@@ -92,9 +99,15 @@ export function startRun(options: { cwd: string; args: string[]; launch: Launch;
 		}
 	};
 	child.once("exit", () => clearTimeout(killTimer));
-	const launchId = `run-${hex()}`;
-	/** The launch command got its response. */
+	/** The id of the command that started the current run: the launch, or a chained command. */
+	let commandId = `run-${hex()}`;
+	/** That command got its response. */
 	let replied = false;
+	let chained: Launch[] = [];
+	/** A chained command started the current step: the run stopped at its safe point and goes on in this process. */
+	let inChain = false;
+	/** command() calls waiting for their responses, by id. */
+	const awaiting = new Map<string, (response: { success: boolean; error?: string; data?: any }) => void>();
 	let busy = false;
 	/** Between compaction_start and compaction_end. */
 	let compacting = false;
@@ -123,6 +136,8 @@ export function startRun(options: { cwd: string; args: string[]; launch: Launch;
 		if (finished) return;
 		finished = true;
 		concluded.abort();
+		for (const done of awaiting.values()) done({ success: false, error: "the run ended" });
+		awaiting.clear();
 		if (process.platform === "win32") {
 			child.stdin.end();
 			setTimeout(killTree, KILL_AFTER_MS).unref();
@@ -135,8 +150,26 @@ export function startRun(options: { cwd: string; args: string[]; launch: Launch;
 		killTree();
 	};
 
+	const send = (command: Launch) => {
+		commandId = `run-${hex()}`;
+		replied = false;
+		write({ id: commandId, ...command });
+	};
+
 	// A stop during a tool can end with an assistant error, so the abort decides first.
 	const conclude = () => {
+		if (chained.length && !aborting) {
+			// A chained compaction that failed ends the run; one with nothing to compact leaves the context as it is, and the run goes on.
+			if (inChain && lastStop === "error" && !/^(Nothing to compact|Already compacted)/.test(lastError ?? "")) {
+				chained = [];
+				return finish("error", `compaction failed: ${lastError}`);
+			}
+			// The stop at the safe point belongs to the same run, which goes on with the next command.
+			lastStop = null;
+			settledAborted = false;
+			inChain = true;
+			return send(chained.shift() as Launch);
+		}
 		if (aborting) finish("aborted", null, "main");
 		else if (settledAborted) finish("aborted", null, "extension");
 		else if (lastStop === "error") finish("error", lastError ?? "assistant error");
@@ -166,6 +199,11 @@ export function startRun(options: { cwd: string; args: string[]; launch: Launch;
 		if (finished) return;
 		switch (event.type) {
 			case "response": {
+				const waiting = awaiting.get(event.id);
+				if (waiting) {
+					awaiting.delete(event.id);
+					return waiting(event);
+				}
 				if (event.id && event.id === probe) {
 					probe = null;
 					if (!event.success || typeof event.data?.isStreaming !== "boolean") finish("error", `state check failed: ${event.error ?? "no isStreaming"}`);
@@ -173,11 +211,11 @@ export function startRun(options: { cwd: string; args: string[]; launch: Launch;
 					else if (!event.data.isStreaming && !event.data.isCompacting && !busy && !compacting && !gate) conclude();
 					return;
 				}
-				if (event.id !== launchId) return;
+				if (event.id !== commandId) return;
 				replied = true;
 				if (!event.success) {
 					lastStop = "error";
-					lastError = event.error ?? `${options.launch.type} rejected`;
+					lastError = event.error ?? `${event.command ?? options.launch.type} rejected`;
 				} else if (event.data?.disposition === "started") gate = true;
 				maybeFinish();
 				return;
@@ -241,9 +279,12 @@ export function startRun(options: { cwd: string; args: string[]; launch: Launch;
 	const closed = (reason: string, clean = false) => {
 		if (ended) return;
 		ended = true;
+		// A process that exits with chained commands left, or before one answered, ends its run there.
+		const interrupted = chained.length > 0 || (inChain && !replied);
+		chained = [];
 		if (aborting) finish("aborted", null, "main");
-		else if (clean && !busy && !compacting && !gate) conclude();
-		else finish("error", `${reason}${stderr.trim() ? `\n${stderr.trim()}` : ""}`);
+		else if (clean && !busy && !compacting && !gate && !interrupted) conclude();
+		else finish("error", `${interrupted ? "the process exited during the compaction at its safe point: " : ""}${reason}${stderr.trim() ? `\n${stderr.trim()}` : ""}`);
 		markExited();
 	};
 	child.on("error", (error) => closed(`could not run Pi: ${error.message}`));
@@ -252,12 +293,25 @@ export function startRun(options: { cwd: string; args: string[]; launch: Launch;
 	const onExit = (code: number | null, signal: NodeJS.Signals | null) => closed(`Pi exited (code ${code}, signal ${signal})`, code === 0);
 	child.on("close", onExit);
 	child.on("exit", (code, signal) => setTimeout(() => onExit(code, signal), 2_000).unref());
-	write({ id: launchId, ...options.launch });
+	send(options.launch);
 
 	return {
 		exited,
 		fail,
-		async stop(signal) {
+		command(record) {
+			if (finished) return Promise.resolve({ success: false, error: "the run ended" });
+			const id = `cmd-${hex()}`;
+			return new Promise((done) => {
+				awaiting.set(id, done);
+				write({ id, ...record });
+			});
+		},
+		chain(commands) {
+			chained = [...commands];
+			// The new chain starts at another safe point, whose stop is no failed command.
+			inChain = false;
+		},
+		async stop(signal, atBoundary = false) {
 			if (finished) return;
 			aborting = true;
 			// Pi drops an abort that arrives before its run starts, so a run that has not started ends with its process.
@@ -266,7 +320,7 @@ export function startRun(options: { cwd: string; args: string[]; launch: Launch;
 				killTree();
 				return exited;
 			}
-			write({ type: "abort" });
+			if (!atBoundary) write({ type: "abort" });
 			await within(new Promise((done) => concluded.signal.addEventListener("abort", done)), ABORT_WAIT_MS, signal);
 			if (finished) return;
 			killTree();

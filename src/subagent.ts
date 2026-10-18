@@ -13,11 +13,12 @@ import {
 	type ExtensionAPI,
 	type ExtensionContext,
 	getAgentDir,
+	resolveCliModel,
 	type SessionEntry,
 	SettingsManager,
 } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
-import { BODY_CHARS, DEFAULT_WAIT_MS, type Details, detailsOf, MAX_WAIT_MS, type Reply, type Request } from "./protocol.ts";
+import { BODY_CHARS, DEFAULT_WAIT_MS, type Details, detailsOf, MAX_WAIT_MS, type Reply, type Request, SEEN_ENTRY } from "./protocol.ts";
 import { type AbortedBy, type Launch, type Run, type RunStatus, startRun } from "./rpc.ts";
 import { createTeam, DESCRIPTION_CHARS } from "./team.ts";
 
@@ -29,6 +30,8 @@ const ERROR_CHARS = 200;
 const ARGS_CHARS = 60;
 const NOTICES = 3;
 const FOOTER_AGENTS = 3;
+/** Members a team wait that timed out lists for the main agent. */
+const TEAM_LINES = 10;
 const STALE_MS = 60_000;
 const IDLE_POLL_MS = 250;
 const MAIN = "main";
@@ -109,8 +112,14 @@ interface Agent {
 	/** Context tokens after the last model reply or compaction, and the member's compact point; kept across runs, undefined until known. */
 	contextTokens?: number;
 	compactAt?: number;
-	/** A compaction that starts once the current run's process exits. */
+	/** A compaction at the running member's next safe point, or once its run's process exits if the run ends first. */
 	queued: Compaction | null;
+	/** The main agent's abort, at the running member's next safe point. */
+	stopAt: boolean;
+	/** The main agent's switch, at the running member's next safe point; `launchArgs` hold the new settings. */
+	switchAt: boolean;
+	/** The run stopped at its safe point to compact, and continues once compacted. */
+	resuming: boolean;
 	/** The message a compaction run continues with once the member is compacted. */
 	next?: string;
 	/** The message a compaction run writes after the summary, for the member's next run; `kept` once handed to the member. */
@@ -288,8 +297,19 @@ export default function setupParent(pi: ExtensionAPI) {
 		return ` · ${oneLine(agent.error, ERROR_CHARS)}${retried}`;
 	};
 
-	/** ` · next run: <model>` while a busy member's next run uses other settings than its current one. */
+	/** What the main agent asked of a running member at its next safe point. */
+	const pendingText = (agent: Agent) => {
+		if (agent.status !== "running") return "";
+		if (agent.stopAt) return " · stops at its next safe point";
+		if (agent.queued) return " · compacts at its next safe point";
+		if (agent.switchAt) return ` · switches to ${modelLabel(modelChoice(agent.launchArgs))} at its next safe point`;
+		return "";
+	};
+
+	/** A pending safe-point request, or ` · next run: <model>` while a busy member's next run uses other settings than its current one. */
 	const nextRun = (agent: Agent) => {
+		const pending = pendingText(agent);
+		if (pending) return pending;
 		if (!busy(agent) && !agent.queued) return "";
 		const next = modelLabel(modelChoice(agent.launchArgs));
 		return next === modelLabel(modelChoice(agent.runArgs)) ? "" : ` · next run: ${next}`;
@@ -304,6 +324,12 @@ export default function setupParent(pi: ExtensionAPI) {
 
 	const header = (agent: Agent) => statusLine(agent) + nextRun(agent) + lockNote(agent);
 
+	/** A running member's tools with their main arguments and durations, or its phase. */
+	const activityOf = (agent: Agent, now: number) =>
+		agent.tools.size
+			? [...agent.tools.values()].map((tool) => `${tool.name}${tool.args ? ` (${tool.args})` : ""} ${duration(now - tool.since)}`).join(", ")
+			: agent.phase;
+
 	const statusLine = (agent: Agent) => {
 		const now = Date.now();
 		const id = `subagent ${agent.id}${agent.model ? ` · ${agent.model}${agent.thinking ? `:${agent.thinking}` : ""}` : ""}`;
@@ -315,10 +341,7 @@ export default function setupParent(pi: ExtensionAPI) {
 		if (agent.status !== "running") {
 			return `[${agent.status}] ${id} · ${agent.turns} turns · ${duration(agent.endedAt - agent.startedAt)}${usageText(agent.usage)}${context}${compaction}${outcome(agent)}`;
 		}
-		const activity = agent.tools.size
-			? [...agent.tools.values()].map((tool) => `${tool.name}${tool.args ? ` (${tool.args})` : ""} ${duration(now - tool.since)}`).join(", ")
-			: agent.phase;
-		return `[running] ${id} · turn ${agent.turns + 1} · ${activity} · last event ${duration(now - agent.lastEventAt)} ago · ${duration(now - agent.startedAt)}${usageText(agent.usage)}${context}${compaction}`;
+		return `[running] ${id} · turn ${agent.turns + 1} · ${activityOf(agent, now)} · last event ${duration(now - agent.lastEventAt)} ago · ${duration(now - agent.startedAt)}${usageText(agent.usage)}${context}${compaction}`;
 	};
 
 	/** Whether a compaction run wrote the main agent's message into the member's context. */
@@ -371,6 +394,39 @@ export default function setupParent(pi: ExtensionAPI) {
 		});
 		const more = running.length > FOOTER_AGENTS ? `, +${running.length - FOOTER_AGENTS} more` : "";
 		return `\n\n(Background: ${shown.join(", ")}${more}.)`;
+	};
+
+	/** A busy member, or a stopped one that needs the main agent, in one line for its team wait; empty for any other. */
+	const teamLine = (agent: Agent, now: number) => {
+		if (busy(agent)) {
+			const activity = agent.status === "running" ? ` · ${activityOf(agent, now)} · last event ${duration(now - agent.lastEventAt)} ago` : "";
+			return `${agent.id} ${agent.status} ${duration(now - agent.startedAt)}${activity}${ctxText(agent)}${pendingText(agent)}`;
+		}
+		const unread = team.unread(agent.id);
+		const why = [
+			agent.status === "error" ? "error" : "",
+			agent.locked ? "only your direct message wakes it" : "",
+			unread.length ? `${unread.length} unread waiting (${unread.map((seq) => `#${seq}`).join(", ")})` : "",
+		].filter(Boolean);
+		return why.length ? `${agent.id} stopped · ${why.join(" · ")}` : "";
+	};
+
+	/** What a team wait that timed out shows: the main agent, what it may act on; a member, who else runs, and when only main can bring news. */
+	const waitFooter = (name: string) => {
+		const now = Date.now();
+		const members = [...agents.values()].filter((agent) => !team.isRetired(agent.id));
+		if (name === MAIN) {
+			// Busy members first: what is in flight matters more than what waits.
+			const lines = [...members.filter(busy), ...members.filter((agent) => !busy(agent))].map((agent) => teamLine(agent, now)).filter(Boolean);
+			if (!lines.length) return "";
+			const more = lines.length > TEAM_LINES ? [`+${lines.length - TEAM_LINES} more — subagent status`] : [];
+			return `\n\nTeam:\n${[...lines.slice(0, TEAM_LINES), ...more].map((line) => `- ${line}`).join("\n")}`;
+		}
+		const others = members.filter((agent) => agent.id !== name);
+		const states = others.map((agent) => `${agent.id} ${busy(agent) ? `${agent.status} ${duration(now - agent.startedAt)}` : "stopped"}`);
+		const line = others.length ? `\n\nTeam: ${states.join(", ")}.` : "";
+		if (others.some(busy)) return line;
+		return `${line}${line ? "\n" : "\n\n"}No other member is running; only main can bring new messages. If your work is done, end your run with your final reply.`;
 	};
 
 	// The board digest joins the branch before a run starts, from a prompt or a delivered message.
@@ -521,11 +577,79 @@ export default function setupParent(pi: ExtensionAPI) {
 			await waitFor(undefined, ms, signal, true);
 			return loud();
 		},
+		interrupted: (name) => {
+			const agent = agents.get(name);
+			return Boolean(agent && pendingText(agent));
+		},
+		footer: waitFooter,
 	});
+
+	/** The model the member's Pi picks for `pattern` among the models it has, matched as `--model` matches; or why none is picked. */
+	const resolveModel = async (run: Run, pattern: string) => {
+		const response = await run.command({ type: "get_available_models" });
+		if (!response.success) return { model: undefined, error: response.error };
+		const models = response.data?.models ?? [];
+		// resolveCliModel reads only these two methods of Pi's model runtime; the member's models all have credentials.
+		const modelRuntime = { getModels: () => models, hasConfiguredAuth: () => true } as unknown as Parameters<typeof resolveCliModel>[0]["modelRuntime"];
+		return resolveCliModel({ cliModel: pattern, modelRuntime });
+	};
+
+	/** Applies a pending switch to the run at its safe point; returns why it failed, or undefined. */
+	const switchRun = async (agent: Agent, run: Run) => {
+		// The settings of this switch; another one that arrives meanwhile waits for the next safe point.
+		const target = agent.launchArgs;
+		const next = modelChoice(target);
+		const steps: object[] = [];
+		// A thinking switch keeps the model the run already uses.
+		if (next.model && next.model !== modelChoice(agent.runArgs).model) {
+			const { model, error } = await resolveModel(run, next.model);
+			if (!model) return error ?? `model ${next.model} not found`;
+			steps.push({ type: "set_model", provider: model.provider, modelId: model.id });
+		}
+		if (next.thinking) steps.push({ type: "set_thinking_level", level: next.thinking });
+		for (const step of steps) {
+			const response = await run.command(step);
+			if (!response.success) return response.error ?? "the switch failed";
+		}
+		agent.runArgs = target;
+	};
+
+	/**
+	 * At a running member's safe point, applies what the main agent asked: an abort ends the run there; a switch changes the run's model
+	 * and thinking level; a compaction, after any switch, stops the run there and continues it in the same process. Returns the reply
+	 * that stops it.
+	 */
+	const atSafePoint = async (agent: Agent, run: Run): Promise<Reply | undefined> => {
+		if (agent.stopAt) {
+			agent.stopAt = false;
+			void run.stop(undefined, true);
+			return { ok: true, stop: true };
+		}
+		if (agent.switchAt) {
+			agent.switchAt = false;
+			const target = modelLabel(modelChoice(agent.launchArgs));
+			const failed = await switchRun(agent, run);
+			notice(agent, failed ? `could not switch at its safe point (${failed}); it runs on ${target} from its next run.` : `switched to ${target} at its safe point.`);
+		}
+		if (agent.queued) {
+			const { instructions, message } = agent.queued;
+			agent.queued = null;
+			const resume = `The main agent compacted your context at this point of your run. Continue your task.${message ? `\n\nThe main agent's message:\n${message}` : ""}`;
+			run.chain([{ type: "compact", ...(instructions ? { customInstructions: instructions } : {}) }, { type: "prompt", message: resume }]);
+			agent.resuming = true;
+			return { ok: true, stop: true };
+		}
+		return undefined;
+	};
 
 	const answer = async (agent: Agent, request: Request, signal: AbortSignal): Promise<Reply> => {
 		if (shuttingDown) return { error: "the main agent's session is ending" };
 		if (request.op === "start") agent.greeted = true;
+		if (request.op === "inbox" && request.boundary && agent.run && agent.status === "running") {
+			const stop = await atSafePoint(agent, agent.run);
+			// Messages the stopped run does not read stay unread, for the run that follows.
+			if (stop) return stop;
+		}
 		// Only a compaction the main agent asked for carries its message, once.
 		if (request.op === "compacted") {
 			if (!agent.compactOnly || agent.keep === undefined || agent.kept) return { ok: true };
@@ -611,12 +735,19 @@ export default function setupParent(pi: ExtensionAPI) {
 				return;
 			case "compaction_end": {
 				const { reason, result } = event;
+				const resuming = agent.resuming;
+				agent.resuming = false;
+				// The run's last model reply came before this compaction, which decides how the run ends.
+				if (resuming) agent.modelError = false;
+				const why = (event.errorMessage ?? "").replace(/^Compaction failed: /, "");
+				const noop = /^(Nothing to compact|Already compacted)/.test(why);
 				if (result) {
 					agent.contextTokens = result.estimatedTokensAfter;
 					agent.compaction = `compacted ${tokens.format(result.tokensBefore)}→${tokens.format(result.estimatedTokensAfter)} (${reason})`;
-				} else agent.compaction = `compaction failed: ${event.errorMessage ?? "cancelled"}`;
-				// A compaction run reports its own result.
-				if (reason !== "manual") notice(agent, `${agent.compaction}${ctxText(agent)}`);
+				} else if (resuming && !noop) return; // The run ends on the failure as its error.
+				else agent.compaction = resuming ? why : `compaction failed: ${why || "cancelled"}`;
+				// A compaction run reports its own result; one at a safe point continues the run.
+				if (!agent.compactOnly) notice(agent, `${agent.compaction}${ctxText(agent)}${resuming ? " at its safe point; it continues its run." : ""}`);
 				return;
 			}
 			case "response": {
@@ -644,7 +775,7 @@ export default function setupParent(pi: ExtensionAPI) {
 			if (status === "settled" || noop) [status, error] = ["compacted", null];
 			else if (status === "error") error = `compaction failed: ${error}`;
 		}
-		Object.assign(agent, { status, error, abortedBy, endedAt: Date.now() });
+		Object.assign(agent, { status, error, abortedBy, endedAt: Date.now(), stopAt: false, switchAt: false, resuming: false });
 		agent.tools.clear();
 		if (status === "compacted" && agent.next !== undefined && !shuttingDown) {
 			// The run on the message is the main agent's task, so it unlocks the member; its header keeps this compaction,
@@ -772,6 +903,7 @@ export default function setupParent(pi: ExtensionAPI) {
 		agent.waiters.add(hold);
 		try {
 			agent.queued = null;
+			agent.stopAt = false;
 			if (agent.launching) {
 				// A wake still waiting for the previous process to exit: it never starts.
 				agent.launching = null;
@@ -832,6 +964,9 @@ export default function setupParent(pi: ExtensionAPI) {
 			kept: false,
 			compaction: "",
 			queued: null,
+			stopAt: false,
+			switchAt: false,
+			resuming: false,
 			delivered: null,
 			greeted: false,
 			startedBy: MAIN,
@@ -899,7 +1034,7 @@ export default function setupParent(pi: ExtensionAPI) {
 		when: Type.Optional(
 			StringEnum(["now", "next"] as const, {
 				description:
-					"switch (required while the member runs, compacts, or has a compaction queued), compact (required while it runs): now stops that as abort does, then, for switch, runs the member on message with the new settings at once, which needs message, and for compact, compacts it at once. next leaves the current run alone: switch applies the settings from its next run, and compact queues the compaction after the run. A stopped member ignores it.",
+					"abort, compact, switch on a running member: next (default) acts at its next safe point, once its current tool calls finish and before its next model request; now interrupts it at once. A stopped member ignores it.",
 			}),
 		),
 		retire: Type.Optional(
@@ -939,10 +1074,11 @@ export default function setupParent(pi: ExtensionAPI) {
 		label: "Subagent",
 		description: [
 			"Delegate work to a Pi subagent: a separate Pi process with its own session that loads tools, extensions, skills, and MCP servers like a normal Pi launch.",
-			"run hires a named team member, announces it on the board, and starts it on message; its name is its id, and its description is the role the team roster shows. status reports progress or the result (without id: lists subagents). abort stops a member's run or compaction, if any, and cancels a queued compaction; a member you aborted wakes only for your direct message, and its status says so. retire (required with abort): true also removes the member from the team, whether it runs or not; retire members you will not use again. A retired member's name is not reused, and status with its id still shows its last result.",
+			`run hires a named team member, announces it on the board, and starts it on message; its name is its id, and its description is the role the team roster shows, at most ${DESCRIPTION_CHARS} characters (a longer one fails). status reports progress or the result (without id: lists subagents). abort stops a member's run or compaction, if any, and cancels a queued compaction; a member you aborted wakes only for your direct message, and its status says so. retire (required with abort): true also removes the member from the team, whether it runs or not; retire members you will not use again. A retired member's name is not reused, and status with its id still shows its last result.`,
+			"A running member's safe point comes once its current tool calls finish, before its next model request. abort, compact, and switch act on a running member at its next safe point and return at once; when: now interrupts it at once instead, even in the middle of a tool call. A member waiting in team wait returns from it early to reach its safe point.",
 			"Two ways to give work: a fresh member with a self-contained message suits a different domain or a new task; a stopped member, compacted with instructions that keep what helps and then messaged, suits continuing its work, or similar work its earlier context helps with.",
-			"compact compacts a member's context; instructions go to the compaction that runs as Pi's custom instructions, and how they shape the summary depends on that compaction. Pi compacts a running member by itself at its compact point, a Pi setting; status lines show ctx: the member's context tokens against that point. Compact a member yourself when it is past about 60% of its compact point and is about to take a new or unrelated task, or holds much that the next task does not need. A stopped member compacts at once. A running member needs when: next compacts it after its current run, and now stops that run as abort does and compacts it in the same call. With message and wake true (the default), the member then runs on message as if you sent it. With wake false, message is written word for word into its context after the summary, marked as yours, and the member stays stopped until something wakes it; use it for what the member's next task needs word for word, without starting that task. Without message or with wake false, a result you did not wait for arrives without starting a turn, unless your message could not be written.",
-			"switch moves a member to another model or thinking level; it keeps its name, session, and context. A stopped member uses the new settings from its next run, and with message runs on them at once. A busy member needs when: next leaves its current run or compaction on the old settings, and its status shows `next run:` until then; now, with message, stops it as abort does and runs it on message with the new settings in the same call. A new model starts without the prompt cache, so its next request pays full input price for the whole context; compact first when the context is large.",
+			"compact compacts a member's context; instructions go to the compaction that runs as Pi's custom instructions, and how they shape the summary depends on that compaction. Pi compacts a running member by itself at its compact point, a Pi setting; status lines show ctx: the member's context tokens against that point. Compact a member yourself when it is past about 60% of its compact point and is about to take a new or unrelated task, or holds much that the next task does not need. A running member compacts at its next safe point and then continues its run, reading message if you give one; if its run ends first, it compacts afterwards as a stopped member does. A stopped member compacts at once: with message and wake true (the default), it then runs on message as if you sent it; with wake false, message is written word for word into its context after the summary, marked as yours, and the member stays stopped until something wakes it; use it for what the member's next task needs word for word, without starting that task. Without message or with wake false, a result you did not wait for arrives without starting a turn, unless your message could not be written. when: now stops a running member at once and compacts it as a stopped member.",
+			"switch moves a member to another model or thinking level; it keeps its name, session, and context. A running member switches at its next safe point and continues its run; a member in a compaction run, and a stopped one, use the new settings from their next run, and a stopped member with message runs on them at once. With message, a busy member needs when: now, which stops it at once and runs it on message with the new settings in the same call. A new model starts without the prompt cache, so its next request pays full input price for the whole context; compact first when the context is large.",
 			`run, status, compact, and switch with message wait up to waitMs (default ${DEFAULT_WAIT_MS}, max ${MAX_WAIT_MS}) and return the result if it finishes in time, otherwise its progress while it keeps running. To wait longer, call status again; each wait of up to ${MAX_WAIT_MS / 60_000} minutes keeps the prompt cache warm. Or end your turn: every result and message for you starts your next turn, and notices that start none arrive with it.`,
 			"Members talk with you and each other through the team tool. A member starts with an empty conversation, so put the context it needs in message. A direct team message to a stopped member wakes it in its own session. A run woken by a member's message sends its final reply to that member, or to you when that member has stopped.",
 			"args are Pi command-line options: read docs/cli.md in the Pi documentation listed in your system prompt, or run `pi --help`. Session, mode, model, provider, and thinking flags are set by this tool.",
@@ -957,11 +1093,17 @@ export default function setupParent(pi: ExtensionAPI) {
 				const listed = [...agents.values()].filter((agent) => !team.isRetired(agent.id));
 				return { content: [{ type: "text", text: listed.length ? listed.map(header).join("\n") : "No subagents." }], details: undefined };
 			}
-			/** The state of `agent`, with the other running members; `details` mark what the result shows seen. */
+			/**
+			 * The state of `agent`, with the other running members; `details` mark what the result shows seen, in an entry of its own,
+			 * since a call made through another tool, such as codemode, returns no details.
+			 */
 			const result = (agent: Agent, details?: object, lead = "") => {
 				const state = consume(agent);
-				return { content: [{ type: "text" as const, text: lead + state.text + footer(agent) }], details: { ...details, ...state.details } };
+				if (details || state.details) pi.appendEntry(SEEN_ENTRY, { ...details, ...state.details });
+				return { content: [{ type: "text" as const, text: lead + state.text + footer(agent) }], details: undefined };
 			};
+			const plain = (text: string) => ({ content: [{ type: "text" as const, text }], details: undefined });
+			const safePoint = "its next safe point, once its current tool calls finish and before its next model request";
 			if (params.action === "run") {
 				const { agent, joined } = create(params, ctx);
 				launch(agent, { type: "prompt", message: params.message as string }, MAIN);
@@ -985,13 +1127,15 @@ export default function setupParent(pi: ExtensionAPI) {
 				const wake = params.wake ?? true;
 				if (!wake && !params.message) throw new Error("compact with wake: false requires message, which the member finds in its context after the summary");
 				if (agent.status === "compacting" || agent.queued) throw new Error(`${agent.id} is already compacting or has a compaction queued`);
+				if (agent.stopAt) throw new Error(`${agent.id} stops at its next safe point; compact it once it has stopped`);
 				const request = { instructions, message: params.message || undefined, wake };
 				let stopped = "";
 				if (agent.status === "running") {
-					if (!params.when) throw new Error(`${agent.id} is running: compact requires when: now or next`);
-					if (params.when === "next") {
+					if (params.when !== "now") {
 						agent.queued = request;
-						return { content: [{ type: "text", text: `${header(agent)}\n\nCompaction queued after the current run.${footer(agent)}` }], details: undefined };
+						team.interrupt(agent.id);
+						const reads = request.message ? ", reading your message" : "";
+						return plain(`${header(agent)}\n\nIt compacts at ${safePoint}, then continues its run${reads}. If its run ends first, it compacts afterwards.${footer(agent)}`);
 					}
 					const state = await stopNow(agent, signal);
 					if (state === undefined) return result(agent, undefined, `${agent.id}: the call was cancelled, so it stopped without compacting.\n\n`);
@@ -1007,7 +1151,6 @@ export default function setupParent(pi: ExtensionAPI) {
 				if (!pattern && !level) throw new Error("switch requires model or thinking");
 				const occupied = busy(agent) || Boolean(agent.queued);
 				const state = agent.status === "running" ? "running" : "compacting";
-				if (occupied && !params.when) throw new Error(`${agent.id} is ${state}: switch requires when: now or next`);
 				const now = occupied && params.when === "now";
 				if (now && !params.message) throw new Error("switch with when: now requires message, the task the member runs on the new settings");
 				// A run on message would replace the current run, or drop a queued compaction.
@@ -1033,7 +1176,13 @@ export default function setupParent(pi: ExtensionAPI) {
 						: "";
 				/** What the member runs or last ran on, as its status header shows it. */
 				const was = () => modelLabel({ model: agent.model || ran.model, thinking: agent.thinking || ran.thinking });
-				if (!params.message) return { content: [{ type: "text", text: `${agent.id} now runs on ${target} from its next run (was ${was()}).${cache}` }], details: undefined };
+				if (!params.message) {
+					// A running member switches within its run; a compaction run keeps its settings.
+					const inRun = agent.status === "running";
+					agent.switchAt = inRun;
+					if (inRun) team.interrupt(agent.id);
+					return plain(`${agent.id} now runs on ${target} from its next ${inRun ? "safe point" : "run"} (was ${was()}).${cache}`);
+				}
 				let stopped = "";
 				if (now) {
 					const state = await stopNow(agent, signal);
@@ -1054,11 +1203,21 @@ export default function setupParent(pi: ExtensionAPI) {
 			if (params.retire) team.retire(agent.id);
 			// A queued compaction holds messages until its run's process exits, which then routes them.
 			agent.locked = true;
+			const retired = () => {
+				if (!params.retire) return "";
+				const unread = team.unread(agent.id);
+				const left = unread.length ? ` ${agent.id} had ${unread.length} unread message${unread.length === 1 ? "" : "s"}: ${unread.map((seq) => `#${seq}`).join(", ")}.` : "";
+				return `${agent.id} is retired: it left the team; its session and final.md stay.${left}\n\n`;
+			};
+			// A run that has started stops at its safe point; a compaction run, or a run that Pi has not started, stops at once.
+			if (params.when !== "now" && agent.status === "running" && agent.run && !agent.launching && !agent.restarting && agent.phase !== "starting") {
+				agent.queued = null;
+				agent.stopAt = true;
+				team.interrupt(agent.id);
+				return plain(`${retired()}${header(agent)}\n\nIt stops at ${safePoint}; its result arrives then.${footer(agent)}`);
+			}
 			await halt(agent, signal);
-			if (!params.retire) return result(agent);
-			const unread = team.unread(agent.id);
-			const left = unread.length ? ` ${agent.id} had ${unread.length} unread message${unread.length === 1 ? "" : "s"}: ${unread.map((seq) => `#${seq}`).join(", ")}.` : "";
-			return result(agent, undefined, `${agent.id} is retired: it left the team; its session and final.md stay.${left}\n\n`);
+			return result(agent, undefined, retired());
 		},
 	});
 

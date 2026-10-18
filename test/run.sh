@@ -1,6 +1,6 @@
 # Runs inside a container: typecheck against Pi's types, then the end-to-end test.
 set -eu
-PI_VERSION="${PI_VERSION:-1.1.0}"
+PI_VERSION="${PI_VERSION:-1.3.0}"
 npm i -g --no-audit --no-fund "@earendil-works/pi-coding-agent@$PI_VERSION" > /tmp/npm-pi.log 2>&1
 echo "pi $(pi --version)"
 

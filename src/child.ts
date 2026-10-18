@@ -11,6 +11,7 @@ import {
 	MAX_WAIT_MS,
 	type Reply,
 	type Request,
+	SEEN_ENTRY,
 	seenIn,
 	TAG,
 	TEAM_DESCRIPTION,
@@ -39,11 +40,14 @@ export default function setupChild(pi: ExtensionAPI) {
 	/** The seqs of the team messages the current branch holds. */
 	const seen = (ctx: ExtensionContext) => [...seenIn(ctx.sessionManager.getBranch().map(detailsOf), teamId)];
 
-	/** Pulls the messages the branch lacks and, with `digest`, the board digest and the cursor it moves to; notices and the digest carry seq 0. */
-	const pull = async (ctx: ExtensionContext, digest = false) => {
+	/**
+	 * Pulls the messages the branch lacks and, with `digest`, the board digest and the cursor it moves to; notices and the digest carry seq 0.
+	 * At a safe point (`boundary`), `stop` asks the run to end there.
+	 */
+	const pull = async (ctx: ExtensionContext, digest = false, boundary = false) => {
 		const board = digest ? { board: boardCursor(ctx.sessionManager.getBranch(), teamId) } : {};
-		const { messages = [], board: cursor } = await ask(ctx, { op: "inbox", seen: seen(ctx), ...board }, ctx.signal);
-		return { messages, cursor };
+		const { messages = [], board: cursor, stop } = await ask(ctx, { op: "inbox", seen: seen(ctx), ...board, ...(boundary ? { boundary } : {}) }, ctx.signal);
+		return { messages, cursor, stop };
 	};
 
 	// Pi appends a batch entry by entry, and the digest comes last; only that entry carries the board cursor, so an interrupted append never marks the digest seen.
@@ -64,12 +68,12 @@ export default function setupChild(pi: ExtensionAPI) {
 		async execute(_toolCallId, params, signal, _onUpdate, ctx) {
 			if (params.action === "wait") {
 				const ms = Math.min(params.ms ?? DEFAULT_WAIT_MS, MAX_WAIT_MS);
-				const { count } = await ask(ctx, { op: "wait", seen: seen(ctx), ms }, signal, ms + WAIT_SLACK_MS);
-				return text(count ? `${count} team message(s) for you follow this result.` : `No team messages for you within ${ms}ms.`);
+				return text((await ask(ctx, { op: "wait", seen: seen(ctx), ms }, signal, ms + WAIT_SLACK_MS)).text ?? "");
 			}
 			const reply = await ask(ctx, { op: "team", ...params }, signal);
-			if (!reply.covered) return text(reply.text ?? "");
-			return text(reply.text ?? "", { team: teamId, covered: reply.covered });
+			// An entry of its own, since a call made through another tool, such as codemode, returns no details.
+			if (reply.covered?.length) pi.appendEntry(SEEN_ENTRY, { team: teamId, covered: reply.covered });
+			return text(reply.text ?? "");
 		},
 	});
 
@@ -83,10 +87,12 @@ export default function setupChild(pi: ExtensionAPI) {
 		};
 	});
 
-	// Messages ride on a request the model makes anyway: one that follows tool results.
+	// Messages ride on a request the model makes anyway: one that follows tool results. That point is also where the main agent's
+	// abort or compaction stops the run, and its switch takes effect, between finished tool calls and the next model request.
 	pi.on("turn_end", async (event, ctx) => {
 		if (event.outcome !== "completed" || !event.toolResults.length) return;
-		const { messages, cursor } = await pull(ctx, true);
+		const { messages, cursor, stop } = await pull(ctx, true, true);
+		if (stop) return ctx.abort();
 		if (messages.length) return { entries: [...event.entries, ...drafts(messages, cursor)] };
 	});
 

@@ -12,6 +12,8 @@ export const TAG = "pi-subagent/1";
 export const CHILD_ENV = "PI_SUBAGENT_CHILD";
 /** Custom message type of team messages and of a member's preamble. */
 export const TEAM_MESSAGE = "team-message";
+/** Custom entry type that marks what a tool call showed seen on the branch; tool calls made through other tools return no details of their own. */
+export const SEEN_ENTRY = "team-seen";
 export const DEFAULT_WAIT_MS = 30_000;
 export const MAX_WAIT_MS = 240_000;
 export const BODY_CHARS = 8_000;
@@ -51,7 +53,8 @@ export type TeamParams = Static<typeof teamParameters>;
 export const TEAM_DESCRIPTION = [
 	"Talk with your team: the main agent (main) and the members it started.",
 	"send posts to the shared board (no `to`), or sends one direct message to the members in `to`, and each recipient sees who else got it. A title names a thread: a board post starts one with a title and a body; a reply (`replyTo`), board or direct, joins the thread of the message it answers with only a body. The board is the record; a direct message asks its recipients to act. A board post notifies the members in `mentions` and the author of `replyTo`. Everyone else gets a one-line digest of new board posts by thread after tool results and when a run starts. A running member reads its messages after its next tool results, or before its run ends. A direct message wakes a stopped member, which then runs in its own session; board posts never wake, so to wake the members a post mentions, send them a short direct message that names its #seq instead of repeating the post. A run started by a member's message cannot wake others, and a member the main agent aborted wakes only for the main agent. The send result shows each recipient's state. A run started by a member's message sends its final reply to that member.",
-	"history lists board threads by latest activity, or your direct messages with `with`; `thread` shows a page of one thread, selecting oldest messages first and displaying them as a tree. Each page keeps full message bodies within 16000 characters; follow its `More: history thread=... after=...` call until no continuation remains. wait returns once a message for you is pending; the messages follow the tool result. members lists members with their roles and states, and the topic. topic sets the topic (main agent only).",
+	"history lists board threads by latest activity, or your direct messages with `with`; `thread` shows a page of one thread, selecting oldest messages first and displaying them as a tree. Each page keeps full message bodies within 16000 characters; follow its `More: history thread=... after=...` call until no continuation remains. wait returns once a message for you is pending; the messages follow the tool result. members lists members with their roles and states, and the topic. topic sets the topic (main agent only). A member's progress, result, and control (status, abort, compact, switch) belong to the main agent's subagent tool, not to team.",
+	"Members see the board and only the direct messages they sent or received; when you point others to a direct message they did not get, quote what they need from it.",
 ].join("\n\n");
 
 /** One team message, rendered for its recipient; a notice from the team itself has seq 0. */
@@ -67,23 +70,24 @@ export type Request =
 	 * `seen`: the seqs of the team messages that the member's current branch holds; the reply holds the messages for the member that it lacks.
 	 * `board`: the branch's board cursor; with it, the reply also holds a one-line digest of the board posts after it that `seen` lacks,
 	 * and the cursor that digest moves it to.
+	 * `boundary`: the member is at a safe point, between tool results and its next model request; the reply's `stop` asks it to end its run there.
 	 */
-	| { op: "inbox"; seen: number[]; board?: number }
+	| { op: "inbox"; seen: number[]; board?: number; boundary?: boolean }
 	| { op: "wait"; seen: number[]; ms: number }
 	/** After a manual compaction: the reply's `text`, if any, is the main agent's message to append after the summary. */
 	| { op: "compacted" }
 	| ({ op: "team" } & TeamParams);
 
-/** `board`: the caller's board cursor after a digest. `covered`: the seqs of the messages a history call showed. */
+/** `board`: the caller's board cursor after a digest. `covered`: the seqs of the messages a history call showed. `stop`: end the run at this safe point. */
 export type Reply =
-	| { ok: true; text?: string; team?: string; preamble?: string; messages?: Delivery[]; count?: number; board?: number; covered?: number[] }
+	| { ok: true; text?: string; team?: string; preamble?: string; messages?: Delivery[]; count?: number; board?: number; covered?: number[]; stop?: boolean }
 	| { error: string };
 
 export type Details = Record<string, unknown> | undefined;
 
-/** The details of a custom message or tool result entry, where the extension keeps what a branch has seen. */
+/** The details of a custom message or seen-mark entry, where the extension keeps what a branch has seen. */
 export const detailsOf = (entry: SessionEntry) =>
-	(entry.type === "custom_message" ? entry.details : entry.type === "message" && entry.message.role === "toolResult" ? entry.message.details : undefined) as Details;
+	(entry.type === "custom_message" ? entry.details : entry.type === "custom" && entry.customType === SEEN_ENTRY ? entry.data : undefined) as Details;
 
 /** The board cursor of `entries`, a session's current branch, for team `team`: the highest `board` in their details, which every digest carries. */
 export const boardCursor = (entries: SessionEntry[], team: string) =>

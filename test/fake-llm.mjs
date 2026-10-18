@@ -1,7 +1,7 @@
 // Scripted OpenAI-compatible endpoint for the end-to-end test; logs every request body.
 // Team messages and subagent notices (user messages starting with "[team" or "[subagent]") are skipped, except that a woken member's launch note
 // ("... sent you a team message. Act on ...") is replaced by the body of the last team message its run starts with,
-// without the board digest that may follow it.
+// without the board digest that may follow it, and the note that resumes a run after a compaction at its safe point is replaced by the main agent's message in it.
 // The last other message decides the reply:
 //   assistant                        → "notified" (only team messages arrived)
 //   tool result                      → "ack" (parent turn after a subagent call), except:
@@ -16,6 +16,7 @@
 //   "TEAMS <a> || <b> ..."            → a `team` call with <a>
 //   "RELOAD"                         → a `reload_now` tool call
 //   "BASH <command>"                 → a `bash` tool call running <command>
+//   "TOOL <name> <json>"             → a call of tool <name> with those arguments
 //   "[settled|aborted|error|compacted] ..." → "notified" (a delivered subagent result)
 //   "FAIL <message>"                 → a stream that fails with <message>
 //   "SLOW <ms> <rest>"               → wait, then handle <rest>
@@ -36,13 +37,20 @@ const sleep = (ms) => new Promise((done) => setTimeout(done, ms));
 const CALLS = /^CALLS (\d+) (\{.*?\}) \|\| (\{.*\})$/s;
 // The whole message, so a summarizer prompt that quotes a launch note is not one.
 const WOKEN = /^.* sent you a team message\. Act on your team messages\.$/;
+const RESUMED = /^The main agent compacted your context at this point of your run\. Continue your task\.\n\nThe main agent's message:\n([\s\S]*)$/;
 const isTeam = (m) => m.role === "user" && /^\[(team|subagent\])/.test(text(m));
 /** The body of the last team message in a run's start message. */
 const lastBody = (start) => text(start).split(/\[team #\d+\][^\n]*\n/).at(-1).split("\n[team] Board: ")[0].trim();
 
 async function reply(body) {
 	const messages = body.messages.flatMap((m, i, all) =>
-		m.role === "user" && WOKEN.test(text(m)) ? [{ role: "user", content: lastBody(all[i + 1]) }] : isTeam(m) ? [] : [m],
+		m.role === "user" && WOKEN.test(text(m))
+			? [{ role: "user", content: lastBody(all[i + 1]) }]
+			: m.role === "user" && RESUMED.test(text(m))
+				? [{ role: "user", content: text(m).match(RESUMED)[1] }]
+				: isTeam(m)
+					? []
+					: [m],
 	);
 	const last = messages.at(-1);
 	if (last.role === "assistant") return { content: "notified" };
@@ -83,6 +91,8 @@ async function reply(body) {
 	if (said.startsWith("TEAMS ")) return { call: said.slice(6).split(" || ")[0], name: "team" };
 	if (said === "RELOAD") return { call: "{}", name: "reload_now" };
 	if (said.startsWith("BASH ")) return { call: JSON.stringify({ command: said.slice(5) }), name: "bash" };
+	const tool = said.match(/^TOOL (\S+) ([\s\S]*)$/);
+	if (tool) return { call: tool[2], name: tool[1] };
 	if (said === "TOOLS?") return { content: `tools: ${(body.tools || []).map((t) => t.function.name).join(",")}` };
 	if (said.startsWith("SAY ")) return { content: said.slice(4) };
 	return { content: `unscripted: ${said.slice(0, 80)}` };

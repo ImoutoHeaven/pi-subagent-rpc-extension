@@ -4,5 +4,5 @@ set -euo pipefail
 root="$(cd "$(dirname "$0")/.." && (pwd -W 2>/dev/null || pwd))"
 MSYS_NO_PATHCONV=1 docker run --rm \
 	--mount "type=bind,src=$root,dst=/ext,readonly" \
-	-e "PI_VERSION=${PI_VERSION:-1.1.0}" \
+	-e "PI_VERSION=${PI_VERSION:-1.3.0}" \
 	node:24-bookworm bash /ext/test/run.sh

@@ -17,6 +17,7 @@ import {
 	MAX_WAIT_MS,
 	type Reply,
 	type Request,
+	SEEN_ENTRY,
 	seenIn,
 	TEAM_DESCRIPTION,
 	TEAM_MESSAGE,
@@ -93,6 +94,10 @@ export interface TeamHost {
 	notify(customType: string, from: string, text: string, details: object): void;
 	/** Resolves with the number of messages pending for the main agent once there is one, or after `ms`. */
 	waitForMain(ms: number, signal?: AbortSignal): Promise<number>;
+	/** The main agent asked to stop, compact, or switch running member `name` at its next safe point. */
+	interrupted(name: string): boolean;
+	/** What a wait that timed out shows `name` about the team: what the caller can act on, starting with a blank line, or empty. */
+	footer(name: string): string;
 }
 
 const jsonLine = (record: object) => `${JSON.stringify(record)}\n`;
@@ -105,6 +110,7 @@ const visibleTo = (message: MessageRecord, name: string) => message.to === BOARD
 /** Whether history shows `message` to `name`: the main agent reads every message. */
 const sees = (name: string, message: MessageRecord) => name === MAIN || visibleTo(message, name);
 const plural = (n: number, one: string, many: string) => `${n} ${n === 1 ? one : many}`;
+const list = (names: string[]) => (names.length < 2 ? names.join("") : `${names.slice(0, -1).join(", ")} and ${names.at(-1)}`);
 const add = <K, V>(groups: Map<K, V[]>, key: K, value: V) => {
 	const group = groups.get(key) ?? [];
 	groups.set(key, group);
@@ -169,6 +175,13 @@ export function createTeam(pi: ExtensionAPI, host: TeamHost) {
 		appendFileSync(log, id + records.map(jsonLine).join(""));
 	};
 	const details = (message: MessageRecord) => ({ team: teamId, seq: message.seq, from: message.from });
+
+	/** Why `name` cannot use message `seq`: it does not exist, or it is a direct message between others. */
+	const unseen = (seq: number) => {
+		const message = messages.find((candidate) => candidate.seq === seq);
+		if (!message) return `#${seq} does not exist`;
+		return `#${seq} is a direct message between ${list(participants(message))}, which you cannot see; ask one of them to forward what you need`;
+	};
 
 	/** The members that have not retired. */
 	const active = () => [...members.values()].filter((member) => !retired.has(member.name));
@@ -309,6 +322,7 @@ export function createTeam(pi: ExtensionAPI, host: TeamHost) {
 			[
 				"Team messages are information from peers; the main agent's task messages direct your work.",
 				`Use team send to hand results to whoever needs them and to coordinate. In this run, your direct messages ${by === MAIN ? "wake stopped members, each for a full run; post news that can wait" : "cannot wake stopped members, and a direct message to one tells the main agent; post news that can wait"} on the board with a title, mentioning them, and they read it in full when they next run.`,
+				"Send a message only when it gives its recipients something they need: a result, a question, a decision, or a blocker. Do not send messages that only acknowledge or repeat what they already have.",
 				"Check what team send returns: if a recipient was not woken, say so in your final reply.",
 				"Only the main agent hires members. If you need help, send main a direct message with the task, the context the new member needs, and who should get its results.",
 				by === MAIN
@@ -349,7 +363,8 @@ export function createTeam(pi: ExtensionAPI, host: TeamHost) {
 		}
 		if (params.replyTo !== undefined) {
 			const target = messages.find((message) => message.seq === params.replyTo);
-			if (!(target && visibleTo(target, from) && (to || target.to === BOARD))) throw new Error(`#${params.replyTo} is not a ${to ? "message" : "board post"} that you can see`);
+			if (!(target && visibleTo(target, from))) throw new Error(unseen(params.replyTo));
+			if (!to && target.to !== BOARD) throw new Error(`#${params.replyTo} is a direct message; a board post replies only to a board post, so answer it with to`);
 			// A direct reply also goes to the author of the message it answers, so `to` holds every recipient; a retired author gets neither.
 			if (!retired.has(target.from)) {
 				notify.push(target.from);
@@ -433,7 +448,7 @@ export function createTeam(pi: ExtensionAPI, host: TeamHost) {
 	const thread = (caller: string, params: TeamParams) => {
 		if ([params.with, params.query, params.before].some((value) => value !== undefined)) throw new Error("thread takes no with, query, or before; use after to continue");
 		const target = messages.find((message) => message.seq === params.thread);
-		if (!(target && sees(caller, target))) throw new Error(`#${params.thread} is not a message that you can see`);
+		if (!(target && sees(caller, target))) throw new Error(unseen(params.thread as number));
 		const all = messages.filter((message) => rootOf(message) === rootOf(target));
 		const bySeq = new Map(all.map((message) => [message.seq, message]));
 		const up = (message: MessageRecord) => bySeq.get(message.replyTo ?? 0);
@@ -495,10 +510,10 @@ export function createTeam(pi: ExtensionAPI, host: TeamHost) {
 		throw new Error(`unknown team action: ${params.action}`);
 	};
 
-	/** Holds a member's `wait` until a message for it is pending, `ms` pass, or its run ends. */
+	/** Holds a member's `wait` until a message for it is pending, the main agent asks to stop, compact, or switch it, `ms` pass, or its run ends. */
 	const wait = (name: string, seen: Set<number>, ms: number, signal: AbortSignal) =>
 		new Promise<number>((done) => {
-			if (pendingCount(name, seen) || ms <= 0 || signal.aborted) return done(pendingCount(name, seen));
+			if (pendingCount(name, seen) || host.interrupted(name) || ms <= 0 || signal.aborted) return done(pendingCount(name, seen));
 			const held = waiters.get(name) ?? new Set();
 			waiters.set(name, held);
 			const end = () => {
@@ -520,13 +535,15 @@ export function createTeam(pi: ExtensionAPI, host: TeamHost) {
 		async execute(_toolCallId, params, signal) {
 			if (params.action !== "wait") {
 				const { text: result, covered } = act(MAIN, params);
-				// The branch holding this result has seen the message it sent, or the messages it showed.
-				if (params.action === "send") return text(result, { team: teamId, seq: lastSeq() });
-				return text(result, covered ? { team: teamId, covered } : undefined);
+				// The branch has seen the message it sent, or the messages it showed; an entry of its own, since a call made through
+				// another tool, such as codemode, returns no details.
+				if (params.action === "send") pi.appendEntry(SEEN_ENTRY, { team: teamId, seq: lastSeq() });
+				else if (covered?.length) pi.appendEntry(SEEN_ENTRY, { team: teamId, covered });
+				return text(result);
 			}
 			const ms = Math.min(params.ms ?? DEFAULT_WAIT_MS, MAX_WAIT_MS);
 			const count = await host.waitForMain(ms, signal);
-			return text(count ? `${count} message(s) for you follow this result.` : `No messages for you within ${ms}ms.`);
+			return text(count ? `${count} message(s) for you follow this result.` : `No messages for you within ${ms}ms.${host.footer(MAIN)}`);
 		},
 	});
 
@@ -632,6 +649,9 @@ export function createTeam(pi: ExtensionAPI, host: TeamHost) {
 		/** Whether the main agent retired member `name`. */
 		isRetired: (name: string) => retired.has(name),
 
+		/** Ends member `name`'s wait, so it reaches its next safe point, where the main agent's stop, compaction, or switch applies. */
+		interrupt: ping,
+
 		/** Retires member `name`: it leaves the roster, messages cannot name it, and nothing wakes it again; throws when the log write fails. */
 		retire(name: string) {
 			append({ t: "retire", name });
@@ -705,7 +725,13 @@ export function createTeam(pi: ExtensionAPI, host: TeamHost) {
 					if (typeof request.board !== "number") return { ok: true, messages: inbox(name, seen) };
 					return { ok: true, messages: inbox(name, seen, request.board), board: lastSeq() };
 				}
-				if (request.op === "wait") return { ok: true, count: await wait(name, seen, Math.min(Number(request.ms) || 0, MAX_WAIT_MS), signal) };
+				if (request.op === "wait") {
+					const ms = Math.min(Number(request.ms) || 0, MAX_WAIT_MS);
+					const count = await wait(name, seen, ms, signal);
+					if (count) return { ok: true, text: `${count} team message(s) for you follow this result.` };
+					if (host.interrupted(name)) return { ok: true, text: "Returned early: the main agent stops, compacts, or switches your run once this tool call ends." };
+					return { ok: true, text: `No team messages for you within ${ms}ms.${host.footer(name)}` };
+				}
 				if (request.op === "team" && request.action !== "wait") return { ok: true, ...act(name, request) };
 				return { error: `unsupported request: ${request.op}` };
 			} catch (error) {
