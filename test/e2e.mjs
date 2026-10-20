@@ -701,6 +701,11 @@ await step("a direct message names each recipient once, never its sender, and on
 		[["ann", "main"], /you cannot send a message to yourself/],
 		[["ann", "nobody"], /Unknown member: nobody/],
 		[["all"], /Unknown member: all/],
+		// One string naming several recipients, as some models send them.
+		['["ann", "nobody"]', /Unknown member: nobody\./],
+		['"nobody"', /Unknown member: nobody\./],
+		["ann, ann", /to names ann twice/],
+		["", /to names at least one recipient/],
 	]) {
 		const r = await teamCall({ action: "send", to, body: "x" });
 		assert.ok(r.isError, r.text);
@@ -1268,7 +1273,7 @@ await step("a thread shows only visible messages as a tree and pages full bodies
 	await teamCall({ action: "send", to: "outsider", body: TEAMS(outsiderCalls) });
 	await report("outsider", mark);
 	const shown = requestsBy("outsider").at(-1).messages.filter((m) => m.role === "tool").map(rawText).slice(-5);
-	assert.equal(shown[0], `#${direct} is a direct message between main and writer, which you cannot see; ask one of them to forward what you need`);
+	assert.equal(shown[0], `#${direct} is a direct message between main and writer, which you cannot see; ask writer to forward what you need`);
 	assert.equal(shown[1], [`Thread ${title} · 2 messages`, "", ...top, ...boardReply("main")].join("\n"));
 	assert.equal(shown[2], boardItem("1 reply", seqOf(board)));
 	assert.equal(shown[3], "No messages.");

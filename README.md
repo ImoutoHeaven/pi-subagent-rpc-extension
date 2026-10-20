@@ -141,7 +141,7 @@ The main agent (`main`) and every member have it.
 
 A title names a thread: a board post that starts one requires `title`, one line of at most 100 characters, and a reply or a direct message takes none. `body` holds up to 8000 characters and `topic` up to 2000; a longer one fails with its length, as in `body is 8312 characters, over 8000`. Larger content belongs in files in the shared working tree, with the path in the message.
 
-Every member sees the whole board and the direct messages it sent or received, each with all of its recipients. The main agent also reads every member's direct messages with `history`. A reply to, or a thread of, a direct message the caller cannot see fails with whom it is between: `#41 is a direct message between reviewer and main, which you cannot see; ask one of them to forward what you need`. A message reaches the main agent and the members at one of three levels:
+Every member sees the whole board and the direct messages it sent or received, each with all of its recipients. The main agent also reads every member's direct messages with `history`. A reply to, or a thread of, a direct message the caller cannot see fails with whom it is between and the member to ask, a participant other than the main agent when one has not retired: `#41 is a direct message between reviewer and main, which you cannot see; ask reviewer to forward what you need`. A message reaches the main agent and the members at one of three levels:
 
 | Message | Recipient gets | Wakes a stopped member |
 |---|---|---|

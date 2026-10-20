@@ -110,6 +110,15 @@ const visibleTo = (message: MessageRecord, name: string) => message.to === BOARD
 /** Whether history shows `message` to `name`: the main agent reads every message. */
 const sees = (name: string, message: MessageRecord) => name === MAIN || visibleTo(message, name);
 const plural = (n: number, one: string, many: string) => `${n} ${n === 1 ? one : many}`;
+/** Recipients given as one string, as some models send them: a name, a JSON array or string, or a comma-separated list. */
+const recipientNames = (to: string): string[] => {
+	try {
+		const parsed: unknown = JSON.parse(to);
+		if (Array.isArray(parsed)) return parsed.map(String);
+		if (typeof parsed === "string") return [parsed];
+	} catch {}
+	return to.split(",").map((name) => name.trim()).filter(Boolean);
+};
 const list = (names: string[]) => (names.length < 2 ? names.join("") : `${names.slice(0, -1).join(", ")} and ${names.at(-1)}`);
 const add = <K, V>(groups: Map<K, V[]>, key: K, value: V) => {
 	const group = groups.get(key) ?? [];
@@ -180,7 +189,9 @@ export function createTeam(pi: ExtensionAPI, host: TeamHost) {
 	const unseen = (seq: number) => {
 		const message = messages.find((candidate) => candidate.seq === seq);
 		if (!message) return `#${seq} does not exist`;
-		return `#${seq} is a direct message between ${list(participants(message))}, which you cannot see; ask one of them to forward what you need`;
+		// A member that took part answers without spending the main agent's context.
+		const ask = participants(message).find((name) => name !== MAIN && !retired.has(name)) ?? MAIN;
+		return `#${seq} is a direct message between ${list(participants(message))}, which you cannot see; ask ${ask} to forward what you need`;
 	};
 
 	/** The members that have not retired. */
@@ -341,7 +352,7 @@ export function createTeam(pi: ExtensionAPI, host: TeamHost) {
 		if (!body) throw new Error("send requires body");
 		if (body.length > BODY_CHARS) throw new Error(`body is ${body.length} characters, over ${BODY_CHARS}; put the content in a file in the shared working tree and send its path`);
 		if (params.replyTo !== undefined && params.title !== undefined) throw new Error("title names a thread; a reply has only a body");
-		let to = typeof params.to === "string" ? [params.to] : params.to;
+		let to = typeof params.to === "string" ? recipientNames(params.to) : params.to;
 		let notify: string[];
 		let title: string | undefined;
 		if (to) {
