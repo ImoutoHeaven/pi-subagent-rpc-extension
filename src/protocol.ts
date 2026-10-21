@@ -57,30 +57,35 @@ export const TEAM_DESCRIPTION = [
 	"Members see the board and only the direct messages they sent or received; when you point others to a direct message they did not get, quote what they need from it.",
 ].join("\n\n");
 
-/** One team message, rendered for its recipient; a notice from the team itself has seq 0. */
+/** One team message, rendered for its recipient; a notice from the team itself has seq 0, and one about the member's messages its `note` id. */
 export interface Delivery {
 	seq: number;
 	from: string;
 	text: string;
+	note?: string;
 }
 
 export type Request =
 	| { op: "start" }
 	/**
 	 * `seen`: the seqs of the team messages that the member's current branch holds; the reply holds the messages for the member that it lacks.
+	 * `notes`: the ids of the notices that branch holds; the reply holds the others still pending.
 	 * `board`: the branch's board cursor; with it, the reply also holds a one-line digest of the board posts after it that `seen` lacks,
 	 * and the cursor that digest moves it to.
 	 * `boundary`: the member is at a safe point, between tool results and its next model request; the reply's `stop` asks it to end its run there.
 	 */
-	| { op: "inbox"; seen: number[]; board?: number; boundary?: boolean }
-	| { op: "wait"; seen: number[]; ms: number }
-	/** After a manual compaction: the reply's `text`, if any, is the main agent's message to append after the summary. */
+	| { op: "inbox"; seen: number[]; notes: string[]; board?: number; boundary?: boolean }
+	| { op: "wait"; seen: number[]; notes: string[]; ms: number }
+	/** After a manual compaction: the reply's `text`, if any, is the main agent's message to append after the summary, with `keep` in its details. */
 	| { op: "compacted" }
 	| ({ op: "team" } & TeamParams);
 
-/** `board`: the caller's board cursor after a digest. `covered`: the seqs of the messages a history call showed. `stop`: end the run at this safe point. */
+/**
+ * `board`: the caller's board cursor after a digest. `covered`: the seqs of the messages a history call showed. `stop`: end the run at this safe point.
+ * `keep`: the id that marks the main agent's message after a compaction.
+ */
 export type Reply =
-	| { ok: true; text?: string; team?: string; preamble?: string; messages?: Delivery[]; count?: number; board?: number; covered?: number[]; stop?: boolean }
+	| { ok: true; text?: string; team?: string; preamble?: string; messages?: Delivery[]; count?: number; board?: number; covered?: number[]; stop?: boolean; keep?: string }
 	| { error: string };
 
 export type Details = Record<string, unknown> | undefined;
@@ -109,4 +114,15 @@ export const seenIn = (details: Details[], team: string) => {
 		if (Array.isArray(item.covered)) for (const seq of item.covered) seqs.add(seq);
 	}
 	return seqs;
+};
+
+/** The ids of team `team`'s notices that the entries with `details` hold: one delivered at a boundary (`note`), or at a member's run start (`notes`). */
+export const notesIn = (details: Details[], team: string) => {
+	const ids = new Set<string>();
+	for (const item of details) {
+		if (item?.team !== team) continue;
+		if (typeof item.note === "string") ids.add(item.note);
+		if (Array.isArray(item.notes)) for (const id of item.notes) ids.add(id);
+	}
+	return ids;
 };

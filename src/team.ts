@@ -15,6 +15,7 @@ import {
 	type Details,
 	detailsOf,
 	MAX_WAIT_MS,
+	notesIn,
 	type Reply,
 	type Request,
 	SEEN_ENTRY,
@@ -157,15 +158,18 @@ export function createTeam(pi: ExtensionAPI, host: TeamHost) {
 	let topic = "";
 	/** Held `wait` requests by member. */
 	const waiters = new Map<string, Set<() => void>>();
-	// shortcut: pull marks and sender notices live in memory; a reopened session counts every earlier message as pulled, and every member is stopped then anyway.
-	/** Per member, the highest seq its inbox returned; it decides only which messages wake the member again after a run. */
-	const pulled = new Map<string, number>();
+	/**
+	 * Per member, the seqs of the team messages its session branch holds, as its latest request or its session file reports them;
+	 * it decides only which direct messages count as unread, such as those that wake the member again after a run.
+	 */
+	const held = new Map<string, Set<number>>();
 	/** Per member, the seq of its join announcement, the record after its member record in the log; the member's digest leaves it out. */
 	const joined = new Map<string, number>();
 	/** Per member, the seq of the message that woke its current or last run; it never wakes the member again. */
 	const wokeBy = new Map<string, number>();
-	/** Notices for running senders about messages their recipient never read; not log records. */
-	const notices = new Map<string, string[]>();
+	// shortcut: notices live in memory; a reopened session drops those no branch holds yet.
+	/** Notices for running senders about messages their recipient never read, until the sender's branch holds them; not log records. */
+	const notices = new Map<string, { id: string; text: string }[]>();
 	const lastSeq = () => messages.at(-1)?.seq ?? 0;
 	const ping = (name: string) => {
 		for (const wake of [...(waiters.get(name) ?? [])]) wake();
@@ -173,8 +177,15 @@ export function createTeam(pi: ExtensionAPI, host: TeamHost) {
 	/** Queues a notice for running member `name`'s next pull and ends its wait. */
 	const tell = (name: string, text: string) => {
 		if (retired.has(name)) return;
-		notices.set(name, [...(notices.get(name) ?? []), text]);
+		notices.set(name, [...(notices.get(name) ?? []), { id: randomUUID(), text }]);
 		ping(name);
+	};
+	/** Records what member `name`'s branch holds: the team messages `seen`, and the notices `notes`, which it then no longer needs. */
+	const receive = (name: string, seen: Set<number>, notes: Set<string>) => {
+		held.set(name, seen);
+		const left = (notices.get(name) ?? []).filter((notice) => !notes.has(notice.id));
+		if (left.length) notices.set(name, left);
+		else notices.delete(name);
 	};
 
 	const append = (...records: (MemberRecord | MessageRecord | TopicRecord | RetireRecord)[]) => {
@@ -262,9 +273,7 @@ export function createTeam(pi: ExtensionAPI, host: TeamHost) {
 		const pending = due(name, seen);
 		const shown = pending.slice(0, INBOX_SIZE);
 		const more = pending.length - shown.length;
-		if (shown.length) pulled.set(name, Math.max(pulled.get(name) ?? 0, shown[shown.length - 1].seq));
 		const notes = notices.get(name) ?? [];
-		notices.delete(name);
 		return [
 			...shown.map((message, i) => ({
 				seq: message.seq,
@@ -273,7 +282,8 @@ export function createTeam(pi: ExtensionAPI, host: TeamHost) {
 					render(message, name) +
 					(more && i === shown.length - 1 ? `(${more} more team messages for you are pending; they arrive after your next tool results or before your run ends.)\n\n` : ""),
 			})),
-			...[...notes, cursor === undefined ? "" : digest(name, cursor, seen)].filter(Boolean).map((text) => ({ seq: 0, from: BOARD, text })),
+			...notes.map(({ id, text }) => ({ seq: 0, from: BOARD, text, note: id })),
+			...[cursor === undefined ? "" : digest(name, cursor, seen)].filter(Boolean).map((text) => ({ seq: 0, from: BOARD, text })),
 		];
 	};
 
@@ -282,8 +292,8 @@ export function createTeam(pi: ExtensionAPI, host: TeamHost) {
 		host.wake(name, message.from);
 	};
 
-	/** The direct messages to member `name` after its last inbox pull. */
-	const unread = (name: string) => messages.filter((message) => message.to !== BOARD && message.to.includes(name) && message.seq > (pulled.get(name) ?? 0));
+	/** The direct messages to member `name` that its branch does not hold. */
+	const unread = (name: string) => messages.filter((message) => message.to !== BOARD && message.to.includes(name) && !held.get(name)?.has(message.seq));
 
 	type Block = "hop" | "abort";
 	/** `<recipient>#<seq>` of each stuck message the main agent was told about; route and afterRun can both find one. */
@@ -603,7 +613,6 @@ export function createTeam(pi: ExtensionAPI, host: TeamHost) {
 					else if (record?.t === "team" && typeof record.id === "string") teamId ||= record.id;
 					else if (ctx.hasUI) ctx.ui.notify(`team.jsonl line ${i + 1} is not a team record; skipped`, "warning");
 				});
-			for (const name of members.keys()) pulled.set(name, lastSeq());
 			// A log without an id gets one, which every later load reads.
 			if (!teamId) {
 				teamId = randomUUID();
@@ -673,8 +682,13 @@ export function createTeam(pi: ExtensionAPI, host: TeamHost) {
 			retired.add(name);
 		},
 
-		/** The seqs of the direct messages to member `name` after its last inbox pull. */
+		/** The seqs of the direct messages to member `name` that its branch does not hold. */
 		unread: (name: string) => unread(name).map((message) => message.seq),
+
+		/** Records what member `name`'s session branch, with entry details `details`, holds, as its session file shows after a run. */
+		received(name: string, details: Details[]) {
+			receive(name, seenIn(details, teamId), notesIn(details, teamId));
+		},
 
 		/** Records new launch args for member `name`, such as another model; throws when the log write fails. */
 		relaunch(name: string, args: string[]) {
@@ -699,7 +713,7 @@ export function createTeam(pi: ExtensionAPI, host: TeamHost) {
 		},
 
 		/**
-		 * Once a member's run is over, routes again the direct messages that reached it after its last inbox pull:
+		 * Once a member's run is over, routes again the direct messages its branch does not hold:
 		 * one from a sender that can wake it starts its next run; the others wait, and their senders and the main agent are told.
 		 */
 		afterRun(name: string) {
@@ -736,6 +750,10 @@ export function createTeam(pi: ExtensionAPI, host: TeamHost) {
 		/** Answers a member's request. */
 		async answer(name: string, request: Request, signal: AbortSignal): Promise<Reply> {
 			const seen = new Set("seen" in request && Array.isArray(request.seen) ? request.seen.filter(Number.isInteger) : []);
+			// Inbox and wait requests carry what the member's branch holds.
+			if (request.op === "inbox" || request.op === "wait") {
+				receive(name, seen, new Set(Array.isArray(request.notes) ? request.notes.filter((id) => typeof id === "string") : []));
+			}
 			try {
 				if (request.op === "start") return { ok: true, team: teamId, preamble: preamble(name) };
 				if (request.op === "inbox") {

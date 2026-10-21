@@ -1376,6 +1376,64 @@ await step("a provider error ends a run as an error with Pi's retry count; a run
 	for (const id of ["erring", "partner"]) await finished(id);
 });
 
+await step("a notice in a batch another extension drops reaches the member at its next pull, once", async () => {
+	const dropper = join(WORK_DIR, "drop-notice-extension.ts");
+	// Loaded after the subagent extension, it empties the first turn_end batch that holds a notice.
+	fs.writeFileSync(
+		dropper,
+		`export default function (pi) {
+	let dropped = false;
+	pi.on("turn_end", async (event) => {
+		if (dropped || !event.entries.some((e) => e.type === "custom_message" && e.details?.note)) return;
+		dropped = true;
+		return { entries: [] };
+	});
+}
+`,
+	);
+	const args = ["--no-extensions", "-e", fileURLToPath(new URL("..", import.meta.url)), "-e", dropper];
+	await run({ name: "failing", message: `SLOW 4000 FAIL ${DROP}`, waitMs: 0 });
+	await until(() => requestsBy("failing").length > 0);
+	await run({ name: "sender", message: TEAMS([{ action: "send", to: "failing", body: "SAY failing back" }, { action: "wait", ms: 60_000 }]), args, waitMs: 0 });
+	for (const id of ["failing", "sender"]) await finished(id);
+	const told = "[team] failing stopped on an error; the main agent was told.";
+	const count = (body) => body.messages.filter((m) => text(m) === told).length;
+	const seenBy = requestsBy("sender");
+	// The request after the wait lacks the dropped notice; a later one holds it once.
+	const afterWait = seenBy.findIndex((body) => body.messages.at(-1).role === "tool" && /team message\(s\) for you follow this result/.test(text(body.messages.at(-1))));
+	assert.ok(afterWait >= 0, "the wait did not return for the notice");
+	assert.equal(count(seenBy[afterWait]), 0, "the dropped notice reached the model");
+	assert.equal(count(seenBy.at(-1)), 1);
+});
+
+await step("a direct message in a member's last batch that another extension drops wakes the member again once its process exits", async () => {
+	const dropper = join(WORK_DIR, "drop-settle-extension.ts");
+	const marker = join(WORK_DIR, "dropped-at-settle");
+	// Loaded after the subagent extension, it empties the first batch before settling that holds a team message, and ends the run there.
+	fs.writeFileSync(
+		dropper,
+		`import fs from "node:fs";
+export default function (pi) {
+	pi.on("agent_before_settle", async (event) => {
+		if (fs.existsSync(${JSON.stringify(marker)}) || !event.entries.some((e) => e.type === "custom_message" && e.details?.seq)) return;
+		fs.writeFileSync(${JSON.stringify(marker)}, "");
+		return { entries: [], continue: false };
+	});
+}
+`,
+	);
+	const args = ["--no-extensions", "-e", fileURLToPath(new URL("..", import.meta.url)), "-e", dropper];
+	await run({ name: "unheld", message: "SLOW 4000 SAY first run", args, waitMs: 0 });
+	await until(() => requestsBy("unheld").length > 0);
+	const mark = team.events.length;
+	assert.match((await teamCall({ action: "send", to: "unheld", body: "SAY unheld again" })).text, /\(running\)\.$/);
+	const again = (e) => asMessage(e)?.customType === "subagent-result" && asMessage(e).details?.id === "unheld" && /unheld again$/.test(text(asMessage(e)));
+	await team.waitEvent(again, mark);
+	assert.ok(fs.existsSync(marker), "the batch was not dropped");
+	assert.equal(requestsBy("unheld").length, 2);
+	await finished("unheld");
+});
+
 await step("a run that a member started and that ends on an error replies to that member; the main agent gets a notice that starts no turn", async () => {
 	const mark = team.events.length;
 	const r = await run({ name: "caller", message: TEAMS([{ action: "send", to: "erring", body: `SLOW 1000 FAIL ${DROP}` }, { action: "wait", ms: 60_000 }]), waitMs: 60_000 });
@@ -1420,6 +1478,30 @@ await step("Pi's own compaction of a member at its compact point shows in the ru
 	const notices = team.messages(mark).filter((m) => m.customType === "subagent-notice");
 	assert.ok(notices.length, "no compaction notice");
 	for (const notice of notices) assert.match(notice.content, /^\[subagent\] tiny compacted [\d.]+K?→[\d.]+K? \(threshold\) · ctx [\d.]+K?\/1K \d+%$/);
+});
+
+await step("an extension's compaction of a member at a turn boundary shows in the run's result, with a notice that starts no turn", async () => {
+	const boundary = join(WORK_DIR, "boundary-compaction-extension.ts");
+	// Compacts once after the first tool batch, keeping the branch from the assistant message on.
+	fs.writeFileSync(
+		boundary,
+		`export default function (pi) {
+	let done = false;
+	pi.on("turn_end", async (event) => {
+		if (done || !event.toolResults.length) return;
+		done = true;
+		return { entries: [...event.entries, { type: "compaction", summary: "boundary summary", firstKeptEntryId: event.messageEntryId }] };
+	});
+}
+`,
+	);
+	const mark = team.events.length;
+	const r = await run({ name: "bound", message: TEAM({ action: "members" }), args: ["-e", boundary] });
+	const compacted = "compacted [\\d.]+K?→\\? at a turn boundary \\(ctx known after its next successful reply\\)";
+	assert.match(r.text, new RegExp(`^\\[settled\\] subagent bound [^\\n]* · ctx [\\d.]+K?\\/[\\d.]+K? \\d+% · ${compacted}\\n`));
+	const notices = team.messages(mark).filter((m) => m.customType === "subagent-notice").map((m) => m.content);
+	assert.equal(notices.length, 1);
+	assert.match(notices[0], new RegExp(`^\\[subagent\\] bound ${compacted}$`));
 });
 
 const compactor = join(WORK_DIR, "compact-extension.ts");
@@ -1580,13 +1662,44 @@ await step("compact with wake false writes nothing when the compaction fails, an
 	const r = await team.call({ action: "compact", id: "keepfail", instructions: "CANCEL", message: KEPT, wake: false, waitMs: 0 });
 	assert.match(r.text, /^\[compacting\] /);
 	const result = await team.waitMessage("subagent-result", from);
-	assert.match(result.content, /^\[error\] subagent keepfail [^\n]* · compaction failed: Compaction cancelled · only your direct message wakes it\n\nYour message was not written to its context: no compaction completed\.\n\nNotices: compaction refused$/);
+	assert.match(result.content, /^\[error\] subagent keepfail [^\n]* · compaction failed: Compaction cancelled · only your direct message wakes it\n\nYour message was not written to its context: no compaction completed, or appending it failed\.\n\nNotices: compaction refused$/);
 	assert.ok(team.events.slice(from, result.at).some((e) => e.type === "agent_start"), "the result started no turn");
 	await team.waitEvent((e) => e.type === "agent_settled", result.at);
 	const mark = team.events.length;
 	await teamCall({ action: "send", to: "keepfail", body: "SAY after failure" });
 	assert.match(await report("keepfail", mark), /after failure$/);
 	assert.ok(!requestsBy("keepfail").at(-1).messages.some((m) => rawText(m).includes(keptText)), "the message was written");
+});
+
+await step("compact with wake false reports the message unwritten when the member cannot append it after the compaction, and its result starts a turn", async () => {
+	const breaker = join(WORK_DIR, "break-session-extension.ts");
+	const marker = join(WORK_DIR, "broken-session");
+	// Loaded before the subagent extension: after a manual compaction it replaces the session file with a directory, so Pi's next append fails.
+	fs.writeFileSync(
+		breaker,
+		`import fs from "node:fs";
+export default function (pi) {
+	pi.on("session_compact", async (event, ctx) => {
+		if (event.reason !== "manual") return;
+		const file = ctx.sessionManager.getSessionFile();
+		fs.renameSync(file, file + ".saved");
+		fs.mkdirSync(file);
+		fs.writeFileSync(${JSON.stringify(marker)}, file);
+	});
+}
+`,
+	);
+	await lockedMember("keepbroken", ["--no-extensions", "-e", breaker, "-e", fileURLToPath(new URL("..", import.meta.url))]);
+	const from = team.events.length;
+	await team.call({ action: "compact", id: "keepbroken", message: KEPT, wake: false, waitMs: 0 });
+	const result = await team.waitMessage("subagent-result", from);
+	assert.ok(fs.existsSync(marker), "the session file was not replaced");
+	assert.match(result.content, /^\[compacted\] subagent keepbroken [^\n]* \(manual\) · only your direct message wakes it\n\nYour message was not written to its context: no compaction completed, or appending it failed\.$/);
+	assert.ok(team.events.slice(from, result.at).some((e) => e.type === "agent_start"), "the result started no turn");
+	await team.waitEvent((e) => e.type === "agent_settled", result.at);
+	const file = fs.readFileSync(marker, "utf8");
+	fs.rmSync(file, { recursive: true });
+	fs.renameSync(`${file}.saved`, file);
 });
 
 await step("compact and team limits: wake false needs message, wake is for compact only, and length errors state the length; a body of 8000 characters is sent", async () => {

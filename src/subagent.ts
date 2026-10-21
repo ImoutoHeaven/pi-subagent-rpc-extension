@@ -15,6 +15,7 @@ import {
 	getAgentDir,
 	resolveCliModel,
 	type SessionEntry,
+	SessionManager,
 	SettingsManager,
 } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
@@ -122,8 +123,8 @@ interface Agent {
 	resuming: boolean;
 	/** The message a compaction run continues with once the member is compacted. */
 	next?: string;
-	/** The message a compaction run writes after the summary, for the member's next run; `kept` once handed to the member. */
-	keep?: string;
+	/** The message a compaction run writes after the summary, for the member's next run, and the id that marks it; `kept` once Pi appended it. */
+	keep?: { id: string; text: string };
 	kept: boolean;
 	/** Where the final result went, completing "Its result …": SENT, RETURNED, or to the member that woke the run; null until it went somewhere. */
 	delivered: string | null;
@@ -347,7 +348,7 @@ export default function setupParent(pi: ExtensionAPI) {
 	/** Whether a compaction run wrote the main agent's message into the member's context. */
 	const keptLine = (agent: Agent) => {
 		if (!agent.compactOnly || agent.keep === undefined || busy(agent)) return "";
-		return agent.kept ? "Your message waits in its context for its next run." : "Your message was not written to its context: no compaction completed.";
+		return agent.kept ? "Your message waits in its context for its next run." : "Your message was not written to its context: no compaction completed, or appending it failed.";
 	};
 
 	const noticeLine = (agent: Agent) => (agent.notices.length ? `Notices: ${agent.notices.join(" | ")}` : "");
@@ -659,8 +660,7 @@ export default function setupParent(pi: ExtensionAPI) {
 		// Only a compaction the main agent asked for carries its message, once.
 		if (request.op === "compacted") {
 			if (!agent.compactOnly || agent.keep === undefined || agent.kept) return { ok: true };
-			agent.kept = true;
-			return { ok: true, text: agent.keep };
+			return { ok: true, text: agent.keep.text, keep: agent.keep.id };
 		}
 		return team.answer(agent.id, request, signal);
 	};
@@ -707,6 +707,8 @@ export default function setupParent(pi: ExtensionAPI) {
 				agent.phase = "finishing turn";
 				return;
 			case "message_end": {
+				// Pi reports an appended custom message only once the session holds it.
+				if (event.message?.role === "custom" && agent.keep && event.message.details?.keep === agent.keep.id) agent.kept = true;
 				if (event.message?.role !== "assistant") return;
 				if (event.message.provider && event.message.model) setModel(agent, event.message.provider, event.message.model);
 				const usage = event.message.usage;
@@ -739,6 +741,14 @@ export default function setupParent(pi: ExtensionAPI) {
 			case "compaction_start":
 				agent.phase = "compacting";
 				return;
+			// An extension's compaction at a turn boundary: Pi reports its entry, without compaction events or the size after it.
+			case "entry_appended": {
+				if (event.entry?.type !== "compaction") return;
+				agent.contextTokens = undefined;
+				agent.compaction = `compacted ${tokens.format(event.entry.tokensBefore)}→? at a turn boundary (ctx known after its next successful reply)`;
+				if (!agent.compactOnly) notice(agent, agent.compaction);
+				return;
+			}
 			case "compaction_end": {
 				const { reason, result } = event;
 				const resuming = agent.resuming;
@@ -826,6 +836,20 @@ export default function setupParent(pi: ExtensionAPI) {
 		if (!waiting) deliver(agent);
 	};
 
+	/**
+	 * Records what member `agent`'s session branch holds, as its session file shows once its process has exited.
+	 * A file Pi has not written, or cannot read, changes nothing.
+	 */
+	const readBranch = (agent: Agent) => {
+		const path = SessionManager.findById(agent.cwd, agent.id, agent.dir);
+		if (!path) return;
+		try {
+			team.received(agent.id, SessionManager.open(path, agent.dir).getBranch().map(detailsOf));
+		} catch {
+			// What the member's requests reported stands.
+		}
+	};
+
 	/** Starts a run on `command` once the previous run's process has exited; the member counts as running or compacting at once. */
 	const launch = (agent: Agent, command: Launch, startedBy: string) => {
 		if (shuttingDown) throw new Error("the session is ending; no new subagent processes start");
@@ -883,6 +907,7 @@ export default function setupParent(pi: ExtensionAPI) {
 			// A queued compaction comes first; the direct messages the run left unread are routed once it is over.
 			void run.exited.then(() => {
 				if (agent.run === run) agent.run = undefined;
+				readBranch(agent);
 				// A restart launches the next run itself, which reads the messages this run left unread.
 				if (busy(agent) || agent.restarting || shuttingDown) return;
 				const queued = agent.queued;
@@ -899,7 +924,7 @@ export default function setupParent(pi: ExtensionAPI) {
 	const compact = (agent: Agent, { instructions, message, wake }: Compaction) => {
 		launch(agent, { type: "compact", ...(instructions ? { customInstructions: instructions } : {}) }, MAIN);
 		if (wake) agent.next = message;
-		else agent.keep = message;
+		else if (message !== undefined) agent.keep = { id: randomUUID(), text: message };
 	};
 
 	/** Stops the member's run or compaction, if any, and cancels a queued compaction; the caller returns the stopped run's state. */
@@ -1232,7 +1257,7 @@ export default function setupParent(pi: ExtensionAPI) {
 	pi.on("session_start", (event, ctx) => {
 		parent = ctx;
 		const base = sessionBase(ctx);
-		for (const member of team.load(base, ctx)) register(member.name, member.cwd, join(base, "subagents", member.name), member.args, "stopped");
+		for (const member of team.load(base, ctx)) readBranch(register(member.name, member.cwd, join(base, "subagents", member.name), member.args, "stopped"));
 		// Nothing is pending yet: a session start makes a new runtime.
 		const shown = ctx.sessionManager.getBranch().map(detailsOf);
 		if (event.reason === "fork") team.forked(shown);

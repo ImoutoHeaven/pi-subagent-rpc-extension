@@ -9,6 +9,7 @@ import {
 	type Delivery,
 	detailsOf,
 	MAX_WAIT_MS,
+	notesIn,
 	type Reply,
 	type Request,
 	SEEN_ENTRY,
@@ -37,8 +38,11 @@ export default function setupChild(pi: ExtensionAPI) {
 	/** The team's id, from the start reply. */
 	let teamId = "";
 	// Read state comes from the current branch at every pull: Pi can drop a batch of boundary entries, and the next pull then returns it again.
-	/** The seqs of the team messages the current branch holds. */
-	const seen = (ctx: ExtensionContext) => [...seenIn(ctx.sessionManager.getBranch().map(detailsOf), teamId)];
+	/** The seqs of the team messages, and the ids of the notices, the current branch holds. */
+	const held = (ctx: ExtensionContext) => {
+		const details = ctx.sessionManager.getBranch().map(detailsOf);
+		return { seen: [...seenIn(details, teamId)], notes: [...notesIn(details, teamId)] };
+	};
 
 	/**
 	 * Pulls the messages the branch lacks and, with `digest`, the board digest and the cursor it moves to; notices and the digest carry seq 0.
@@ -46,7 +50,7 @@ export default function setupChild(pi: ExtensionAPI) {
 	 */
 	const pull = async (ctx: ExtensionContext, digest = false, boundary = false) => {
 		const board = digest ? { board: boardCursor(ctx.sessionManager.getBranch(), teamId) } : {};
-		const { messages = [], board: cursor, stop } = await ask(ctx, { op: "inbox", seen: seen(ctx), ...board, ...(boundary ? { boundary } : {}) }, ctx.signal);
+		const { messages = [], board: cursor, stop } = await ask(ctx, { op: "inbox", ...held(ctx), ...board, ...(boundary ? { boundary } : {}) }, ctx.signal);
 		return { messages, cursor, stop };
 	};
 
@@ -57,7 +61,13 @@ export default function setupChild(pi: ExtensionAPI) {
 			customType: TEAM_MESSAGE,
 			content: message.text,
 			display: true,
-			details: { team: teamId, seq: message.seq, from: message.from, ...(cursor !== undefined && i === messages.length - 1 ? { board: cursor } : {}) },
+			details: {
+				team: teamId,
+				seq: message.seq,
+				from: message.from,
+				...(message.note ? { note: message.note } : {}),
+				...(cursor !== undefined && i === messages.length - 1 ? { board: cursor } : {}),
+			},
 		}));
 
 	pi.registerTool({
@@ -68,7 +78,7 @@ export default function setupChild(pi: ExtensionAPI) {
 		async execute(_toolCallId, params, signal, _onUpdate, ctx) {
 			if (params.action === "wait") {
 				const ms = Math.min(params.ms ?? DEFAULT_WAIT_MS, MAX_WAIT_MS);
-				return text((await ask(ctx, { op: "wait", seen: seen(ctx), ms }, signal, ms + WAIT_SLACK_MS)).text ?? "");
+				return text((await ask(ctx, { op: "wait", ...held(ctx), ms }, signal, ms + WAIT_SLACK_MS)).text ?? "");
 			}
 			const reply = await ask(ctx, { op: "team", ...params }, signal);
 			// An entry of its own, since a call made through another tool, such as codemode, returns no details.
@@ -82,8 +92,9 @@ export default function setupChild(pi: ExtensionAPI) {
 		teamId = id;
 		const { messages, cursor } = await pull(ctx, true);
 		const covered = messages.flatMap((m) => (m.seq ? [m.seq] : []));
+		const notes = messages.flatMap((m) => (m.note ? [m.note] : []));
 		return {
-			message: { customType: TEAM_MESSAGE, content: [preamble, ...messages.map((m) => m.text)].join(""), display: true, details: { team: teamId, covered, board: cursor } },
+			message: { customType: TEAM_MESSAGE, content: [preamble, ...messages.map((m) => m.text)].join(""), display: true, details: { team: teamId, covered, notes, board: cursor } },
 		};
 	});
 
@@ -99,10 +110,11 @@ export default function setupChild(pi: ExtensionAPI) {
 	// A compaction the main agent asked for may carry its message, which joins the session after the summary without starting a run.
 	pi.on("session_compact", async (event, ctx) => {
 		if (event.reason !== "manual") return;
-		const { text: message } = await ask(ctx, { op: "compacted" });
+		const { text: message, keep } = await ask(ctx, { op: "compacted" });
 		if (message === undefined) return;
 		const content = `[team] main → you (direct), written after the compaction for your next run:\n${message}\n\n`;
-		pi.sendMessage({ customType: TEAM_MESSAGE, content, display: true, details: { from: "main" } }, { triggerTurn: false });
+		// The main agent counts the message kept once Pi reports it appended, by `keep`.
+		pi.sendMessage({ customType: TEAM_MESSAGE, content, display: true, details: { from: "main", keep } }, { triggerTurn: false });
 	});
 
 	// A message that arrived while the member wrote its final reply continues the same run; a digest alone never does, so it is not asked for.
