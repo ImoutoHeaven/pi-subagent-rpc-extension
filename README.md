@@ -4,7 +4,7 @@ A [Pi](https://pi.dev) extension that gives a session a team of subagents. Each 
 
 `team send` is the only way to send a message. A message reaches its recipient at the recipient's next safe point. A direct message to a stopped member wakes it, except that a run woken by another member cannot wake anyone. A run's final reply goes to whoever started that run.
 
-Requires Pi 1.3.0.
+Supports Pi 1.3.0 and 1.4.0.
 
 ## Install
 
@@ -20,7 +20,7 @@ To try it for one run: `pi -e /path/to/pi-subagent-rpc-extension`. Subagents do 
 |---|---|---|
 | `run` | `name`, `description`, `message`, `model`, `cwd`, `args`, `waitMs` | Hires a member named `name`, announces it on the board, and starts it on `message`. |
 | `status` | `id`, `waitMs` | Reports progress or the result. Without `id`, lists every member. |
-| `abort` | `id`, `retire`, `when` | Stops the member's run at its next [safe point](#safe-points), or at once with `when: now`, and cancels a queued compaction. A compaction run stops at once. A run that Pi has not started yet, or that does not stop within 10 seconds, is killed; a wake still waiting for the previous process never starts. The member then wakes only for a direct message from the main agent, and its status header ends with ` · only your direct message wakes it`, with `, 2 unread waiting` when direct messages wait in its inbox; the roster shows it as `stopped (only main wakes it)`. With `retire: true`, the member, running or stopped, also leaves the team. |
+| `abort` | `id`, `retire`, `when` | Stops the member's run at its next [safe point](#safe-points), or at once with `when: now`, and cancels a queued compaction. A compaction run stops at once. For an immediate stop, a run Pi has not started yet is killed; a started run gets up to 10 seconds to abort before process termination. A wake still waiting for the previous process never starts. The member then wakes only for a direct message from the main agent, and its status header ends with ` · only your direct message wakes it`, with `, 2 unread waiting` when direct messages wait in its inbox; the roster shows it as `stopped (only main wakes it)`. With `retire: true`, the member, running or stopped, also leaves the team. |
 | `compact` | `id`, `instructions`, `message`, `wake`, `when`, `waitMs` | Compacts the member's context with Pi's compaction; see [Compaction](#compaction). |
 | `switch` | `id`, `model`, `thinking`, `when`, `message`, `waitMs` | Moves the member to another model or thinking level: a running member at its next [safe point](#safe-points), any other from its next run, or at once with `when: now` and `message`; see [Switching models](#switching-models). |
 
@@ -64,7 +64,7 @@ Once a run ends, its status line names the model with its thinking level, such a
 Once known, the status line also shows the member's context as `ctx 212K/300K 71%`: the context tokens of its last model reply, or Pi's estimate after its last compaction, against its [compact point](#compaction). The context stays known across runs. A run that did not settle ends its status line with how it ended:
 
 ```text
-[error] subagent tester · openai/gpt-5:high · 3 turns · 2m10s · 48.2K in · 3.1K out · ctx 52K/300K 17% · stream error: stream disconnected before completion: stream closed before response.completed (Pi retried 0 times)
+[error] subagent tester · openai/gpt-5:high · 3 turns · 2m10s · 48.2K in · 3.1K out · ctx 52K/300K 17% · invalid request: unsupported model parameter (Pi retried 0 times)
 [aborted] subagent tester · openai/gpt-5:high · 2 turns · 41s · 20.1K in · 1.2K out · ctx 31K/300K 10% · by an extension
 ```
 
@@ -207,5 +207,6 @@ A reply cites the message it answers and its thread by `#seq` and the thread's t
 
 The end-to-end test drives parent Pi processes over RPC against a scripted model and a throwaway agent directory. Each parent runs Pi's CLI inside a small host script, as an SDK host does.
 
-- `npm test` runs a typecheck and the end-to-end test in a `node:24-bookworm` container. It requires Docker.
+- `npm test` (`bash test/docker.sh`) runs `test/run.sh` (typecheck, POSIX process checks, and the end-to-end test) against Pi 1.3.0 and 1.4.0 in separate `node:24-bookworm` containers. It requires Docker and network access to download dependencies; source is mounted read-only and host dependencies stay unchanged.
+- `PI_VERSION=1.4.0 npm test` selects one Pi version (`test/run.sh` defaults `PI_VERSION` to `1.4.0` when run directly in a container).
 - `PI_CLI=/path/to/cli.js bash test/local.sh` runs the end-to-end test against the Pi CLI entry (`cli.js`) that `PI_CLI` names.

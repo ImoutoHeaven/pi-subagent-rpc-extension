@@ -1,6 +1,6 @@
 {
 	"name": "pi-subagent-rpc-extension",
-	"version": "0.1.0",
+	"version": "0.1.1",
 	"description": "Pi subagents as RPC child processes bound to the parent session",
 	"type": "module",
 	"license": "MIT",

@@ -37,6 +37,7 @@ const requests = () =>
 	fs
 		.readFileSync(REQUESTS, "utf8")
 		.split("\n")
+		.slice(0, -1) // A concurrent append may leave the last JSONL record incomplete.
 		.filter(Boolean)
 		.map((line) => JSON.parse(line))
 		.filter((body) => body.messages);
@@ -157,6 +158,20 @@ async function step(name, fn) {
 		console.log(`      recent events:\n        ${recent.join("\n        ")}`);
 	}
 }
+
+await step("request log polling waits for complete JSONL records and rejects malformed complete records", async () => {
+	const first = { messages: [{ role: "user", content: "complete record" }] };
+	try {
+		fs.writeFileSync(REQUESTS, `${JSON.stringify(first)}\n{"messages":`);
+		assert.deepEqual(requests(), [first]);
+		fs.appendFileSync(REQUESTS, "[]}\n");
+		assert.deepEqual(requests(), [first, { messages: [] }]);
+		fs.appendFileSync(REQUESTS, "not JSON\n");
+		assert.throws(requests, SyntaxError);
+	} finally {
+		fs.writeFileSync(REQUESTS, "");
+	}
+});
 
 const parent = startParent(["--session-dir", join(WORK_DIR, "sessions")]);
 current = parent;
@@ -1358,8 +1373,8 @@ await step("a team member without the extension fails its run", async () => {
 	assert.match(r.text, /team extension did not load/);
 });
 
-// A transport error that Pi does not retry.
-const DROP = "stream error: stream disconnected before completion: stream closed before response.completed";
+// A deterministic provider rejection that Pi does not retry.
+const DROP = "invalid request: deterministic fixture rejection";
 const escaped = (text) => text.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
 
 await step("a provider error ends a run as an error with Pi's retry count; a running member that sent it a direct message is told, and its unread message resumes it", async () => {
@@ -1966,6 +1981,21 @@ const waiting = async (name, args = {}) => {
 	await until(() => requestsBy(name).length > 0);
 	await sleep(1500);
 };
+/** Holds a real shell tool until the parent releases it, independent of scheduling delays. */
+const heldTool = async (name, args = {}) => {
+	const ready = join(WORK_DIR, `${name}-tool-ready`);
+	const release = join(WORK_DIR, `${name}-tool-release`);
+	const releaseTool = () => fs.writeFileSync(release, "");
+	const quote = (file) => "'" + file.replaceAll("\\", "/").replaceAll("'", "'\\''") + "'";
+	try {
+		await run({ name, ...args, message: `BASH : > ${quote(ready)}; while [ ! -f ${quote(release)} ]; do sleep 0.05; done`, waitMs: 0 });
+		await until(() => fs.existsSync(ready));
+		return releaseTool;
+	} catch (error) {
+		releaseTool();
+		throw error;
+	}
+};
 /** Member `id`'s next result from event index `from`, once the main agent's turn on it has ended. */
 const resultOf = async (id, from) => {
 	const result = await team.waitEvent((e) => asMessage(e)?.customType === "subagent-result" && asMessage(e).details?.id === id, from);
@@ -1998,14 +2028,16 @@ await step("abort stops a running member at its next safe point: a member in tea
 });
 
 await step("the main agent's direct message sent while an abort waits for the member's safe point wakes it once the run has stopped, ahead of a member's earlier message", async () => {
-	// A slow tool holds the safe point back while a member and then the main agent send.
-	await run({ name: "abortdm", message: "BASH sleep 10", waitMs: 0 });
-	await until(() => requestsBy("abortdm").length > 0);
+	const release = await heldTool("abortdm");
 	const from = team.events.length;
-	assert.match((await team.call({ action: "abort", id: "abortdm", retire: false })).text, / · stops at its next safe point\n/);
-	await run({ name: "abortpeer", message: TEAM({ action: "send", to: "abortdm", body: "SAY from peer" }), waitMs: 0 });
-	assert.match(await report("abortpeer", from), /\nteam: Sent #\d+ to abortdm \(running\)\.(\n|$)/);
-	assert.match((await teamCall({ action: "send", to: "abortdm", body: "SAY rewoken" })).text, /^Sent #\d+ to abortdm \(running\)\.$/);
+	try {
+		assert.match((await team.call({ action: "abort", id: "abortdm", retire: false })).text, / · stops at its next safe point\n/);
+		await run({ name: "abortpeer", message: TEAM({ action: "send", to: "abortdm", body: "SAY from peer" }), waitMs: 0 });
+		assert.match(await report("abortpeer", from), /\nteam: Sent #\d+ to abortdm \(running\)\.(\n|$)/);
+		assert.match((await teamCall({ action: "send", to: "abortdm", body: "SAY rewoken" })).text, /^Sent #\d+ to abortdm \(running\)\.$/);
+	} finally {
+		release();
+	}
 	const aborted = await resultOf("abortdm", from);
 	assert.match(aborted, /^\[aborted\] subagent abortdm [^\n]* · by main(\n|$)/);
 	assert.doesNotMatch(aborted, /only your direct message wakes it/);
@@ -2121,11 +2153,14 @@ await step("a safe-point compaction with nothing to compact lets the run continu
 });
 
 await step("a compaction and a switch pending at the same safe point compact on the new model, and the run continues on it", async () => {
-	await run({ name: "combo", model: "fake/fake-think:low", message: "BASH sleep 6", waitMs: 0 });
-	await until(() => requestsBy("combo").length > 0);
+	const release = await heldTool("combo", { model: "fake/fake-think:low" });
 	const from = team.events.length;
-	await team.call({ action: "compact", id: "combo", message: "SAY combined" });
-	assert.match((await team.call({ action: "switch", id: "combo", model: "fake-keep" })).text, /^combo now runs on fake-keep:low from its next safe point/);
+	try {
+		await team.call({ action: "compact", id: "combo", message: "SAY combined" });
+		assert.match((await team.call({ action: "switch", id: "combo", model: "fake-keep" })).text, /^combo now runs on fake-keep:low from its next safe point/);
+	} finally {
+		release();
+	}
 	assert.match(await resultOf("combo", from), /^\[settled\] subagent combo · fake\/fake-keep:\w+ · [^\n]* · compacted [\d.]+K?→[\d.]+K? \(manual\)\n\ncombined$/);
 	assert.equal(requestsBy("combo").length, 2);
 	assert.equal(requestsBy("combo").at(-1).model, "fake-keep");
