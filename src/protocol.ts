@@ -52,8 +52,8 @@ export type TeamParams = Static<typeof teamParameters>;
 
 export const TEAM_DESCRIPTION = [
 	"Talk with your team: the main agent (main) and the members it started.",
-	"send posts to the shared board (no `to`), or sends one direct message to the members in `to`, and each recipient sees who else got it. A title names a thread: a board post starts one with a title and a body; a reply (`replyTo`), board or direct, joins the thread of the message it answers with only a body. The board is the record; a direct message asks its recipients to act. A board post notifies the members in `mentions` and the author of `replyTo`. Everyone else gets a one-line digest of new board posts by thread after tool results and when a run starts. A running member reads its messages after its next tool results, or before its run ends. A direct message wakes a stopped member, which then runs in its own session; board posts never wake, so to wake the members a post mentions, send them a short direct message that names its #seq instead of repeating the post. A run started by a member's message cannot wake others, and a member the main agent aborted wakes only for the main agent. The send result shows each recipient's state. A run started by a member's message sends its final reply to that member.",
-	"history lists board threads by latest activity, or your direct messages with `with`; `thread` shows a page of one thread, selecting oldest messages first and displaying them as a tree. Each page keeps full message bodies within 16000 characters; follow its `More: history thread=... after=...` call until no continuation remains. wait returns once a message for you is pending; the messages follow the tool result. members lists members with their roles and states, and the topic. topic sets the topic (main agent only). A member's progress, result, and control (status, abort, compact, switch) belong to the main agent's subagent tool, not to team.",
+	"send posts to the shared board (no `to`), or sends one direct message to the members in `to`, and each recipient sees who else got it. A title names a thread: a board post starts one with a title and a body; a reply (`replyTo`), board or direct, joins the thread of the message it answers with only a body. The board is the record; a direct message asks its recipients to act. A board post notifies the members in `mentions` and the author of `replyTo`. Everyone else gets a one-line digest of new board posts by thread after tool results and when a run starts. A running member reads its messages after its next tool results, or before its run ends. A direct message wakes a stopped member, which then runs in its own session; board posts never wake, so to wake the members a post mentions, send them a short direct message that names its #seq instead of repeating the post. A run started by a member's message cannot wake others, and a member the main agent aborted wakes only for the main agent. The send result shows each recipient's state and context use. A run started by a member's message sends its final reply to that member.",
+	"history lists board threads by latest activity, or your direct messages with `with`; `thread` shows a page of one thread, selecting oldest messages first and displaying them as a tree. Each page keeps full message bodies within 16000 characters; follow its `More: history thread=... after=...` call until no continuation remains. wait returns once a message for you is pending; the messages follow the tool result. When the team changed since you last saw it, send and wait results end with a Team footer about it: a member's state, or context use passing another 10% of a compact point; a wait that times out with no change says so. members lists members with their roles, states and context use, and the topic. topic sets the topic (main agent only). A member's progress, result, and control (status, abort, compact, switch) belong to the main agent's subagent tool, not to team.",
 	"Members see the board and only the direct messages they sent or received; when you point others to a direct message they did not get, quote what they need from it.",
 ].join("\n\n");
 
@@ -75,10 +75,11 @@ export type Request =
 	 * `boundary`: the member is at a safe point, between tool results and its next model request; the reply's `stop` asks it to end its run there.
 	 */
 	| { op: "inbox"; seen: number[]; notes: string[]; board?: number; boundary?: boolean }
-	| { op: "wait"; seen: number[]; notes: string[]; ms: number }
+	/** `mark`: the id of the latest compaction on the member's branch, or empty; a new one resets what its team footers count as seen. */
+	| { op: "wait"; seen: number[]; notes: string[]; ms: number; mark: string }
 	/** After a manual compaction: the reply's `text`, if any, is the main agent's message to append after the summary, with `keep` in its details. */
 	| { op: "compacted" }
-	| ({ op: "team" } & TeamParams);
+	| ({ op: "team"; mark: string } & TeamParams);
 
 /**
  * `board`: the caller's board cursor after a digest. `covered`: the seqs of the messages a history call showed. `stop`: end the run at this safe point.
@@ -89,6 +90,9 @@ export type Reply =
 	| { error: string };
 
 export type Details = Record<string, unknown> | undefined;
+
+/** The id of the latest compaction on a branch, or empty: what a team footer has shown is in context since then. */
+export const compactionMark = (entries: SessionEntry[]) => entries.findLast((entry) => entry.type === "compaction")?.id ?? "";
 
 /** The details of a custom message or seen-mark entry, where the extension keeps what a branch has seen. */
 export const detailsOf = (entry: SessionEntry) =>

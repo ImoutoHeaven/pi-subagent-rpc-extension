@@ -21,6 +21,8 @@ export type RunStatus = "settled" | "aborted" | "error";
 export type AbortedBy = "main" | "extension";
 /** The RPC command a run starts with. */
 export type Launch = { type: "prompt"; message: string } | { type: "compact"; customInstructions?: string };
+/** A chained command, or a function that makes it once the step before it is over, such as a prompt that tells how a compaction went. */
+export type Step = Launch | (() => Launch);
 
 export interface RunOwner {
 	/** Every record the child writes, before the run's own bookkeeping. */
@@ -44,7 +46,7 @@ export interface Run {
 	/** Sends an RPC command and resolves to its response; a run that ends first resolves it as failed. */
 	command(record: object): Promise<{ success: boolean; error?: string; data?: any }>;
 	/** Commands the same process runs, in order, once its current run stops, instead of the run concluding; an abort from the parent cancels them. */
-	chain(commands: Launch[]): void;
+	chain(commands: Step[]): void;
 	/** Ends the process whatever its state, for the end of the parent session. */
 	shutdown(): Promise<void>;
 }
@@ -103,7 +105,7 @@ export function startRun(options: { cwd: string; args: string[]; launch: Launch;
 	let commandId = `run-${hex()}`;
 	/** That command got its response. */
 	let replied = false;
-	let chained: Launch[] = [];
+	let chained: Step[] = [];
 	/** A chained command started the current step: the run stopped at its safe point and goes on in this process. */
 	let inChain = false;
 	/** command() calls waiting for their responses, by id. */
@@ -168,7 +170,8 @@ export function startRun(options: { cwd: string; args: string[]; launch: Launch;
 			lastStop = null;
 			settledAborted = false;
 			inChain = true;
-			return send(chained.shift() as Launch);
+			const next = chained.shift() as Step;
+			return send(typeof next === "function" ? next() : next);
 		}
 		if (aborting) finish("aborted", null, "main");
 		else if (settledAborted) finish("aborted", null, "extension");

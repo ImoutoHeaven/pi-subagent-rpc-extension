@@ -67,6 +67,15 @@ const seenMarks = (p, from = 0) =>
 const ROLE = "test member";
 // Messages end with a blank line that separates them; assertions compare the text before it.
 const trimmed = (m) => m && { ...m, content: m.content.trimEnd() };
+const CTX = String.raw`ctx [\d.]+[KM]?(?:\/[\d.]+[KM]? \d+%)?`;
+/** `value` without the context use in recipient states and roster lines, and without Team footers, for assertions about other things. */
+const plain = (value) =>
+	value
+		.replace(/\n\nTeam:(?:\n- [^\n]*)+/g, "")
+		.replace(/\n\nTeam: no changes\./g, "")
+		.replace(new RegExp(` \\(${CTX}\\)`, "g"), "")
+		.replace(new RegExp(` · ${CTX}\\)`, "g"), ")")
+		.replace(new RegExp(`^(- [a-z][a-z0-9-]*: [^\\n]*?) · ${CTX}`, "gm"), "$1");
 
 function startParent(args) {
 	const child = spawn(process.execPath, [host, PI_CLI, "--mode", "rpc", "--model", "fake/fake-model", ...args], { cwd: join(WORK_DIR, "project"), stdio: "pipe" });
@@ -185,7 +194,7 @@ await step("run returns the result when the child finishes within waitMs", async
 	// its 1700 context tokens against the compact point of Pi's default 128000-token window and 16384 reserve tokens.
 	assert.match(r.text, /^\[settled\] subagent first · fake\/fake-model:off · 1 turns · \d+s · 500 in · 200 out · 1K cached · \$0\.26 · ctx 1\.7K\/111\.6K 2%\n/);
 	assert.match(r.text, /hello$/);
-	assert.doesNotMatch(r.text, /\(Background:/);
+	assert.doesNotMatch(r.text, /\nTeam:/, "a team of one shows no footer");
 	first = idOf(r.text);
 	// A later call does not repeat a returned result.
 	const again = await call({ action: "status", id: first });
@@ -212,7 +221,7 @@ await step("status without id lists subagents", async () => {
 await step("a direct message from the main agent wakes a stopped member in its own session; its result reaches the main agent", async () => {
 	const from = events.length;
 	const sent = await call({ action: "send", to: first, body: "SAY again" }, "team");
-	assert.match(sent.text, /^Sent #\d+ to first \(woken\)\.$/);
+	assert.match(plain(sent.text), /^Sent #\d+ to first \(woken\)\.$/);
 	const note = await waitMessage("subagent-result", from);
 	assert.match(note.content, /^\[settled\] subagent first.*again$/s);
 	await waitEvent((e) => e.type === "agent_settled", note.at);
@@ -391,18 +400,18 @@ await step("a result returned by a call is not delivered again", async () => {
 	assert.equal(notifications(from).length, 0);
 });
 
-await step("abort requires retire; with retire false, it stops a hung child, which other results show in their footer until then", async () => {
+await step("abort requires retire; with retire false, it stops a hung child, which a later footer does not repeat as running", async () => {
 	const r = await call({ action: "run", name: "hanging", message: "HANG", waitMs: 500 });
 	assert.match(r.text, LIVE);
 	const id = idOf(r.text);
 	const other = await call({ action: "run", name: "side", message: "SAY side" });
-	assert.match(other.text, new RegExp(`side\\n\\n\\(Background: ${id} running \\d+s\\.\\)$`));
+	assert.match(other.text, /\n\nside$/, "the run result already showed hanging running");
 	const missing = await call({ action: "abort", id });
 	assert.ok(missing.isError, missing.text);
 	assert.match(missing.text, /abort requires retire: true or false/);
 	const a = await call({ action: "abort", id, retire: false, when: "now" });
 	assert.match(a.text, /^\[aborted\]/);
-	assert.doesNotMatch(a.text, /Background/);
+	assert.doesNotMatch(a.text, /\nTeam:/);
 });
 
 await step("a child stays a subagent when its extensions reload", async () => {
@@ -622,17 +631,17 @@ await step("a mention reaches a running member's next request and does not wake 
 	assert.match(alpha.text, LIVE);
 	await until(() => requestsBy("alpha").length > 0);
 	const preamble = requestsBy("alpha")[0].messages.find((m) => rawText(m).startsWith("[team] You are alpha,"));
-	assert.match(rawText(preamble), /\n- main: main agent\n- beta: stopped — answers as beta\n- alpha: running — lists the team\n/);
+	assert.match(plain(rawText(preamble)), /\n- main: main agent\n- beta: stopped — answers as beta\n- alpha: running — lists the team\n/);
 	assert.match(
 		rawText(preamble),
 		/\nUse team send to hand results to whoever needs them and to coordinate\. In this run, your direct messages wake stopped members, each for a full run; post news that can wait on the board with a title, mentioning them, and they read it in full when they next run\.\nSend a message only when it gives its recipients something they need: a result, a question, a decision, or a blocker\. Do not send messages that only acknowledge or repeat what they already have\.\nCheck what team send returns: if a recipient was not woken, say so in your final reply\.\n/,
 	);
-	assert.match(rawText(preamble), /\nYour final reply goes to main\. Keep it short: for what you already sent with team send, name the #seq instead of repeating it\.\n\n/);
+	assert.match(plain(rawText(preamble)), /\nYour final reply goes to main\. Keep it short: for what you already sent with team send, name the #seq instead of repeating it\.\n\n/);
 	const sent = await teamCall({ action: "send", title: "hello both", body: "hello both", mentions: ["alpha", "beta"] });
-	assert.match(sent.text, /^Sent #\d+ to alpha \(running\), beta \(stopped; board posts do not wake\)\.$/);
+	assert.match(plain(sent.text), /^Sent #\d+ to alpha \(running\), beta \(stopped; board posts do not wake\)\.$/);
 	const done = await team.call({ action: "status", id: "alpha", waitMs: 30_000 });
-	assert.match(done.text, /^\[settled\] subagent alpha.*team: Members:\n- main: main agent\n- beta: stopped — answers as beta\n- alpha: running — lists the team\n/s);
-	assert.equal((await teamCall({ action: "members" })).text, "Members:\n- main: main agent\n- beta: stopped — answers as beta\n- alpha: stopped — lists the team\nTopic: (none)");
+	assert.match(plain(done.text), /^\[settled\] subagent alpha.*team: Members:\n- main: main agent\n- beta: stopped — answers as beta\n- alpha: running — lists the team\n/s);
+	assert.equal(plain((await teamCall({ action: "members" })).text), "Members:\n- main: main agent\n- beta: stopped — answers as beta\n- alpha: stopped — lists the team\nTopic: (none)");
 	const next = requestsBy("alpha").at(-1).messages;
 	assert.equal(next.at(-2).role, "tool");
 	assert.match(text(next.at(-1)), /^\[team #\d+\] main → #team, mentions you, beta: hello both\nhello both$/);
@@ -640,7 +649,7 @@ await step("a mention reaches a running member's next request and does not wake 
 	assert.equal(requestsBy("beta").length, children, "a board post woke a stopped member");
 	const mark = team.events.length;
 	const woke = await teamCall({ action: "send", to: "beta", body: "SAY beta again" });
-	assert.match(woke.text, /^Sent #\d+ to beta \(woken\)\.$/);
+	assert.match(plain(woke.text), /^Sent #\d+ to beta \(woken\)\.$/);
 	assert.match(await report("beta", mark), /beta again$/);
 	const start = requestsBy("beta").at(-1).messages.at(-1);
 	// alpha joined after beta's first run, so beta's digest holds alpha's join announcement.
@@ -659,7 +668,7 @@ await step("a direct message between two members is invisible to a third member;
 	await run({ name: "carol", message: TEAM({ action: "send", to: "eve", body: "secret plan" }), waitMs: 0 });
 	for (const id of ["carol", "eve"]) await finished(id);
 	const sent = requestsBy("carol").at(-1).messages.findLast((m) => m.role === "tool");
-	assert.match(rawText(sent), /^Sent #\d+ to eve \(running\)\.$/);
+	assert.match(plain(rawText(sent)), /^Sent #\d+ to eve \(running\)\.$/);
 	const board = await run({ name: "gamma", message: TEAM({ action: "history" }) });
 	assert.match(board.text, /hello both/);
 	assert.doesNotMatch(board.text, /secret plan/);
@@ -679,7 +688,7 @@ await step("a direct message to several members is one message that each gets an
 	await run({ name: "bob", message: "SAY bob ready" });
 	let mark = team.events.length;
 	const sent = await teamCall({ action: "send", to: ["ann", "bob"], body: "SAY to both" });
-	const seq = sent.text.match(/^Sent #(\d+) to ann \(running\), bob \(woken\)\.$/)?.[1] ?? assert.fail(sent.text);
+	const seq = plain(sent.text).match(/^Sent #(\d+) to ann \(running\), bob \(woken\)\.$/)?.[1] ?? assert.fail(plain(sent.text));
 	assert.match(await report("bob", mark), /to both$/);
 	assert.match(rawText(requestsBy("bob").at(-1).messages.at(-1)), new RegExp(`\\[team #${seq}\\] main → ann, you \\(direct\\):\\nSAY to both\\n`));
 	await finished("ann");
@@ -700,9 +709,9 @@ await step("a direct reply to a member's direct message also goes to its author,
 	await finished("dot");
 	let mark = team.events.length;
 	const sent = await teamCall({ action: "send", to: ["ann"], replyTo: asked, body: "SAY answered" });
-	const seq = sent.text.match(/^Sent #(\d+) to ann \(woken\), dot \(woken\)\.$/)?.[1] ?? assert.fail(sent.text);
+	const seq = plain(sent.text).match(/^Sent #(\d+) to ann \(woken\), dot \(woken\)\.$/)?.[1] ?? assert.fail(plain(sent.text));
 	const reply = (viewer) => `[team #${seq}] ${viewer} → ann, dot (direct), replying to #${asked}:\nSAY answered`;
-	for (const id of ["ann", "dot"]) assert.match(await report(id, mark), /\n\nanswered(\n\n\(Background: .*\))?$/);
+	for (const id of ["ann", "dot"]) assert.match(plain(await report(id, mark)), /\n\nanswered$/);
 	assert.ok((await teamCall({ action: "history", with: "dot" })).text.includes(reply("you")), "main's history lacks the reply");
 	mark = team.events.length;
 	await teamCall({ action: "send", to: "dot", body: TEAM({ action: "history", with: "main" }) });
@@ -749,7 +758,7 @@ await step("a direct message can answer a board post and also goes to its author
 	const post = posted.text.match(/team: Posted #(\d+)\./)?.[1] ?? assert.fail(posted.text);
 	const mark = team.events.length;
 	const sent = await teamCall({ action: "send", to: "ann", replyTo: Number(post), body: "SAY taken" });
-	const seq = sent.text.match(/^Sent #(\d+) to ann \(woken\), asker \(woken\)\.$/)?.[1] ?? assert.fail(sent.text);
+	const seq = plain(sent.text).match(/^Sent #(\d+) to ann \(woken\), asker \(woken\)\.$/)?.[1] ?? assert.fail(plain(sent.text));
 	for (const id of ["ann", "asker"]) assert.match(await report(id, mark), /taken/);
 	assert.match(rawText(requestsBy("asker").at(-1).messages.at(-1)), new RegExp(`\\[team #${seq}\\] main → ann, you \\(direct\\), replying to #${post} "Who takes the parser\\?":\\nSAY taken\\n`));
 	assert.match((await teamCall({ action: "history" })).text, new RegExp(`\\[team #${post}\\] asker → #team: Who takes the parser\\?\\nThe parser needs an owner\\.`));
@@ -762,7 +771,7 @@ await step("a message that arrives while a member writes its final reply continu
 	await run({ name: "settler", message: "SLOW 3000 SAY first answer", waitMs: 0 });
 	await until(() => requestsBy("settler").length > 0);
 	const sent = await teamCall({ action: "send", to: "settler", body: "late news" });
-	assert.match(sent.text, /^Sent #\d+ to settler \(running\)\.$/);
+	assert.match(plain(sent.text), /^Sent #\d+ to settler \(running\)\.$/);
 	const done = await team.call({ action: "status", id: "settler", waitMs: 30_000 });
 	// The usage of both replies of the run.
 	assert.match(done.text, /^\[settled\] subagent settler · fake\/fake-model:off · 2 turns · \d+s · 1K in · 400 out · 2K cached · \$0\.52 · ctx 1\.7K\/111\.6K 2%\n.*notified$/s);
@@ -774,9 +783,9 @@ await step("a message that arrives while a member writes its final reply continu
 await step("a member's direct message wakes a stopped member, whose final reply goes back to it as a team message", async () => {
 	const from = team.events.length;
 	const r = await run({ name: "waker", message: TEAMS([{ action: "send", to: "beta", body: "SAY for waker" }, { action: "wait", ms: 60_000 }]), waitMs: 60_000 });
-	assert.match(r.text, /^\[settled\] subagent waker.*team: 1 team message\(s\) for you follow this result\.$/s);
+	assert.match(plain(r.text), /^\[settled\] subagent waker.*team: 1 team message\(s\) for you follow this result\.$/s);
 	const seen = requestsBy("waker").at(-1).messages;
-	assert.ok(seen.some((m) => m.role === "tool" && /^Sent #\d+ to beta \(woken\)\.$/.test(rawText(m))), "beta was not woken");
+	assert.ok(seen.some((m) => m.role === "tool" && /^Sent #\d+ to beta \(woken\)\.$/.test(plain(rawText(m)))), "beta was not woken");
 	assert.match(text(seen.at(-1)), /^\[team #\d+\] beta → you \(direct\):\nFinal reply of beta \(settled\); full text: .*final\.md\n\nfor waker$/);
 	const note = requestsBy("beta").at(-1).messages.findLast((m) => m.role === "user" && !isTeam(m));
 	assert.equal(rawText(note), "waker sent you a team message. Act on your team messages.");
@@ -796,7 +805,7 @@ await step("a member's direct message wakes a stopped member, whose final reply 
 await step("a woken member's final reply reaches the main agent when its waker has stopped", async () => {
 	const from = team.events.length;
 	const r = await run({ name: "quitter", message: TEAM({ action: "send", to: "beta", body: "SLOW 3000 SAY for quitter" }) });
-	assert.match(r.text, /team: Sent #\d+ to beta \(woken\)\.(\n\n\(Background: .*\))?$/);
+	assert.match(plain(r.text), /team: Sent #\d+ to beta \(woken\)\.$/);
 	const note = await team.waitMessage("subagent-result", from);
 	assert.match(note.content, /^\[settled\] subagent beta[^\n]*\n\n\(woken by quitter; quitter had stopped\)\n\nfor quitter$/);
 	await team.waitEvent((e) => e.type === "agent_settled", note.at);
@@ -821,10 +830,10 @@ await step("a run woken by a member cannot wake others; a notice that starts a t
 	assert.match(result.content, /^\[settled\] subagent origin/);
 	await team.waitEvent((e) => e.type === "agent_settled", result.at);
 	const sendResult = requestsBy("relay").at(-1).messages.findLast((m) => m.role === "tool");
-	assert.equal(rawText(sendResult), `Sent #${notice.content.match(/#(\d+)/)[1]} to sink (stopped, not woken: your run was started by origin's message, so it cannot start others; the main agent was told).`);
+	assert.equal(plain(rawText(sendResult)), `Sent #${notice.content.match(/#(\d+)/)[1]} to sink (stopped, not woken: your run was started by origin's message, so it cannot start others; the main agent was told).`);
 	const mark = team.events.length;
 	const woke = await teamCall({ action: "send", to: "sink", body: "SAY sink woken" });
-	assert.match(woke.text, /\(woken\)\.$/);
+	assert.match(plain(woke.text), /\(woken\)\.$/);
 	assert.match(await report("sink", mark), /sink woken$/);
 	assert.match(
 		text(requestsBy("sink").at(-1).messages.at(-1)),
@@ -842,7 +851,7 @@ await step("a direct message to several members from a run woken by a member wak
 	const sendResult = rawText(requestsBy("ray").at(-1).messages.findLast((m) => m.role === "tool"));
 	const seq = sendResult.match(/^Sent #(\d+) /)?.[1] ?? assert.fail(sendResult);
 	const why = "stopped, not woken: your run was started by orin's message, so it cannot start others; the main agent was told";
-	assert.equal(sendResult, `Sent #${seq} to ann (${why}), bob (${why}).`);
+	assert.equal(plain(sendResult), `Sent #${seq} to ann (${why}), bob (${why}).`);
 	assert.deepEqual(
 		team.messages(from).filter((m) => m.customType === "team-notice" && m.content.startsWith(`[team] #${seq} `)).map((m) => m.content.match(/→ (\w+) is waiting/)[1]),
 		["ann", "bob"],
@@ -865,11 +874,11 @@ for (const stopped of [false, true]) {
 		const toolEnd = team.events.findIndex((e, i) => i >= from && e.type === "tool_execution_end");
 		const settled = team.events.findIndex((e, i) => i > toolEnd && e.type === "agent_settled");
 		assert.ok(toolEnd < notice.at && notice.at < settled, "the notice did not join after the tool call");
-		assert.ok((await report(sender, from)).includes(`to ${name} (stopped, not woken: the main agent stopped it; the main agent was told).`));
+		assert.ok((plain(await report(sender, from))).includes(`to ${name} (stopped, not woken: the main agent stopped it; the main agent was told).`));
 		assert.equal(requestsBy(name).length, before, "the member's message woke the aborted recipient");
 		const mark = team.events.length;
 		const woke = await teamCall({ action: "send", to: name, body: "SAY unlocked" });
-		assert.ok(woke.text.endsWith(`to ${name} (woken).`), woke.text);
+		assert.ok(plain(woke.text).endsWith(`to ${name} (woken).`), woke.text);
 		assert.match(await report(name, mark), /^\[settled\] subagent .*unlocked$/s);
 	});
 }
@@ -883,7 +892,7 @@ await step("abort stops a woken member before its run starts; extension notices 
 	const ready = await run({ name: "late", message: "SAY late ready", args: ["-e", slow] });
 	assert.match(ready.text, /^\[settled\] subagent late[^\n]*\n\nNotices: turn started\n\nlate ready/);
 	const before = requestsBy("late").length;
-	assert.match((await teamCall({ action: "send", to: "late", body: "SAY should not run" })).text, /\(woken\)\.$/);
+	assert.match(plain((await teamCall({ action: "send", to: "late", body: "SAY should not run" })).text), /\(woken\)\.$/);
 	const started = Date.now();
 	assert.match((await team.call({ action: "abort", id: "late", retire: false })).text, /^\[aborted\] subagent late/);
 	assert.ok(Date.now() - started < 8000, "abort waited for the kill timeout");
@@ -942,7 +951,7 @@ await step("wait returns early when a message arrives, and the message follows t
 	assert.ok(Date.now() - started < 20_000, "the wait was not cut short");
 	const next = requestsBy("delta").at(-1).messages;
 	assert.equal(next.at(-3).role, "tool");
-	assert.equal(rawText(next.at(-3)), "1 team message(s) for you follow this result.");
+	assert.equal(plain(rawText(next.at(-3))), "1 team message(s) for you follow this result.");
 	assert.match(text(next.at(-2)), /^\[team #\d+\] main → you \(direct\):\nwake up$/);
 	assert.equal(text(next.at(-1)), `[team] Board: 1 new post — #${posted} main: not for delta (team history).`);
 });
@@ -1016,7 +1025,7 @@ await step("a digest alone does not continue a run at settle, and a board post d
 
 await step("a member woken by a direct message acts on it, and its run-start message holds the digest of the posts it missed", async () => {
 	const mark = team.events.length;
-	assert.match((await teamCall({ action: "send", to: "lima", body: "SAY lima woken" })).text, /\(woken\)\.$/);
+	assert.match(plain((await teamCall({ action: "send", to: "lima", body: "SAY lima woken" })).text), /\(woken\)\.$/);
 	assert.match(await report("lima", mark), /^\[settled\] subagent lima[^\n]*\n\nlima woken$/);
 	assert.match(
 		text(requestsBy("lima").at(-1).messages.at(-1)),
@@ -1062,7 +1071,7 @@ await step("a post a member read in history stays out of its digest when it is w
 	assert.match(rawText(requestsBy("zulu").at(-1).messages.at(-1)), /main → #team: read by zulu\nread by zulu\n\nMore: history before=\d+\.$/);
 	const seq = (await teamCall({ action: "send", title: "after zulu", body: "after zulu" })).text.match(/^Posted #(\d+)\./)[1];
 	const mark = team.events.length;
-	assert.match((await teamCall({ action: "send", to: "zulu", body: "SAY zulu again" })).text, /\(woken\)\.$/);
+	assert.match(plain((await teamCall({ action: "send", to: "zulu", body: "SAY zulu again" })).text), /\(woken\)\.$/);
 	assert.match(await report("zulu", mark), /zulu again$/);
 	assert.match(
 		text(requestsBy("zulu").at(-1).messages.at(-1)),
@@ -1092,7 +1101,7 @@ await step("a new member's first digest lists the board posts from before it joi
 	assert.match(rawText(seenBy[1].messages.at(-1)), new RegExp(`\\[team #${during}\\] main → #team: during hotel\\nduring hotel\\n\\nMore: history before=${during}\\.$`));
 	assert.ok(!seenBy.some((body) => body.messages.some((m) => DIGEST.test(rawText(m)))), "a digest repeated a post read in history");
 	const mark = team.events.length;
-	assert.match((await teamCall({ action: "send", to: "hotel", body: "SAY hotel again" })).text, /\(woken\)\.$/);
+	assert.match(plain((await teamCall({ action: "send", to: "hotel", body: "SAY hotel again" })).text), /\(woken\)\.$/);
 	assert.match(await report("hotel", mark), /hotel again$/);
 	assert.doesNotMatch(rawText(requestsBy("hotel").at(-1).messages.at(-1)), /\[team\] Board:/);
 });
@@ -1123,7 +1132,7 @@ export default function (pi) {
 	// Twelve messages for india, more than one pull returns: a board post that mentions it, then direct messages.
 	await team.say(TEAMS([{ action: "send", title: "board for india", body: "board for india", mentions: ["india"] }, ...Array.from({ length: 11 }, (_, i) => ({ action: "send", to: "india", body: `dm ${i}` }))]));
 	await until(() => fs.existsSync(marker));
-	const last = Number((await teamCall({ action: "send", to: "india", body: "after the drop" })).text.match(/^Sent #(\d+) to india \(running\)\.$/)[1]);
+	const last = Number(plain((await teamCall({ action: "send", to: "india", body: "after the drop" })).text).match(/^Sent #(\d+) to india \(running\)\.$/)[1]);
 	await finished("india");
 	const seqs = (messages) => messages.flatMap((m) => [...rawText(m).matchAll(/\[team #(\d+)\]/g)].map((match) => Number(match[1])));
 	const range = (from, n) => Array.from({ length: n }, (_, i) => from + i);
@@ -1138,7 +1147,7 @@ export default function (pi) {
 	assert.deepEqual(seqs(seenBy[3].messages), range(last - 12, 13));
 	// The next run starts with only the message that woke it.
 	const mark = team.events.length;
-	assert.match((await teamCall({ action: "send", to: "india", body: "SAY india again" })).text, /\(woken\)\.$/);
+	assert.match(plain((await teamCall({ action: "send", to: "india", body: "SAY india again" })).text), /\(woken\)\.$/);
 	assert.match(await report("india", mark), /india again$/);
 	assert.deepEqual(seqs([requestsBy("india").at(-1).messages.at(-1)]), [last + 1]);
 });
@@ -1252,13 +1261,13 @@ await step("a thread shows only visible messages as a tree and pages full bodies
 	await run({ name: "outsider", message: "SAY outsider ready" });
 	const root = Number((await run({ name: "writer", message: TEAM({ action: "send", title: "Thread root", body: "root body" }) })).text.match(/team: Posted #(\d+)/)[1]);
 	const board = await teamCall({ action: "send", replyTo: root, body: "board reply" });
-	assert.match(board.text, /to writer \(stopped; board posts do not wake\)\.$/);
+	assert.match(plain(board.text), /to writer \(stopped; board posts do not wake\)\.$/);
 	const onward = TEAM({ action: "send", to: "reader", replyTo: root, body: "SAY between members zq-private" });
 	let mark = team.events.length;
 	const direct = seqOf(await teamCall({ action: "send", to: "writer", replyTo: seqOf(board), body: onward }));
 	await report("writer", mark);
 	await finished("reader");
-	const sent = requestsBy("writer").flatMap((body) => body.messages).map(rawText).find((t) => /^Sent #\d+ to reader \(woken\)\.$/.test(t)) ?? assert.fail("writer did not wake reader");
+	const sent = requestsBy("writer").flatMap((body) => body.messages).map(rawText).find((t) => /^Sent #\d+ to reader \(woken\)\.$/.test(plain(t))) ?? assert.fail("writer did not wake reader");
 	const between = seqOf({ text: sent });
 	const title = `#${root} "Thread root"`;
 	const top = [`[team #${root}] writer → #team: Thread root`, "root body", ""];
@@ -1441,7 +1450,7 @@ export default function (pi) {
 	await run({ name: "unheld", message: "SLOW 4000 SAY first run", args, waitMs: 0 });
 	await until(() => requestsBy("unheld").length > 0);
 	const mark = team.events.length;
-	assert.match((await teamCall({ action: "send", to: "unheld", body: "SAY unheld again" })).text, /\(running\)\.$/);
+	assert.match(plain((await teamCall({ action: "send", to: "unheld", body: "SAY unheld again" })).text), /\(running\)\.$/);
 	const again = (e) => asMessage(e)?.customType === "subagent-result" && asMessage(e).details?.id === "unheld" && /unheld again$/.test(text(asMessage(e)));
 	await team.waitEvent(again, mark);
 	assert.ok(fs.existsSync(marker), "the batch was not dropped");
@@ -1457,7 +1466,7 @@ await step("a run that a member started and that ends on an error replies to tha
 	const seq = reply.match(new RegExp(`^\\[team #(\\d+)\\] erring → you \\(direct\\):\\nFinal reply of erring \\(error\\); full text: .*final\\.md\\n\\n${escaped(DROP)}$`))?.[1] ?? assert.fail(reply);
 	const notices = team.messages(mark).filter((m) => m.customType === "subagent-notice").map((m) => m.content);
 	assert.deepEqual(notices, [`[subagent] erring stopped on an error; its final reply was sent to caller as team message #${seq}: ${DROP}`]);
-	assert.match((await teamCall({ action: "members" })).text, /\n- erring: stopped \(error\) — test member\n/);
+	assert.match(plain((await teamCall({ action: "members" })).text), /\n- erring: stopped \(error\) — test member\n/);
 });
 
 await step("a run that an extension of the member aborts ends as aborted by an extension, and a member's message still wakes it; the main agent is told", async () => {
@@ -1476,11 +1485,11 @@ await step("a run that an extension of the member aborts ends as aborted by an e
 	const r = await run({ name: "selfstop", message: "SAY abort me", args: ["-e", selfAbort] });
 	assert.match(r.text, /^\[aborted\] subagent selfstop · fake\/fake-model:off · [^\n]* · by an extension\n\nNotices: aborting myself\n\nabort me/);
 	// An extension's abort does not lock the member.
-	assert.match((await teamCall({ action: "members" })).text, /\n- selfstop: stopped — test member\n/);
+	assert.match(plain((await teamCall({ action: "members" })).text), /\n- selfstop: stopped — test member\n/);
 	assert.doesNotMatch((await team.call({ action: "status", id: "selfstop" })).text, /only your direct message wakes it/);
 	const mark = team.events.length;
 	const knock = await run({ name: "knock", message: TEAM({ action: "send", to: "selfstop", body: "SAY back again" }) });
-	assert.match(knock.text, /team: Sent #\d+ to selfstop \(woken\)\./);
+	assert.match(plain(knock.text), /team: Sent #\d+ to selfstop \(woken\)\./);
 	assert.equal((await team.waitMessage("subagent-notice", mark)).content, "[subagent] selfstop resumed (woken by knock) after its run was aborted.");
 	await report("selfstop", mark);
 });
@@ -1490,12 +1499,14 @@ await step("Pi's own compaction of a member at its compact point shows in the ru
 	const r = await run({ name: "tiny", model: "fake/fake-small", message: "SAY tiny" });
 	// fake/fake-small compacts above 1000 context tokens; one reply holds 1700.
 	assert.match(r.text, /^\[settled\] subagent tiny · fake\/fake-small:off · 1 turns · \d+s · 500 in · 200 out · 1K cached · ctx ([\d.]+K?)\/1K \d+% · compacted 1\.7K→\1 \(threshold\)\n\ntiny/);
-	const notices = team.messages(mark).filter((m) => m.customType === "subagent-notice");
-	assert.ok(notices.length, "no compaction notice");
-	for (const notice of notices) assert.match(notice.content, /^\[subagent\] tiny compacted [\d.]+K?→[\d.]+K? \(threshold\) · ctx [\d.]+K?\/1K \d+%$/);
+	const notices = team.messages(mark).filter((m) => m.customType === "subagent-notice").map((m) => m.content);
+	// A new member's first reply counts toward context notices.
+	assert.equal(notices[0], "[subagent] tiny passed 170% of its compact point · ctx 1.7K/1K 170%.");
+	assert.ok(notices.length > 1, "no compaction notice");
+	for (const notice of notices.slice(1)) assert.match(notice, /^\[subagent\] tiny compacted [\d.]+K?→[\d.]+K? \(threshold\) · ctx [\d.]+K?\/1K \d+%$/);
 });
 
-await step("an extension's compaction of a member at a turn boundary shows in the run's result, with a notice that starts no turn", async () => {
+await step("an extension's compaction of a member at a turn boundary shows in the run's result with the size its next reply tells, after a notice that starts no turn", async () => {
 	const boundary = join(WORK_DIR, "boundary-compaction-extension.ts");
 	// Compacts once after the first tool batch, keeping the branch from the assistant message on.
 	fs.writeFileSync(
@@ -1512,11 +1523,33 @@ await step("an extension's compaction of a member at a turn boundary shows in th
 	);
 	const mark = team.events.length;
 	const r = await run({ name: "bound", message: TEAM({ action: "members" }), args: ["-e", boundary] });
-	const compacted = "compacted [\\d.]+K?→\\? at a turn boundary \\(ctx known after its next successful reply\\)";
-	assert.match(r.text, new RegExp(`^\\[settled\\] subagent bound [^\\n]* · ctx [\\d.]+K?\\/[\\d.]+K? \\d+% · ${compacted}\\n`));
+	assert.match(r.text, /^\[settled\] subagent bound [^\n]* · ctx ([\d.]+K?)\/[\d.]+K? \d+% · compacted [\d.]+K?→\1 at a turn boundary\n/);
 	const notices = team.messages(mark).filter((m) => m.customType === "subagent-notice").map((m) => m.content);
 	assert.equal(notices.length, 1);
-	assert.match(notices[0], new RegExp(`^\\[subagent\\] bound ${compacted}$`));
+	assert.match(notices[0], /^\[subagent\] bound compacted [\d.]+K?→\? at a turn boundary \(ctx known after its next successful reply\)$/);
+});
+
+await step("a compaction at the end of a member's run gets its size from the member's next reply, in its next run", async () => {
+	const settle = join(WORK_DIR, "settle-compaction-extension.ts");
+	// Compacts once as the first run settles, keeping the branch from its last entry on; each run is a new process, so a file marks it done.
+	const done = join(WORK_DIR, "settle-compaction-done");
+	fs.writeFileSync(
+		settle,
+		`import { existsSync, writeFileSync } from "node:fs";
+export default function (pi) {
+	pi.on("agent_before_settle", async (event, ctx) => {
+		if (existsSync(${JSON.stringify(done)})) return;
+		writeFileSync(${JSON.stringify(done)}, "");
+		return { entries: [...event.entries, { type: "compaction", summary: "settle summary", firstKeptEntryId: ctx.sessionManager.getLeafId() }] };
+	});
+}
+`,
+	);
+	const first = await run({ name: "settlec", message: "SAY before", args: ["-e", settle] });
+	assert.match(first.text, /^\[settled\] subagent settlec [^\n]* · compacted [\d.]+K?→\? at a turn boundary \(ctx known after its next successful reply\)\n/);
+	const mark = team.events.length;
+	await teamCall({ action: "send", to: "settlec", body: "SAY after" });
+	assert.match(await report("settlec", mark), /^\[settled\] subagent settlec [^\n]* · ctx ([\d.]+K?)\/[\d.]+K? \d+% · compacted [\d.]+K?→\1 at a turn boundary\n\nafter$/);
 });
 
 const compactor = join(WORK_DIR, "compact-extension.ts");
@@ -1562,7 +1595,7 @@ await step("compact compacts a stopped member; an extension that takes compactio
 	const compacted = await team.call({ action: "compact", id: "keeper", instructions: "keep the reply" });
 	assert.match(compacted.text, /^\[compacted\] subagent keeper · fake\/fake-keep:off · \d+s · ctx ([\d.]+K?)\/83\.6K \d+% · compacted 1\.7K→\1 \(manual\)(\n|$)/);
 	assert.equal(await compactionsOf("keeper"), 1);
-	assert.match((await teamCall({ action: "members" })).text, /\n- keeper: stopped — test member\n/);
+	assert.match(plain((await teamCall({ action: "members" })).text), /\n- keeper: stopped — test member\n/);
 	const continued = await team.call({ action: "compact", id: "keeper", message: "SAY continued" });
 	assert.match(continued.text, /^\[settled\] subagent keeper · fake\/fake-keep:off · 1 turns · [^\n]* · Already compacted\n\ncontinued/);
 });
@@ -1588,8 +1621,8 @@ await step("a direct message to a compacting member waits until the compaction e
 	await run({ name: "slowc", model: "fake/fake-keep", args: ["-e", compactor], message: "SAY slowc ready" });
 	const mark = team.events.length;
 	assert.match((await team.call({ action: "compact", id: "slowc", instructions: "WAIT 4000", waitMs: 0 })).text, /^\[compacting\] subagent slowc /);
-	assert.match((await teamCall({ action: "members" })).text, /\n- slowc: compacting — test member\n/);
-	assert.match((await teamCall({ action: "send", to: "slowc", body: "SAY read afterwards" })).text, /^Sent #\d+ to slowc \(compacting; reads it afterwards\)\.$/);
+	assert.match(plain((await teamCall({ action: "members" })).text), /\n- slowc: compacting — test member\n/);
+	assert.match(plain((await teamCall({ action: "send", to: "slowc", body: "SAY read afterwards" })).text), /^Sent #\d+ to slowc \(compacting; reads it afterwards\)\.$/);
 	// The compaction run's result joins the session without a turn; the message then wakes the member.
 	const compacted = await team.waitMessage("subagent-result", mark);
 	assert.match(compacted.content, /^\[compacted\] subagent slowc · fake\/fake-keep:off · \d+s · ctx [\d.]+K?\/83\.6K \d+% · compacted 1\.7K→[\d.]+K? \(manual\)\n\nNotices: compaction waits$/);
@@ -1615,7 +1648,7 @@ await step("the main agent's direct message to a member it aborted, sent during 
 	assert.match((await team.call({ action: "abort", id: "lockc", retire: false, when: "now" })).text, /^\[aborted\] subagent lockc /);
 	const mark = team.events.length;
 	assert.match((await team.call({ action: "compact", id: "lockc", instructions: "WAIT 3000", waitMs: 0 })).text, /^\[compacting\] subagent lockc /);
-	assert.match((await teamCall({ action: "send", to: "lockc", body: "SAY unlocked" })).text, /^Sent #\d+ to lockc \(compacting; reads it afterwards\)\.$/);
+	assert.match(plain((await teamCall({ action: "send", to: "lockc", body: "SAY unlocked" })).text), /^Sent #\d+ to lockc \(compacting; reads it afterwards\)\.$/);
 	const compacted = await team.waitMessage("subagent-result", mark);
 	assert.match(compacted.content, /^\[compacted\] subagent lockc /);
 	assert.match(await report("lockc", compacted.at + 1), /unlocked$/);
@@ -1643,10 +1676,10 @@ for (const [kind, name, args] of [
 		// The member is still locked: a member's message does not wake it.
 		let mark = team.events.length;
 		await run({ name: `${name}-knock`, message: TEAM({ action: "send", to: name, body: "SAY knocked" }) });
-		assert.match(await report(`${name}-knock`, mark), new RegExp(`Sent #\\d+ to ${name} \\(stopped, not woken: the main agent stopped it; the main agent was told\\)\\.$`));
+		assert.match(plain(await report(`${name}-knock`, mark)), new RegExp(`Sent #\\d+ to ${name} \\(stopped, not woken: the main agent stopped it; the main agent was told\\)\\.$`));
 		assert.equal(requestsBy(name).length, before, "the member ran");
 		mark = team.events.length;
-		assert.match((await teamCall({ action: "send", to: name, body: "SAY after keep" })).text, /\(woken\)\.$/);
+		assert.match(plain((await teamCall({ action: "send", to: name, body: "SAY after keep" })).text), /\(woken\)\.$/);
 		assert.match(await report(name, mark), /after keep$/);
 		const seen = requestsBy(name).at(-1).messages.map(rawText);
 		const context = seen.join("\n");
@@ -1668,7 +1701,7 @@ await step("a member the main agent aborted and then compacted still shows that 
 	await report("lockknock", mark);
 	assert.match((await team.call({ action: "status", id: "lockshow" })).text, /^\[compacted\] subagent lockshow [^\n]* · only your direct message wakes it, 1 unread waiting(\n|$)/);
 	assert.match((await team.call({ action: "status" })).text, /^\[compacted\] subagent lockshow [^\n]* · only your direct message wakes it, 1 unread waiting$/m);
-	assert.match((await teamCall({ action: "members" })).text, /\n- lockshow: stopped \(only main wakes it\) — test member\n/);
+	assert.match(plain((await teamCall({ action: "members" })).text), /\n- lockshow: stopped \(only main wakes it\) — test member\n/);
 });
 
 await step("compact with wake false writes nothing when the compaction fails, and its result starts a turn", async () => {
@@ -1721,7 +1754,7 @@ await step("compact and team limits: wake false needs message, wake is for compa
 	for (const [args, error] of [
 		[{ action: "compact", id: "keeppi", wake: false }, /compact with wake: false requires message/],
 		[{ action: "status", id: "keeppi", wake: true }, /wake applies to compact only/],
-		[{ action: "compact", id: "keeppi", instructions: "i".repeat(4001) }, /instructions are 4001 characters, over 4000; put what the member must keep word for word in message: with wake: true \(the default\) it runs on message once compacted; with wake: false message stays in its context and it stays stopped$/],
+		[{ action: "compact", id: "keeppi", instructions: "i".repeat(8001) }, /instructions are 8001 characters, over 8000; put what the member must keep word for word in message: with wake: true \(the default\) it runs on message once compacted; with wake: false message stays in its context and it stays stopped$/],
 		[{ action: "run", name: "longrole", description: "d".repeat(101), message: "SAY x" }, /description is 101 characters, over 100/],
 	]) {
 		const r = await team.call(args);
@@ -1754,18 +1787,18 @@ await step("a member with a queued compaction is not woken between the end of it
 	assert.match((await team.call({ action: "compact", id: "gapc", instructions: "WAIT 1000" })).text, /If its run ends first, it compacts afterwards\./);
 	assert.match((await team.call({ action: "status", id: "gapc", waitMs: 30_000 })).text, /^\[settled\] subagent gapc [^\n]*\n\ngapc first/);
 	let mark = team.events.length;
-	assert.match((await teamCall({ action: "send", to: "gapc", body: "SAY after the compaction" })).text, /^Sent #\d+ to gapc \(compacting; reads it afterwards\)\.$/);
+	assert.match(plain((await teamCall({ action: "send", to: "gapc", body: "SAY after the compaction" })).text), /^Sent #\d+ to gapc \(compacting; reads it afterwards\)\.$/);
 	// The run's process has not exited, so the compaction has not started.
 	assert.match((await team.call({ action: "status", id: "gapc", waitMs: 0 })).text, /^\[settled\] subagent gapc /);
 	const compacted = await team.waitMessage("subagent-result", mark);
 	assert.match(compacted.content, /^\[compacted\] subagent gapc /);
 	assert.match(await report("gapc", compacted.at + 1), /after the compaction$/);
 	// The same gap again, now ended by abort: the member is locked, and the message held for after the compaction does not wake it.
-	assert.match((await teamCall({ action: "send", to: "gapc", body: "SLOW 1000 SAY gapc second" })).text, /\(woken\)\.$/);
+	assert.match(plain((await teamCall({ action: "send", to: "gapc", body: "SLOW 1000 SAY gapc second" })).text), /\(woken\)\.$/);
 	assert.match((await team.call({ action: "compact", id: "gapc", instructions: "WAIT 1000" })).text, /If its run ends first, it compacts afterwards\./);
 	assert.match((await team.call({ action: "status", id: "gapc", waitMs: 30_000 })).text, /^\[settled\] subagent gapc [^\n]*\n\ngapc second/);
 	mark = team.events.length;
-	assert.match((await teamCall({ action: "send", to: "gapc", body: "SAY should not run" })).text, /\(compacting; reads it afterwards\)\.$/);
+	assert.match(plain((await teamCall({ action: "send", to: "gapc", body: "SAY should not run" })).text), /\(compacting; reads it afterwards\)\.$/);
 	assert.match((await team.call({ action: "abort", id: "gapc", retire: false })).text, /^\[settled\] subagent gapc /);
 	const before = requestsBy("gapc").length;
 	await sleep(5000);
@@ -1837,7 +1870,7 @@ await step("switch on a running member whose run ends before a safe point keeps 
 	assert.match(await report("runswap", mark), /^\[settled\] subagent runswap · fake\/fake-model:off · [^\n]*\n\nrunswap first/);
 	assert.equal(requestFor("SLOW 5000 SAY runswap first").model, "fake-model");
 	const woken = team.events.length;
-	assert.match((await teamCall({ action: "send", to: "runswap", body: "SAY runswap second" })).text, /\(woken\)\.$/);
+	assert.match(plain((await teamCall({ action: "send", to: "runswap", body: "SAY runswap second" })).text), /\(woken\)\.$/);
 	assert.match(await report("runswap", woken), /^\[settled\] subagent runswap · fake\/fake-keep:off · [^\n]*\n\nrunswap second/);
 	assert.equal(requestsBy("runswap").at(-1).model, "fake-keep");
 });
@@ -1846,7 +1879,7 @@ await step("a wake that waits for the previous run's process to exit keeps the m
 	await run({ name: "lateswap", args: ["-e", slowExit], message: "SAY late one" });
 	// The run's process is still exiting, so the wake waits for it.
 	const mark = team.events.length;
-	assert.match((await teamCall({ action: "send", to: "lateswap", body: "SAY late two" })).text, /\(woken\)\.$/);
+	assert.match(plain((await teamCall({ action: "send", to: "lateswap", body: "SAY late two" })).text), /\(woken\)\.$/);
 	assert.match((await team.call({ action: "switch", id: "lateswap", model: "fake/fake-keep" })).text, /^lateswap now runs on fake\/fake-keep:off from its next safe point/);
 	assert.match(await report("lateswap", mark), /^\[settled\] subagent lateswap · fake\/fake-model:off · [^\n]*\n\nlate two/);
 	assert.equal(requestsBy("lateswap").at(-1).model, "fake-model");
@@ -1886,7 +1919,7 @@ await step("switch now stops a running member and runs it on message with the ne
 	const r = await team.call({ action: "switch", id: "hotswap", model: "fake/fake-think:high", when: "now", message: "SAY hot", waitMs: 0 });
 	assert.match(r.text, /^hotswap now runs on fake\/fake-think:high \(was fake\/fake-model:off\)\.[^\n]*\n\n\[aborted\] subagent hotswap [^\n]* · by main\n\n\[running\] subagent hotswap /);
 	await finished("poker");
-	assert.match(rawText(requestsBy("poker").at(-1).messages.findLast((m) => m.role === "tool")), /^Sent #\d+ to hotswap \(running\)\.$/);
+	assert.match(plain(rawText(requestsBy("poker").at(-1).messages.findLast((m) => m.role === "tool"))), /^Sent #\d+ to hotswap \(running\)\.$/);
 	assert.match(await report("hotswap", from), /^\[settled\] subagent hotswap · fake\/fake-think:high · [^\n]*\n\nhot$/);
 	await sleep(1000);
 	const last = requestsBy("hotswap").at(-1);
@@ -1914,10 +1947,10 @@ await step("Esc during switch now leaves the member aborted on the new settings 
 		/^escswap now runs on fake\/fake-think:high from its next run \(was fake\/fake-model:off\)\.[^\n]* The call was cancelled, so it stopped without running on message\.\n\n\[aborted\] subagent escswap [^\n]* · by main/,
 	);
 	await team.waitEvent((e) => e.type === "agent_settled", team.events.indexOf(end));
-	assert.match((await teamCall({ action: "members" })).text, /\n- escswap: stopped \(only main wakes it\) — test member\n/);
+	assert.match(plain((await teamCall({ action: "members" })).text), /\n- escswap: stopped \(only main wakes it\) — test member\n/);
 	const mark = team.events.length;
 	await run({ name: "escknock", message: TEAM({ action: "send", to: "escswap", body: "SAY woke" }) });
-	assert.match(await report("escknock", mark), /team: Sent #\d+ to escswap \(stopped, not woken: the main agent stopped it; the main agent was told\)\.$/);
+	assert.match(plain(await report("escknock", mark)), /team: Sent #\d+ to escswap \(stopped, not woken: the main agent stopped it; the main agent was told\)\.$/);
 	await sleep(2000);
 	assert.ok(requestsBy("escswap").every((body) => body.model === "fake-model"), "escswap ran after the cancelled switch");
 });
@@ -1935,7 +1968,7 @@ await step("compact now stops a running member and compacts it in one call; a me
 	// The message woke nowc once the compaction ended, and its final reply went back to nowpoker.
 	await finished("nowpoker");
 	const seen = requestsBy("nowpoker").at(-1).messages.map(rawText);
-	assert.ok(seen.some((m) => /^Sent #\d+ to nowc \(running\)\.$/.test(m)), "the message did not find nowc running");
+	assert.ok(seen.some((m) => /^Sent #\d+ to nowc \(running\)\.$/.test(plain(m))), "the message did not find nowc running");
 	assert.ok(seen.some((m) => /nowc → you \(direct\):\nFinal reply of nowc \(settled\)[^]*\n\nafter now\n/.test(m)), "nowc's reply is missing");
 	assert.ok(!team.messages(from).some((m) => m.customType === "team-notice" && m.content.includes("nowc's inbox")), "a stuck-message notice");
 });
@@ -1972,7 +2005,7 @@ await step("Esc during compact now starts no compaction and leaves the member lo
 	await team.waitEvent((e) => e.type === "agent_settled", team.events.indexOf(end));
 	await sleep(2000);
 	assert.equal(await compactionsOf("escc"), before);
-	assert.match((await teamCall({ action: "members" })).text, /\n- escc: stopped \(only main wakes it\) — test member\n/);
+	assert.match(plain((await teamCall({ action: "members" })).text), /\n- escc: stopped \(only main wakes it\) — test member\n/);
 });
 
 /** Hires member `name` on a team wait of a minute and waits until it is in that wait, past its first model request. */
@@ -2003,11 +2036,11 @@ const resultOf = async (id, from) => {
 	return asMessage(result).content.trimEnd();
 };
 
-await step("abort stops a running member at its next safe point: a member in team wait returns from it early and makes no model request after it; a timed-out wait shows the team", async () => {
+await step("abort stops a running member at its next safe point: a member in team wait returns from it early and makes no model request after it; a timed-out wait shows what changed", async () => {
 	await waiting("safeab");
 	const shown = (await teamCall({ action: "wait", ms: 500 })).text;
-	// Busy members come first; stopped ones that need the main agent follow.
-	assert.match(shown, /^No messages for you within 500ms\.\n\nTeam:\n(- \S+ (running|compacting) [^\n]*\n)*- safeab running \d+s · team \d+s · last event \d+s ago · ctx [^\n]*\n- \S+ stopped · /);
+	assert.match(shown, /^No messages for you within 500ms\.\n\nTeam(: no changes\.|:(\n- [^\n]*)+)$/);
+	assert.equal((await teamCall({ action: "wait", ms: 300 })).text, "No messages for you within 300ms.\n\nTeam: no changes.", "a second wait repeats nothing");
 	const from = team.events.length;
 	const started = Date.now();
 	const r = await team.call({ action: "abort", id: "safeab", retire: false });
@@ -2018,13 +2051,64 @@ await step("abort stops a running member at its next safe point: a member in tea
 	assert.match(await resultOf("safeab", from), /^\[aborted\] subagent safeab [^\n]* · by main · only your direct message wakes it/);
 	assert.ok(Date.now() - started < 30_000, "the wait was not cut short");
 	assert.equal(requestsBy("safeab").length, 1, "the member made a model request after its safe point");
-	// A member's wait that times out names the others' states, and says when only main can bring news.
+	// A member's first footer shows main, itself and the others, and its timed-out wait says when only main can bring news.
 	const mark = team.events.length;
 	await run({ name: "alone", message: TEAM({ action: "wait", ms: 300 }), waitMs: 0 });
 	assert.match(
 		await report("alone", mark),
-		/team: No team messages for you within 300ms\.\n\nTeam: [^\n]*\bsafeab stopped\b[^\n]*\.\nNo other member is running; only main can bring new messages\. If your work is done, end your run with your final reply\.$/,
+		new RegExp(
+			String.raw`team: No team messages for you within 300ms\.\n\nTeam:\n- main · ${CTX}\n- you · ${CTX}\n(- [^\n]*\n)*` +
+				String.raw`No other member is running; only main can bring new messages\. If your work is done, end your run with your final reply\.$`,
+		),
 	);
+});
+
+await step("a member's footers start with its own context, leave out the recipients a send shows, show the rest once, and say when a timed-out wait finds no change", async () => {
+	await run({ name: "footy", message: TEAMS([{ action: "send", to: "main", body: "footy here" }, { action: "wait", ms: 300 }]), waitMs: 0 });
+	await finished("footy");
+	const tools = [...new Set(requestsBy("footy").flatMap((body) => body.messages).filter((m) => m.role === "tool").map(rawText))];
+	const [sent, waited] = [tools.find((t) => t.startsWith("Sent #")), tools.find((t) => t.startsWith("No team messages"))];
+	assert.ok(sent && waited, JSON.stringify(tools));
+	assert.match(sent, new RegExp(String.raw`^Sent #\d+ to main \(${CTX}\)\.\n\nTeam:\n- you · ${CTX}(\n- |$)`));
+	assert.doesNotMatch(sent, /\n- main/);
+	const named = (t) => [...t.matchAll(/^- ([a-z][a-z0-9-]*) /gm)].map((m) => m[1]);
+	assert.deepEqual(named(waited).filter((name) => named(sent).includes(name)), [], "the wait repeats a line the send showed");
+	// Lines past the cap of the send's footer follow in the next one, so the two cover every other member.
+	if (!/\n- \+\d+ more: team members$/.test(sent)) assert.match(waited, /^No team messages for you within 300ms\.\n\nTeam: no changes\.(\n|$)/);
+	else if (!/\n- \+\d+ more: team members(\n|$)/.test(waited)) {
+		const roster = (await teamCall({ action: "members" })).text;
+		const others = [...roster.matchAll(/^- ([a-z][a-z0-9-]*): /gm)].map((m) => m[1]).filter((name) => name !== "main" && name !== "footy");
+		assert.deepEqual([...named(sent), ...named(waited)].filter((name) => name !== "you").sort(), others.sort());
+	}
+});
+
+await step("a compaction of a member's context makes its next footer show the team again", async () => {
+	const boundary = join(WORK_DIR, "reset-compaction-extension.ts");
+	// Compacts once after the first tool batch, keeping the whole branch so the scripted wait still follows; the new compaction is what resets the footer.
+	fs.writeFileSync(
+		boundary,
+		`export default function (pi) {
+	let done = false;
+	pi.on("turn_end", async (event, ctx) => {
+		if (done || !event.toolResults.length) return;
+		done = true;
+		return { entries: [...event.entries, { type: "compaction", summary: "reset summary", firstKeptEntryId: ctx.sessionManager.getBranch()[0].id }] };
+	});
+}
+`,
+	);
+	await run({ name: "resetter", message: TEAMS([{ action: "send", to: "main", body: "before" }, { action: "wait", ms: 100 }]), args: ["-e", boundary], waitMs: 0 });
+	await finished("resetter");
+	const waited = [...new Set(requestsBy("resetter").flatMap((body) => body.messages).filter((m) => m.role === "tool").map(rawText))].find((t) => t.startsWith("No team messages"));
+	assert.match(waited ?? "", new RegExp(String.raw`^No team messages for you within 100ms\.\n\nTeam:\n- main · ${CTX}\n- you · ${CTX}`));
+});
+
+await step("a member's context passing another 10% of its compact point sends the main agent a notice that starts no turn", async () => {
+	const from = team.events.length;
+	// 9.2K and then 30.2K of the default model's 111.6K compact point.
+	await run({ name: "grower", message: "USAGE 9000,30000 BASH true" });
+	const notices = team.messages(from).filter((m) => m.customType === "subagent-notice" && m.content.startsWith("[subagent] grower "));
+	assert.deepEqual(notices.map((m) => m.content), ["[subagent] grower passed 20% of its compact point · ctx 30.2K/111.6K 27%."]);
 });
 
 await step("the main agent's direct message sent while an abort waits for the member's safe point wakes it once the run has stopped, ahead of a member's earlier message", async () => {
@@ -2033,8 +2117,8 @@ await step("the main agent's direct message sent while an abort waits for the me
 	try {
 		assert.match((await team.call({ action: "abort", id: "abortdm", retire: false })).text, / · stops at its next safe point\n/);
 		await run({ name: "abortpeer", message: TEAM({ action: "send", to: "abortdm", body: "SAY from peer" }), waitMs: 0 });
-		assert.match(await report("abortpeer", from), /\nteam: Sent #\d+ to abortdm \(running\)\.(\n|$)/);
-		assert.match((await teamCall({ action: "send", to: "abortdm", body: "SAY rewoken" })).text, /^Sent #\d+ to abortdm \(running\)\.$/);
+		assert.match(plain(await report("abortpeer", from)), /\nteam: Sent #\d+ to abortdm \(running\)\.(\n|$)/);
+		assert.match(plain((await teamCall({ action: "send", to: "abortdm", body: "SAY rewoken" })).text), /^Sent #\d+ to abortdm \(running\)\.$/);
 	} finally {
 		release();
 	}
@@ -2141,15 +2225,19 @@ await step("a member compacts at two safe points of one run", async () => {
 	assert.equal((await compactionsOf("twicec")) - before, 2);
 });
 
-await step("a safe-point compaction with nothing to compact lets the run continue and says so", async () => {
+await step("a safe-point compaction with nothing to compact lets the run continue and says so to both, naming instructions that went unused", async () => {
 	await waiting("noopc");
 	const from = team.events.length;
-	await team.call({ action: "compact", id: "noopc", message: "SAY still here" });
+	await team.call({ action: "compact", id: "noopc", instructions: "keep noopc", message: "SAY still here" });
 	assert.match(await resultOf("noopc", from), /^\[settled\] subagent noopc [^\n]* · Nothing to compact[^\n]*\n\nstill here$/);
 	assert.ok(
-		team.messages(from).some((m) => /^\[subagent\] noopc Nothing to compact[^\n]* at its safe point; it continues its run\.$/.test(m.content)),
-		"no notice of the empty compaction",
+		team.messages(from).some((m) =>
+			/^\[subagent\] noopc had nothing to compact at its safe point \(Nothing to compact[^\n]*\), so your instructions were not applied; it continues its run\.$/.test(m.content),
+		),
+		team.messages(from).map((m) => m.content).join("\n"),
 	);
+	const resumed = rawText(requestsBy("noopc").at(-1).messages.findLast((m) => m.role === "user" && !isTeam(m)));
+	assert.match(resumed, /^The main agent asked to compact your context at this point of your run; Pi found nothing to compact \(Nothing to compact[^\n]*\)\. Continue your task\.\n\nThe main agent's message:\nSAY still here$/);
 });
 
 await step("a compaction and a switch pending at the same safe point compact on the new model, and the run continues on it", async () => {
@@ -2263,7 +2351,7 @@ await step("a reopened session runs a switched member on its new model", async (
 	current = reopened;
 	try {
 		const mark = reopened.events.length;
-		assert.match((await reopened.call({ action: "send", to: "swapper", body: "SAY swap three" }, "team")).text, /\(woken\)\.$/);
+		assert.match(plain((await reopened.call({ action: "send", to: "swapper", body: "SAY swap three" }, "team")).text), /\(woken\)\.$/);
 		const result = await reopened.waitMessage("subagent-result", mark);
 		assert.match(result.content, /^\[settled\] subagent swapper · fake\/fake-keep:off · [^\n]*\n\nswap three$/);
 		await reopened.waitEvent((e) => e.type === "agent_settled", result.at);
@@ -2379,7 +2467,7 @@ await step("board posts an agent missed before its session closed show in its di
 			[`[team] Board: 1 new post — #${forMain} alpha: missed by main (team history).`],
 		);
 		const mark = reopened.events.length;
-		assert.match((await reopened.call({ action: "send", to: "romeo", body: "SAY romeo woken" }, "team")).text, /\(woken\)\.$/);
+		assert.match(plain((await reopened.call({ action: "send", to: "romeo", body: "SAY romeo woken" }, "team")).text), /\(woken\)\.$/);
 		const result = await reopened.waitMessage("subagent-result", mark);
 		await reopened.waitEvent((e) => e.type === "agent_settled", result.at);
 		assert.match(
@@ -2388,7 +2476,7 @@ await step("board posts an agent missed before its session closed show in its di
 		);
 		// sam's first digest lists the latest posts without its own join announcement, the newest.
 		const woken = reopened.events.length;
-		assert.match((await reopened.call({ action: "send", to: "sam", body: "SAY sam woken" }, "team")).text, /\(woken\)\.$/);
+		assert.match(plain((await reopened.call({ action: "send", to: "sam", body: "SAY sam woken" }, "team")).text), /\(woken\)\.$/);
 		await reopened.waitEvent((e) => e.type === "agent_settled", (await reopened.waitMessage("subagent-result", woken)).at);
 		assert.match(
 			text(requestsBy("sam").at(-1).messages.at(-1)),
@@ -2456,7 +2544,7 @@ await step("after a rewind in the session tree, the main agent quietly gets the 
 		]);
 		assert.equal(back.length, 6);
 		assert.match(back[4][1], /^\[settled\] subagent tango[\s\S]*tango done$/);
-		assert.match(back[5][1], /^\[settled\] subagent uniform[\s\S]*team: Sent #3 to main\.$/);
+		assert.match(plain(back[5][1]), /^\[settled\] subagent uniform[\s\S]*team: Sent #3 to main\.$/);
 		await sleep(1000);
 		assert.ok(!tree.events.slice(mark).some((e) => e.type === "agent_start"), "the redelivery started a turn");
 		// tango's result went out in a tool result on the other branch; on this one it went out as a message.
@@ -2501,7 +2589,7 @@ await step("after a move to a team message with a summary, that message arrives 
 	try {
 		const from = tree.events.length;
 		const sent = await tree.call({ action: "send", to: "uniform", body: TEAM({ action: "send", to: "main", body: "summarized" }) }, "team");
-		const dm = Number(sent.text.match(/^Sent #(\d+) to uniform \(woken\)\.$/)[1]) + 1;
+		const dm = Number(plain(sent.text).match(/^Sent #(\d+) to uniform \(woken\)\.$/)[1]) + 1;
 		await resultArrives(tree, from);
 		assert.match((await tree.call({ action: "send", title: "after the message", body: "after the message" }, "team")).text, new RegExp(`^Posted #${dm + 1}\\.`));
 		// Pi summarizes the entries after the selected message and moves to its parent, so neither holds the message itself.
@@ -2516,7 +2604,7 @@ await step("after a move to a team message with a summary, that message arrives 
 		]);
 		assert.deepEqual(branch.at(-3).details.covered, [dm + 1]);
 		assert.equal(back.length, 4);
-		assert.match(back[3][1], new RegExp(`^\\[settled\\] subagent uniform[\\s\\S]*team: Sent #${dm} to main\\.$`));
+		assert.match(plain(back[3][1]), new RegExp(`^\\[settled\\] subagent uniform[\\s\\S]*team: Sent #${dm} to main\\.$`));
 	} finally {
 		await tree.close();
 	}

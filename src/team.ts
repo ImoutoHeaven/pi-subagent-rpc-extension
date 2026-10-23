@@ -97,8 +97,16 @@ export interface TeamHost {
 	waitForMain(ms: number, signal?: AbortSignal): Promise<number>;
 	/** The main agent asked to stop, compact, or switch running member `name` at its next safe point. */
 	interrupted(name: string): boolean;
-	/** What a wait that timed out shows `name` about the team: what the caller can act on, starting with a blank line, or empty. */
-	footer(name: string): string;
+	/** The context use of `name`, main or a member, such as `ctx 212K/300K 71%`; empty until known. */
+	ctx(name: string): string;
+	/** The compaction mark of the main agent's current branch; members send theirs with their requests. */
+	mainMark(): string;
+	/** Counts `names` as seen by `viewer`, whose context holds them since compaction mark `mark`. */
+	seen(viewer: string, mark: string, names: string[]): void;
+	/** What changed in the team since `viewer` last saw it, starting with a blank line; with `unchanged`, says so when nothing did, else empty. */
+	footer(viewer: string, mark: string, unchanged?: boolean): string;
+	/** What a member's wait that timed out adds when only main can bring news, starting with a line break; empty otherwise. */
+	idleHint(name: string): string;
 }
 
 const jsonLine = (record: object) => `${JSON.stringify(record)}\n`;
@@ -218,7 +226,7 @@ export function createTeam(pi: ExtensionAPI, host: TeamHost) {
 		return name;
 	};
 
-	const state = (name: string) => (name === MAIN ? "main agent" : host.state(name));
+	const state = (name: string) => [name === MAIN ? "main agent" : host.state(name), host.ctx(name)].filter(Boolean).join(" · ");
 
 	const roster = () =>
 		[
@@ -312,30 +320,30 @@ export function createTeam(pi: ExtensionAPI, host: TeamHost) {
 		);
 	};
 
-	/** Routes `message` to one recipient; returns the state its sender sees. */
+	/** Routes `message` to one recipient; returns the state its sender sees, empty for main. */
 	const route = (message: MessageRecord, name: string) => {
-		if (name === MAIN) return MAIN;
+		if (name === MAIN) return "";
 		if (host.isRunning(name)) {
 			// An abort waiting for the member's safe point has locked it; the main agent's direct message lifts that, so the stopped run's exit wakes it with this message.
 			if (message.from === MAIN && message.to !== BOARD) host.unlock(name);
-			return `${name} (running)`;
+			return "running";
 		}
 		const compacting = host.state(name) === "compacting";
-		if (message.to === BOARD) return `${name} (${compacting ? "compacting" : "stopped"}; board posts do not wake)`;
+		if (message.to === BOARD) return `${compacting ? "compacting" : "stopped"}; board posts do not wake`;
 		// The member's process exit routes the message again, as for a message that reached a run after its last read.
 		if (compacting) {
 			// As when it wakes a stopped member; a later abort locks it again.
 			if (message.from === MAIN) host.unlock(name);
-			return `${name} (compacting; reads it afterwards)`;
+			return "compacting; reads it afterwards";
 		}
 		const block: Block | undefined = message.hop1 ? "hop" : message.from !== MAIN && host.locked(name) ? "abort" : undefined;
 		if (!block) {
 			wake(name, message);
-			return `${name} (woken)`;
+			return "woken";
 		}
 		tellMain(message, name, block);
 		const why = block === "hop" ? `your run was started by ${host.startedBy(message.from)}'s message, so it cannot start others` : "the main agent stopped it";
-		return `${name} (stopped, not woken: ${why}; the main agent was told)`;
+		return `stopped, not woken: ${why}; the main agent was told`;
 	};
 
 	/** Starts each run of member `name`, with the rules of that run: whether its direct messages wake, and where its final reply goes. */
@@ -414,8 +422,12 @@ export function createTeam(pi: ExtensionAPI, host: TeamHost) {
 		track(message);
 		for (const name of notify) ping(name);
 		if (notify.includes(MAIN)) host.notify(TEAM_MESSAGE, from, render(message, MAIN), details(message));
-		if (!notify.length) return `Posted #${message.seq}. It notified nobody; members see it in history.`;
-		return `Sent #${message.seq} to ${notify.map((name) => route(message, name)).join(", ")}.`;
+		if (!notify.length) return { text: `Posted #${message.seq}. It notified nobody; members see it in history.`, recipients: notify };
+		const recipients = notify.map((name) => {
+			const shown = [route(message, name), host.ctx(name)].filter(Boolean).join(" · ");
+			return shown ? `${name} (${shown})` : name;
+		});
+		return { text: `Sent #${message.seq} to ${recipients.join(", ")}.`, recipients: notify };
 	};
 
 	/** Lists history `items`, ascending by key, in the caller's order within the limit and the character budget, dropping from the far end, and names the call that reads on. */
@@ -526,11 +538,21 @@ export function createTeam(pi: ExtensionAPI, host: TeamHost) {
 		return "Topic set.";
 	};
 
-	/** Every action except wait, which callers handle themselves. History also returns `covered`, the seqs it showed. */
-	const act = (caller: string, params: TeamParams): { text: string; covered?: number[] } => {
-		if (params.action === "send") return { text: send(caller, params) };
+	/**
+	 * Every action except wait, which callers handle themselves. History also returns `covered`, the seqs it showed. A send ends with
+	 * what changed in the team since the caller, whose context holds what it saw since compaction mark `mark`, last saw it.
+	 */
+	const act = (caller: string, params: TeamParams, mark: string): { text: string; covered?: number[] } => {
+		if (params.action === "send") {
+			const { text, recipients } = send(caller, params);
+			host.seen(caller, mark, recipients);
+			return { text: text + host.footer(caller, mark) };
+		}
 		if (params.action === "history") return history(caller, params);
-		if (params.action === "members") return { text: roster() };
+		if (params.action === "members") {
+			host.seen(caller, mark, [MAIN, ...active().map((member) => member.name)]);
+			return { text: roster() };
+		}
 		if (params.action === "topic") return { text: setTopic(caller, params) };
 		throw new Error(`unknown team action: ${params.action}`);
 	};
@@ -558,8 +580,9 @@ export function createTeam(pi: ExtensionAPI, host: TeamHost) {
 		description: TEAM_DESCRIPTION,
 		parameters: teamParameters,
 		async execute(_toolCallId, params, signal) {
+			const mark = host.mainMark();
 			if (params.action !== "wait") {
-				const { text: result, covered } = act(MAIN, params);
+				const { text: result, covered } = act(MAIN, params, mark);
 				// The branch has seen the message it sent, or the messages it showed; an entry of its own, since a call made through
 				// another tool, such as codemode, returns no details.
 				if (params.action === "send") pi.appendEntry(SEEN_ENTRY, { team: teamId, seq: lastSeq() });
@@ -568,7 +591,7 @@ export function createTeam(pi: ExtensionAPI, host: TeamHost) {
 			}
 			const ms = Math.min(params.ms ?? DEFAULT_WAIT_MS, MAX_WAIT_MS);
 			const count = await host.waitForMain(ms, signal);
-			return text(count ? `${count} message(s) for you follow this result.` : `No messages for you within ${ms}ms.${host.footer(MAIN)}`);
+			return text(count ? `${count} message(s) for you follow this result.${host.footer(MAIN, mark)}` : `No messages for you within ${ms}ms.${host.footer(MAIN, mark, true)}`);
 		},
 	});
 
@@ -763,11 +786,12 @@ export function createTeam(pi: ExtensionAPI, host: TeamHost) {
 				if (request.op === "wait") {
 					const ms = Math.min(Number(request.ms) || 0, MAX_WAIT_MS);
 					const count = await wait(name, seen, ms, signal);
-					if (count) return { ok: true, text: `${count} team message(s) for you follow this result.` };
+					const mark = String(request.mark ?? "");
+					if (count) return { ok: true, text: `${count} team message(s) for you follow this result.${host.footer(name, mark)}` };
 					if (host.interrupted(name)) return { ok: true, text: "Returned early: the main agent stops, compacts, or switches your run once this tool call ends." };
-					return { ok: true, text: `No team messages for you within ${ms}ms.${host.footer(name)}` };
+					return { ok: true, text: `No team messages for you within ${ms}ms.${host.footer(name, mark, true)}${host.idleHint(name)}` };
 				}
-				if (request.op === "team" && request.action !== "wait") return { ok: true, ...act(name, request) };
+				if (request.op === "team" && request.action !== "wait") return { ok: true, ...act(name, request, String(request.mark ?? "")) };
 				return { error: `unsupported request: ${request.op}` };
 			} catch (error) {
 				return { error: error instanceof Error ? error.message : String(error) };

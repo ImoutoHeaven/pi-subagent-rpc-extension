@@ -5,6 +5,7 @@
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import {
 	boardCursor,
+	compactionMark,
 	DEFAULT_WAIT_MS,
 	type Delivery,
 	detailsOf,
@@ -78,9 +79,10 @@ export default function setupChild(pi: ExtensionAPI) {
 		async execute(_toolCallId, params, signal, _onUpdate, ctx) {
 			if (params.action === "wait") {
 				const ms = Math.min(params.ms ?? DEFAULT_WAIT_MS, MAX_WAIT_MS);
-				return text((await ask(ctx, { op: "wait", ...held(ctx), ms }, signal, ms + WAIT_SLACK_MS)).text ?? "");
+				const mark = compactionMark(ctx.sessionManager.getBranch());
+				return text((await ask(ctx, { op: "wait", ...held(ctx), ms, mark }, signal, ms + WAIT_SLACK_MS)).text ?? "");
 			}
-			const reply = await ask(ctx, { op: "team", ...params }, signal);
+			const reply = await ask(ctx, { op: "team", ...params, mark: compactionMark(ctx.sessionManager.getBranch()) }, signal);
 			// An entry of its own, since a call made through another tool, such as codemode, returns no details.
 			if (reply.covered?.length) pi.appendEntry(SEEN_ENTRY, { team: teamId, covered: reply.covered });
 			return text(reply.text ?? "");

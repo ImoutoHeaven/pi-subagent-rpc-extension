@@ -19,20 +19,21 @@ import {
 	SettingsManager,
 } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
-import { BODY_CHARS, DEFAULT_WAIT_MS, type Details, detailsOf, MAX_WAIT_MS, type Reply, type Request, SEEN_ENTRY } from "./protocol.ts";
+import { BODY_CHARS, compactionMark, DEFAULT_WAIT_MS, type Details, detailsOf, MAX_WAIT_MS, type Reply, type Request, SEEN_ENTRY } from "./protocol.ts";
 import { type AbortedBy, type Launch, type Run, type RunStatus, startRun } from "./rpc.ts";
 import { createTeam, DESCRIPTION_CHARS } from "./team.ts";
 
 const MAX_RESULT_CHARS = 16_000;
-const INSTRUCTIONS_CHARS = 4_000;
+const INSTRUCTIONS_CHARS = 8_000;
 const NARRATION_LINES = 3;
 const NARRATION_CHARS = 300;
 const ERROR_CHARS = 200;
 const ARGS_CHARS = 60;
 const NOTICES = 3;
-const FOOTER_AGENTS = 3;
-/** Members a team wait that timed out lists for the main agent. */
+/** Lines a team footer shows at most. */
 const TEAM_LINES = 10;
+/** The step, in percent of a compact point, at which context use counts as changed for footers and the main agent's notices. */
+const CTX_STEP = 10;
 const STALE_MS = 60_000;
 const IDLE_POLL_MS = 250;
 const MAIN = "main";
@@ -110,9 +111,17 @@ interface Agent {
 	compactOnly: boolean;
 	/** The run's last compaction, such as `compacted 312K→24K (threshold)` or `compaction failed: …`; empty when there was none. */
 	compaction: string;
+	/** The context tokens before a compaction at a turn boundary, until the next model reply, in this run or a later one, tells the size after it. */
+	compactedFrom?: number;
+	/** Why the compaction at the run's last safe point found nothing to compact; empty when it compacted. */
+	noop: string;
+	/** The compaction at the run's last safe point had the main agent's instructions. */
+	instructed: boolean;
 	/** Context tokens after the last model reply or compaction, and the member's compact point; kept across runs, undefined until known. */
 	contextTokens?: number;
 	compactAt?: number;
+	/** The CTX_STEP step of the context the main agent last heard of; a higher one gets a notice. */
+	ctxNoticed?: number;
 	/** A compaction at the running member's next safe point, or once its run's process exits if the run ends first. */
 	queued: Compaction | null;
 	/** The main agent's abort, at the running member's next safe point. */
@@ -161,12 +170,41 @@ const usageText = ({ input, output, cached, cost }: Usage) => {
 	const price = cost <= 0 ? "" : cost < 0.01 ? " · <$0.01" : ` · $${cost.toFixed(2)}`;
 	return ` · ${tokens.format(input)} in · ${tokens.format(output)} out${cached ? ` · ${tokens.format(cached)} cached` : ""}${price}`;
 };
+interface Context {
+	contextTokens?: number;
+	compactAt?: number;
+}
 /** ` · ctx 212K/300K 71%`: the context tokens against the compact point; empty until known. */
-const ctxText = ({ contextTokens, compactAt }: { contextTokens?: number; compactAt?: number }) => {
+const ctxText = ({ contextTokens, compactAt }: Context) => {
 	if (contextTokens === undefined) return "";
 	const share = compactAt ? `/${tokens.format(compactAt)} ${Math.round((100 * contextTokens) / compactAt)}%` : "";
 	return ` · ctx ${tokens.format(contextTokens)}${share}`;
 };
+/** The CTX_STEP step the context has reached; -1 without a compact point, undefined until known. */
+const ctxLevel = ({ contextTokens, compactAt }: Context) =>
+	contextTokens === undefined ? undefined : compactAt ? Math.floor((100 * contextTokens) / compactAt / CTX_STEP) : -1;
+
+/** Where Pi compacts a session on `model` in `cwd` by itself, from Pi's settings there; undefined when they cannot be read. */
+function compactPoint(cwd: string, model: { provider: string; id: string; contextWindow: number }) {
+	try {
+		const settings = SettingsManager.create(cwd, getAgentDir()).getCompactionSettings(model);
+		const point = settings.enabled ? model.contextWindow - settings.reserveTokens : model.contextWindow;
+		return point > 0 ? point : undefined;
+	} catch {
+		// Invalid compaction settings, which Pi reports itself.
+		return undefined;
+	}
+}
+
+/** A member, or the main agent, as team footers compare it: these change only when worth telling. */
+interface FooterKey {
+	state: string;
+	ctx: number | undefined;
+	/** Running with no event for STALE_MS; only its start counts as a change. */
+	stale: boolean;
+	/** Direct messages waiting in a stopped member's inbox, for the main agent; only new ones count as a change. */
+	unread: number[];
+}
 
 interface Pending {
 	customType: string;
@@ -384,51 +422,117 @@ export default function setupParent(pi: ExtensionAPI) {
 		return { text: report(agent), details: runKey(agent) };
 	};
 
-	/** Other running subagents, so a result also shows what is still in flight. */
-	const footer = (except?: Agent) => {
-		const now = Date.now();
-		const running = [...agents.values()].filter((agent) => agent !== except && busy(agent) && !team.isRetired(agent.id));
-		if (!running.length) return "";
-		const shown = running.slice(0, FOOTER_AGENTS).map((agent) => {
-			const quiet = now - agent.lastEventAt;
-			return `${agent.id} ${agent.status} ${duration(now - agent.startedAt)}${ctxText(agent)}${quiet > STALE_MS ? ` · no event ${duration(quiet)}` : ""}`;
-		});
-		const more = running.length > FOOTER_AGENTS ? `, +${running.length - FOOTER_AGENTS} more` : "";
-		return `\n\n(Background: ${shown.join(", ")}${more}.)`;
+	/** The main agent's context, against its own compact point. */
+	const mainContext = (): Context => {
+		const tokens = parent?.getContextUsage()?.tokens;
+		if (!parent || tokens === null || tokens === undefined) return {};
+		return { contextTokens: tokens, compactAt: parent.model ? compactPoint(parent.cwd, parent.model) : undefined };
+	};
+	/** The compaction mark of the main agent's current branch. */
+	const mainMark = () => (parent ? compactionMark(parent.sessionManager.getBranch()) : "");
+
+	/** Per viewer, main or a member: the compaction mark its footers were shown under, and what they showed, by name. */
+	const footers = new Map<string, { mark: string; keys: Map<string, FooterKey> }>();
+	/** What `viewer` has seen, reset when its context was compacted since. */
+	const seenBy = (viewer: string, mark: string) => {
+		let seen = footers.get(viewer);
+		if (!seen || seen.mark !== mark) footers.set(viewer, (seen = { mark, keys: new Map() }));
+		return seen.keys;
 	};
 
-	/** A busy member, or a stopped one that needs the main agent, in one line for its team wait; empty for any other. */
-	const teamLine = (agent: Agent, now: number) => {
+	/** What `viewer` sees of `name`: main, the viewer itself, or another member; the main agent alone sees members' inboxes. */
+	const keyOf = (viewer: string, name: string, now: number): FooterKey => {
+		// The viewer's own line, and main's, tell only context use.
+		if (name === MAIN || name === viewer) return { state: name, ctx: ctxLevel(name === MAIN ? mainContext() : (agents.get(name) as Agent)), stale: false, unread: [] };
+		const agent = agents.get(name) as Agent;
+		const idle = agent.status === "error" || agent.status === "aborted" ? agent.status : "stopped";
+		return {
+			state: `${busy(agent) ? agent.status : idle}${agent.locked ? " locked" : ""}${nextRun(agent)}`,
+			ctx: ctxLevel(agent),
+			stale: busy(agent) && now - agent.lastEventAt > STALE_MS,
+			unread: viewer === MAIN && !busy(agent) ? team.unread(name) : [],
+		};
+	};
+
+	/** One footer line about `name` for `viewer`. */
+	const footerLine = (viewer: string, name: string, now: number) => {
+		if (name === MAIN) return `main${ctxText(mainContext())}`;
+		const agent = agents.get(name) as Agent;
+		if (name === viewer) return `you${ctxText(agent)}`;
 		if (busy(agent)) {
 			const activity = agent.status === "running" ? ` · ${activityOf(agent, now)} · last event ${duration(now - agent.lastEventAt)} ago` : "";
-			return `${agent.id} ${agent.status} ${duration(now - agent.startedAt)}${activity}${ctxText(agent)}${pendingText(agent)}`;
+			return `${name} ${agent.status} ${duration(now - agent.startedAt)}${activity}${ctxText(agent)}${nextRun(agent)}`;
 		}
-		const unread = team.unread(agent.id);
+		const unread = viewer === MAIN ? team.unread(name) : [];
 		const why = [
-			agent.status === "error" ? "error" : "",
-			agent.locked ? "only your direct message wakes it" : "",
+			agent.locked ? (viewer === MAIN ? "only your direct message wakes it" : "only main wakes it") : "",
 			unread.length ? `${unread.length} unread waiting (${unread.map((seq) => `#${seq}`).join(", ")})` : "",
 		].filter(Boolean);
-		return why.length ? `${agent.id} stopped · ${why.join(" · ")}` : "";
+		const state = agent.status === "error" || agent.status === "aborted" ? agent.status : "stopped";
+		return `${name} ${state}${ctxText(agent)}${nextRun(agent)}${why.length ? ` · ${why.join(" · ")}` : ""}`;
 	};
 
-	/** What a team wait that timed out shows: the main agent, what it may act on; a member, who else runs, and when only main can bring news. */
-	const waitFooter = (name: string) => {
-		const now = Date.now();
-		const members = [...agents.values()].filter((agent) => !team.isRetired(agent.id));
-		if (name === MAIN) {
-			// Busy members first: what is in flight matters more than what waits.
-			const lines = [...members.filter(busy), ...members.filter((agent) => !busy(agent))].map((agent) => teamLine(agent, now)).filter(Boolean);
-			if (!lines.length) return "";
-			const more = lines.length > TEAM_LINES ? [`+${lines.length - TEAM_LINES} more — subagent status`] : [];
-			return `\n\nTeam:\n${[...lines.slice(0, TEAM_LINES), ...more].map((line) => `- ${line}`).join("\n")}`;
-		}
-		const others = members.filter((agent) => agent.id !== name);
-		const states = others.map((agent) => `${agent.id} ${busy(agent) ? `${agent.status} ${duration(now - agent.startedAt)}` : "stopped"}`);
-		const line = others.length ? `\n\nTeam: ${states.join(", ")}.` : "";
-		if (others.some(busy)) return line;
-		return `${line}${line ? "\n" : "\n\n"}No other member is running; only main can bring new messages. If your work is done, end your run with your final reply.`;
+	/** The names a footer of `viewer` covers: every member for main; main, the member itself, and the others for a member. */
+	const covered = (viewer: string) => {
+		const members = [...agents.keys()].filter((name) => !team.isRetired(name));
+		return viewer === MAIN ? members : [MAIN, viewer, ...members.filter((name) => name !== viewer)];
 	};
+
+	/** Counts `names` as seen by `viewer`, as a result that shows them does; `only` limits that to their context use. */
+	const markSeen = (viewer: string, mark: string, names: string[], only?: "ctx") => {
+		const keys = seenBy(viewer, mark);
+		const now = Date.now();
+		for (const name of names) {
+			if (name !== MAIN && !agents.has(name)) continue;
+			const key = keyOf(viewer, name, now);
+			const before = keys.get(name);
+			if (only !== "ctx") keys.set(name, key);
+			else if (before) keys.set(name, { ...before, ctx: key.ctx });
+		}
+	};
+
+	/**
+	 * What changed in the team since `viewer` last saw it, as lines after a blank line: a state, a context step, a member that went quiet,
+	 * or a new unread message. With `unchanged`, says so when nothing did; otherwise empty then.
+	 */
+	const teamFooter = (viewer: string, mark: string, unchanged = false) => {
+		const keys = seenBy(viewer, mark);
+		const now = Date.now();
+		const changes: { name: string; key: FooterKey; rank: number }[] = [];
+		for (const name of covered(viewer)) {
+			const key = keyOf(viewer, name, now);
+			// Main's context is unknown from its compaction to its next reply; a line would tell nothing.
+			if ((name === MAIN || name === viewer) && key.ctx === undefined) continue;
+			const before = keys.get(name);
+			const state = !before || before.state !== key.state;
+			const other = !state && (before.ctx !== key.ctx || (key.stale && !before.stale) || key.unread.some((seq) => !before.unread.includes(seq)));
+			// A member that came back to life or read its messages needs no line.
+			if (!state && !other) keys.set(name, key);
+			else {
+				// A member's own context and main's come first, then errors, stopped members, and busy ones.
+				const kind = name === MAIN || name === viewer ? 0 : key.state.startsWith("error") || key.state.startsWith("aborted") ? 1 : key.state.startsWith("stopped") ? 2 : 3;
+				changes.push({ name, key, rank: kind * 2 + (state ? 0 : 1) });
+			}
+		}
+		if (!changes.length) return unchanged ? "\n\nTeam: no changes." : "";
+		const shown = changes.sort((a, b) => a.rank - b.rank).slice(0, TEAM_LINES);
+		for (const { name, key } of shown) keys.set(name, key);
+		const more = changes.length > shown.length ? [`+${changes.length - shown.length} more: ${viewer === MAIN ? "subagent status" : "team members"}`] : [];
+		return `\n\nTeam:\n${[...shown.map(({ name }) => footerLine(viewer, name, now)), ...more].map((line) => `- ${line}`).join("\n")}`;
+	};
+
+	/** The main agent's footer after a subagent result about `shown`, which that result shows in full. */
+	const footer = (...shown: Agent[]) => {
+		const mark = mainMark();
+		markSeen(MAIN, mark, shown.map((agent) => agent.id));
+		return teamFooter(MAIN, mark);
+	};
+
+	/** What a member's team wait that timed out adds: when only main can bring news. */
+	const idleHint = (name: string) =>
+		[...agents.values()].some((agent) => agent.id !== name && !team.isRetired(agent.id) && busy(agent))
+			? ""
+			: "\nNo other member is running; only main can bring new messages. If your work is done, end your run with your final reply.";
 
 	// The board digest joins the branch before a run starts, from a prompt or a delivered message.
 	const digestFirst = () => {
@@ -519,10 +623,15 @@ export default function setupParent(pi: ExtensionAPI) {
 		agent.delivered = SENT;
 		const lost = agent.keep !== undefined && !agent.kept;
 		notify("subagent-result", agent.id, report(agent), { ...runKey(agent), status: agent.status }, agent.compactOnly && agent.next === undefined && !lost);
+		// The result's header shows the member, so the main agent's footers need not.
+		markSeen(MAIN, mainMark(), [agent.id]);
 	};
 
-	/** Tells the main agent about a member without starting a turn. */
-	const notice = (agent: Agent, text: string) => notify("subagent-notice", agent.id, `[subagent] ${agent.id} ${text}`, { id: agent.id }, true);
+	/** Tells the main agent about a member without starting a turn; a notice that shows the member's context counts it seen. */
+	const notice = (agent: Agent, text: string) => {
+		notify("subagent-notice", agent.id, `[subagent] ${agent.id} ${text}`, { id: agent.id }, true);
+		if (text.includes(ctxText(agent)) && ctxText(agent)) markSeen(MAIN, mainMark(), [agent.id], "ctx");
+	};
 
 	/**
 	 * Resolves once `agent` (if given) stops running, `ms` pass, or `signal` aborts.
@@ -582,7 +691,11 @@ export default function setupParent(pi: ExtensionAPI) {
 			const agent = agents.get(name);
 			return Boolean(agent && pendingText(agent));
 		},
-		footer: waitFooter,
+		ctx: (name) => ctxText(name === MAIN ? mainContext() : ((agents.get(name) as Agent | undefined) ?? {})).replace(/^ · /, ""),
+		mainMark,
+		seen: markSeen,
+		footer: teamFooter,
+		idleHint,
 	});
 
 	/** The model the member's Pi picks for `pattern` among the models it has, matched as `--model` matches; or why none is picked. */
@@ -641,8 +754,16 @@ export default function setupParent(pi: ExtensionAPI) {
 		if (agent.queued) {
 			const { instructions, message } = agent.queued;
 			agent.queued = null;
-			const resume = `The main agent compacted your context at this point of your run. Continue your task.${message ? `\n\nThe main agent's message:\n${message}` : ""}`;
-			run.chain([{ type: "compact", ...(instructions ? { customInstructions: instructions } : {}) }, { type: "prompt", message: resume }]);
+			agent.noop = "";
+			// The prompt tells what the compaction did, so it is made once the compaction is over.
+			const resume = () => {
+				const what = agent.noop
+					? `The main agent asked to compact your context at this point of your run; Pi found nothing to compact (${agent.noop}).`
+					: "The main agent compacted your context at this point of your run.";
+				return { type: "prompt" as const, message: `${what} Continue your task.${message ? `\n\nThe main agent's message:\n${message}` : ""}` };
+			};
+			agent.instructed = Boolean(instructions);
+			run.chain([{ type: "compact", ...(instructions ? { customInstructions: instructions } : {}) }, resume]);
 			agent.resuming = true;
 			return { ok: true, stop: true };
 		}
@@ -670,14 +791,19 @@ export default function setupParent(pi: ExtensionAPI) {
 		if (agent.model === `${provider}/${id}`) return;
 		agent.model = `${provider}/${id}`;
 		const model = parent?.modelRegistry.find(provider, id);
-		if (!model) return;
-		try {
-			const settings = SettingsManager.create(agent.cwd, getAgentDir()).getCompactionSettings(model);
-			const point = settings.enabled ? model.contextWindow - settings.reserveTokens : model.contextWindow;
-			agent.compactAt = point > 0 ? point : undefined;
-		} catch {
-			// Invalid compaction settings, which the member's Pi reports itself.
+		const compactAt = model ? compactPoint(agent.cwd, model) : undefined;
+		// Steps of another compact point are not comparable; each run sets the model again, which keeps the step, and a first one keeps a new member's.
+		if (agent.compactAt !== undefined && compactAt !== agent.compactAt) agent.ctxNoticed = undefined;
+		agent.compactAt = compactAt;
+	};
+
+	/** Tells the main agent, without a turn, when the member's context reaches a higher CTX_STEP step than it last heard of. */
+	const ctxNotice = (agent: Agent) => {
+		const level = ctxLevel(agent);
+		if (level !== undefined && level >= 0 && agent.ctxNoticed !== undefined && level > agent.ctxNoticed && !agent.compactOnly) {
+			notice(agent, `passed ${level * CTX_STEP}% of its compact point${ctxText(agent)}.`);
 		}
+		agent.ctxNoticed = level;
 	};
 
 	const onEvent = (agent: Agent, event: any) => {
@@ -721,7 +847,14 @@ export default function setupParent(pi: ExtensionAPI) {
 					agent.usage.cost += usage.cost?.total ?? 0;
 					// As Pi counts context: a failed or aborted reply carries no valid usage.
 					const context = stop === "error" || stop === "aborted" ? 0 : calculateContextTokens(usage);
-					if (context > 0) agent.contextTokens = context;
+					if (context > 0) {
+						agent.contextTokens = context;
+						if (agent.compactedFrom !== undefined) {
+							agent.compaction = `compacted ${tokens.format(agent.compactedFrom)}→${tokens.format(context)} at a turn boundary`;
+							agent.compactedFrom = undefined;
+						}
+						ctxNotice(agent);
+					}
 				}
 				const text = assistantText(event.message);
 				if (text) {
@@ -745,6 +878,8 @@ export default function setupParent(pi: ExtensionAPI) {
 			case "entry_appended": {
 				if (event.entry?.type !== "compaction") return;
 				agent.contextTokens = undefined;
+				agent.ctxNoticed = undefined;
+				agent.compactedFrom = event.entry.tokensBefore;
 				agent.compaction = `compacted ${tokens.format(event.entry.tokensBefore)}→? at a turn boundary (ctx known after its next successful reply)`;
 				if (!agent.compactOnly) notice(agent, agent.compaction);
 				return;
@@ -759,11 +894,17 @@ export default function setupParent(pi: ExtensionAPI) {
 				const noop = /^(Nothing to compact|Already compacted)/.test(why);
 				if (result) {
 					agent.contextTokens = result.estimatedTokensAfter;
+					agent.compactedFrom = undefined;
+					agent.ctxNoticed = ctxLevel(agent);
 					agent.compaction = `compacted ${tokens.format(result.tokensBefore)}→${tokens.format(result.estimatedTokensAfter)} (${reason})`;
 				} else if (resuming && !noop) return; // The run ends on the failure as its error.
 				else agent.compaction = resuming ? why : `compaction failed: ${why || "cancelled"}`;
+				if (resuming && noop) agent.noop = why;
 				// A compaction run reports its own result; one at a safe point continues the run.
-				if (!agent.compactOnly) notice(agent, `${agent.compaction}${ctxText(agent)}${resuming ? " at its safe point; it continues its run." : ""}`);
+				if (agent.compactOnly) return;
+				if (!resuming) notice(agent, `${agent.compaction}${ctxText(agent)}`);
+				else if (!noop) notice(agent, `${agent.compaction}${ctxText(agent)} at its safe point; it continues its run.`);
+				else notice(agent, `had nothing to compact at its safe point (${why})${agent.instructed ? ", so your instructions were not applied" : ""}; it continues its run.`);
 				return;
 			}
 			case "response": {
@@ -874,6 +1015,8 @@ export default function setupParent(pi: ExtensionAPI) {
 			retries: 0,
 			abortedBy: undefined,
 			compaction: "",
+			noop: "",
+			instructed: false,
 			next: undefined,
 			keep: undefined,
 			kept: false,
@@ -996,6 +1139,8 @@ export default function setupParent(pi: ExtensionAPI) {
 			compactOnly: false,
 			kept: false,
 			compaction: "",
+			noop: "",
+			instructed: false,
 			queued: null,
 			stopAt: false,
 			switchAt: false,
@@ -1029,7 +1174,10 @@ export default function setupParent(pi: ExtensionAPI) {
 		const launchArgs = ["--session-dir", dir, "--session-id", params.name, ...modelArgs, ...args];
 		const joined = team.hire(params.name, params.description ?? "", cwd, launchArgs);
 		mkdirSync(dir, { recursive: true });
-		return { agent: register(params.name, cwd, dir, launchArgs, "running"), joined };
+		const agent = register(params.name, cwd, dir, launchArgs, "running");
+		// A new member starts with an empty context, so its first reply already counts toward notices.
+		agent.ctxNoticed = 0;
+		return { agent, joined };
 	};
 
 	const parameters = Type.Object({
@@ -1110,9 +1258,9 @@ export default function setupParent(pi: ExtensionAPI) {
 			`run hires a named team member, announces it on the board, and starts it on message; its name is its id, and its description is the role the team roster shows, at most ${DESCRIPTION_CHARS} characters (a longer one fails). status reports progress or the result (without id: lists subagents). abort stops a member's run or compaction, if any, and cancels a queued compaction; a member you aborted wakes only for your direct message, and its status says so. retire (required with abort): true also removes the member from the team, whether it runs or not; retire members you will not use again. A retired member's name is not reused, and status with its id still shows its last result.`,
 			"A running member's safe point comes once its current tool calls finish, before its next model request. abort, compact, and switch act on a running member at its next safe point and return at once; when: now interrupts it at once instead, even in the middle of a tool call. A member waiting in team wait returns from it early to reach its safe point.",
 			"Two ways to give work: a fresh member with a self-contained message suits a different domain or a new task; a stopped member, compacted with instructions that keep what helps and then messaged, suits continuing its work, or similar work its earlier context helps with.",
-			"compact compacts a member's context; instructions go to the compaction that runs as Pi's custom instructions, and how they shape the summary depends on that compaction. Pi compacts a running member by itself at its compact point, a Pi setting; status lines show ctx: the member's context tokens against that point. Compact a member yourself when it is past about 60% of its compact point and is about to take a new or unrelated task, or holds much that the next task does not need. A running member compacts at its next safe point and then continues its run, reading message if you give one; if its run ends first, it compacts afterwards as a stopped member does. A stopped member compacts at once: with message and wake true (the default), it then runs on message as if you sent it; with wake false, message is written word for word into its context after the summary, marked as yours, and the member stays stopped until something wakes it; use it for what the member's next task needs word for word, without starting that task. Without message or with wake false, a result you did not wait for arrives without starting a turn, unless your message could not be written. when: now stops a running member at once and compacts it as a stopped member.",
+			"compact compacts a member's context; instructions go to the compaction that runs as Pi's custom instructions, and how they shape the summary depends on that compaction. Pi compacts a running member by itself at its compact point, a Pi setting; status lines show ctx: the member's context tokens against that point, and a notice tells you each time a member passes another 10% of it. Compact a member yourself when it is past about 60% of its compact point and is about to take a new or unrelated task, or holds much that the next task does not need. A running member compacts at its next safe point and then continues its run, reading message if you give one; if its run ends first, it compacts afterwards as a stopped member does. A stopped member compacts at once: with message and wake true (the default), it then runs on message as if you sent it; with wake false, message is written word for word into its context after the summary, marked as yours, and the member stays stopped until something wakes it; use it for what the member's next task needs word for word, without starting that task. Without message or with wake false, a result you did not wait for arrives without starting a turn, unless your message could not be written. when: now stops a running member at once and compacts it as a stopped member.",
 			"switch moves a member to another model or thinking level; it keeps its name, session, and context. A running member switches at its next safe point and continues its run; a member in a compaction run, and a stopped one, use the new settings from their next run, and a stopped member with message runs on them at once. With message, a busy member needs when: now, which stops it at once and runs it on message with the new settings in the same call. A new model starts without the prompt cache, so its next request pays full input price for the whole context; compact first when the context is large.",
-			`run, status, compact, and switch with message wait up to waitMs (default ${DEFAULT_WAIT_MS}, max ${MAX_WAIT_MS}) and return the result if it finishes in time, otherwise its progress while it keeps running. To wait longer, call status again; each wait of up to ${MAX_WAIT_MS / 60_000} minutes keeps the prompt cache warm. Or end your turn: every result and message for you starts your next turn, and notices that start none arrive with it.`,
+			`run, status, compact, and switch with message wait up to waitMs (default ${DEFAULT_WAIT_MS}, max ${MAX_WAIT_MS}) and return the result if it finishes in time, otherwise its progress while it keeps running. To wait longer, call status again; each wait of up to ${MAX_WAIT_MS / 60_000} minutes keeps the prompt cache warm. Or end your turn: every result and message for you starts your next turn, and notices that start none arrive with it. When members changed since you last saw them, results end with a Team footer about it.`,
 			"Members talk with you and each other through the team tool. A member starts with an empty conversation, so put the context it needs in message. A direct team message to a stopped member wakes it in its own session. A run woken by a member's message sends its final reply to that member, or to you when that member has stopped.",
 			"args are Pi command-line options: read docs/cli.md in the Pi documentation listed in your system prompt, or run `pi --help`. Session, mode, model, provider, and thinking flags are set by this tool.",
 			"Progress showing no active tool and an old last event suggests a stall. Subagents cannot delegate further and end with this session.",
@@ -1124,6 +1272,7 @@ export default function setupParent(pi: ExtensionAPI) {
 			if (params.wake !== undefined && params.action !== "compact") throw new Error("wake applies to compact only");
 			if (params.action === "status" && !params.id) {
 				const listed = [...agents.values()].filter((agent) => !team.isRetired(agent.id));
+				markSeen(MAIN, mainMark(), listed.map((agent) => agent.id));
 				return { content: [{ type: "text", text: listed.length ? listed.map(header).join("\n") : "No subagents." }], details: undefined };
 			}
 			/**
@@ -1256,6 +1405,7 @@ export default function setupParent(pi: ExtensionAPI) {
 
 	pi.on("session_start", (event, ctx) => {
 		parent = ctx;
+		footers.clear();
 		const base = sessionBase(ctx);
 		for (const member of team.load(base, ctx)) readBranch(register(member.name, member.cwd, join(base, "subagents", member.name), member.args, "stopped"));
 		// Nothing is pending yet: a session start makes a new runtime.
@@ -1273,6 +1423,8 @@ export default function setupParent(pi: ExtensionAPI) {
 	pi.on("session_tree", (event, ctx) => {
 		const summarized = event.summaryEntry ? summarizing : [];
 		summarizing = [];
+		// Another branch holds other footers.
+		footers.delete(MAIN);
 		const branch = ctx.sessionManager.getBranch();
 		const shown: Details[] = [...branch.map(detailsOf), ...unreceived().map((message) => message.details)];
 		team.redeliver(shown, summarized.map(detailsOf));

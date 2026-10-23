@@ -35,11 +35,11 @@ Authoritative tool schemas and RPC contracts live in
     a direct message, `switch` with `message`, or a post-compaction run with
     `message` and `wake: true`. `compact` with `wake: false` preserves the lock.
   - `retire: true` permanently removes the member from the active roster,
-    `status` list, background footer, and `"all"` mentions; future `team send`,
+    `status` list, Team footers, and `"all"` mentions; future `team send`,
     `compact`, or `switch` calls targeting it fail. Its session directory,
     `final.md`, and `team.jsonl` records remain on disk, and the result lists
     unread direct messages left in its inbox.
-- **`compact`**: Requires `id`; accepts `instructions` (`<= 4000` chars),
+- **`compact`**: Requires `id`; accepts `instructions` (`<= 8000` chars),
   `message`, `wake` (default `true`; `false` requires `message`), `when`
   (`"next"` or `"now"`), and `waitMs`.
   - **Stopped member**: Runs a compaction process immediately; direct messages
@@ -56,6 +56,10 @@ Authoritative tool schemas and RPC contracts live in
     and continues the run (reading `message` if given); if the run ends first,
     it compacts afterward as a stopped member. `when: "now"` stops the run
     immediately and compacts as a stopped member.
+  - **Nothing to compact at a safe point**: When Pi finds nothing to compact,
+    for example because the member just compacted itself, the run continues;
+    the member's prompt and `main`'s notice both say so, and when
+    `instructions` were given, the notice adds that they were not applied.
 - **`switch`**: Requires `id` and `model` and/or `thinking` (`off`, `minimal`,
   `low`, `medium`, `high`, `xhigh`, `max`), plus optional `when`, `message`, and
   `waitMs`.
@@ -110,7 +114,8 @@ or `compact` / `switch` with `when: "now"`):
     `after=<highest seq on page>` (`with`, `query`, and `before` are rejected).
 - **`wait`**: Waits up to `ms` (`0–240000`, default `30000`) for a pending
   message (or safe-point request from `main`).
-- **`members`**: Lists `main`, active members with state and role, and topic.
+- **`members`**: Lists `main`, active members with state, context use, and
+  role, and the topic.
 - **`topic`**: Sets the team topic (`1–2000` chars, `main` only).
 
 ### Visibility, Digests, Wake Rules, and Replies
@@ -134,6 +139,41 @@ or `compact` / `switch` with `when: "now"`):
   `subagent-result` marked `(woken by X; X had stopped)`. Runs started by `main`
   report to `main`. Replies over `16000` chars truncate in the report and write
   in full to `<member dir>/final.md`.
+
+### Context Use and Team Footers
+
+- **Context use**: `ctx 212K/300K 71%` is a member's context tokens after its
+  last model reply or compaction, against its compact point (the model's
+  context window minus Pi's `reserveTokens` for that model in the member's
+  `cwd`). After a compaction at a turn boundary, such as one an extension
+  makes, the status shows
+  `compacted 370K→? at a turn boundary (ctx known after its next successful reply)`
+  until that reply, in the same run or a later one, then
+  `compacted 370K→31K at a turn boundary`.
+- **Context notices**: Each time a member's context passes another `10%` of
+  its compact point, `main` gets a `subagent-notice` that starts no turn.
+- **Recipients**: A `send` result shows each recipient's state and context use.
+- **Team footers**: When something changed since the caller last saw it,
+  results of `subagent` and of `team send` and `wait` end with `Team:` lines
+  about it. For `main` they cover every member; for a member, `main`, itself
+  (`you`), and the others. The lines about `main` and `you` tell context use
+  only.
+  - A change is a new state (running, compacting, stopped, error, aborted, the
+    abort lock, a pending safe-point action, or other settings for the next
+    run), context use reaching another `10%` step, a running member with no
+    event for `60` seconds, or, for `main`, a new direct message waiting in a
+    stopped member's inbox. Durations, current tools, and token counts within
+    a step are no change.
+  - Members a result already shows count as seen: a status header, the
+    `status` list, a `send` recipient, the `members` list, or a result
+    delivered to `main`. A `subagent-notice` that shows a member's context
+    counts that context as seen.
+  - Lines start with the caller's own context and `main`'s, then errors,
+    stopped members, and busy ones, up to `10` lines and a `+N more` line;
+    the lines left out follow in the next footer.
+  - A `wait` that times out with no change ends with `Team: no changes.`
+  - After the caller's context is compacted, the session starts again, or
+    `main` moves in the session tree, the next footer lists everyone again.
 
 ## 4. Session Files and Parent Lifecycle
 

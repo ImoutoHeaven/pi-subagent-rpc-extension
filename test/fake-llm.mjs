@@ -24,20 +24,29 @@
 //   "TOOLS?"                         → the declared tool names
 //   "SAY <text>"                     → <text>
 //   "<conversation>..."              → "summary" (a compaction request); custom instructions "SLOW <ms>" wait first
-// Every reply reports 1500 prompt tokens, 1000 of them cached, and 200 completion tokens.
+//   "USAGE <n>,<m>,... <rest>"       → handle <rest>; the replies of that run report <n>, then <m>, ... prompt tokens
+// Every other reply reports 1500 prompt tokens, 1000 of them cached, and 200 completion tokens.
+const USAGE = /^USAGE ([\d,]+) /;
 import fs from "node:fs";
 import http from "node:http";
 
 const [log, port = "8787"] = process.argv.slice(2);
 const text = (m) => (typeof m.content === "string" ? m.content : (m.content || []).map((p) => p.text || "").join(""));
-const script = (m) => text(m).trim();
+const script = (m) => text(m).trim().replace(USAGE, "");
+/** The prompt tokens a reply reports: by its place after the last USAGE prompt, or 1500. */
+const promptTokens = (messages) => {
+	const start = messages.findLastIndex((m) => m.role === "user" && USAGE.test(text(m).trim()));
+	if (start === -1) return 1500;
+	const steps = text(messages[start]).trim().match(USAGE)[1].split(",").map(Number);
+	return steps[Math.min(messages.slice(start).filter((m) => m.role === "assistant").length, steps.length - 1)];
+};
 /** The scripted call a prompt makes, without its delay. */
 const callOf = (m) => script(m).replace(/^SLOW \d+ /, "");
 const sleep = (ms) => new Promise((done) => setTimeout(done, ms));
 const CALLS = /^CALLS (\d+) (\{.*?\}) \|\| (\{.*\})$/s;
 // The whole message, so a summarizer prompt that quotes a launch note is not one.
 const WOKEN = /^.* sent you a team message\. Act on your team messages\.$/;
-const RESUMED = /^The main agent compacted your context at this point of your run\. Continue your task\.\n\nThe main agent's message:\n([\s\S]*)$/;
+const RESUMED = /^The main agent (?:compacted|asked to compact) your context at this point of your run[^\n]*\. Continue your task\.\n\nThe main agent's message:\n([\s\S]*)$/;
 const isTeam = (m) => m.role === "user" && /^\[(team|subagent\])/.test(text(m));
 /** The body of the last team message in a run's start message. */
 const lastBody = (start) => text(start).split(/\[team #\d+\][^\n]*\n/).at(-1).split("\n[team] Board: ")[0].trim();
@@ -121,7 +130,8 @@ http
 				: { role: "assistant", content: answer.content };
 			chunk([{ index: 0, delta, finish_reason: null }]);
 			chunk([{ index: 0, delta: {}, finish_reason: answer.call ? "tool_calls" : "stop" }]);
-			chunk([], { usage: { prompt_tokens: 1500, completion_tokens: 200, total_tokens: 1700, prompt_tokens_details: { cached_tokens: 1000 } } });
+			const prompt = promptTokens(body.messages);
+			chunk([], { usage: { prompt_tokens: prompt, completion_tokens: 200, total_tokens: prompt + 200, prompt_tokens_details: { cached_tokens: 1000 } } });
 			res.end("data: [DONE]\n\n");
 		});
 	})
