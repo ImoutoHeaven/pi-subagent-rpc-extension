@@ -20,11 +20,11 @@ import {
 	type Request,
 	SEEN_ENTRY,
 	seenIn,
-	TEAM_DESCRIPTION,
 	TEAM_MESSAGE,
 	TITLE_CHARS,
 	TOPIC_CHARS,
 	type TeamParams,
+	teamDescription,
 	teamParameters,
 } from "./protocol.ts";
 
@@ -93,8 +93,11 @@ export interface TeamHost {
 	wake(name: string, by: string): void;
 	/** Delivers a message to the main agent. */
 	notify(customType: string, from: string, text: string, details: object): void;
-	/** Resolves with the number of messages pending for the main agent once there is one, or after `ms`. */
-	waitForMain(ms: number, signal?: AbortSignal): Promise<number>;
+	/**
+	 * Resolves once a message is pending for the main agent, a member ends whose result another call returns (`finished`), or after `ms`,
+	 * with the number of messages pending.
+	 */
+	waitForMain(ms: number, signal?: AbortSignal): Promise<{ count: number; finished?: string }>;
 	/** The main agent asked to stop, compact, or switch running member `name` at its next safe point. */
 	interrupted(name: string): boolean;
 	/** The context use of `name`, main or a member, such as `ctx 212K/300K 71%`; empty until known. */
@@ -577,7 +580,7 @@ export function createTeam(pi: ExtensionAPI, host: TeamHost) {
 	pi.registerTool({
 		name: "team",
 		label: "Team",
-		description: TEAM_DESCRIPTION,
+		description: teamDescription(true),
 		parameters: teamParameters,
 		async execute(_toolCallId, params, signal) {
 			const mark = host.mainMark();
@@ -590,8 +593,10 @@ export function createTeam(pi: ExtensionAPI, host: TeamHost) {
 				return text(result);
 			}
 			const ms = Math.min(params.ms ?? DEFAULT_WAIT_MS, MAX_WAIT_MS);
-			const count = await host.waitForMain(ms, signal);
-			return text(count ? `${count} message(s) for you follow this result.${host.footer(MAIN, mark)}` : `No messages for you within ${ms}ms.${host.footer(MAIN, mark, true)}`);
+			const { count, finished } = await host.waitForMain(ms, signal);
+			if (count) return text(`${count} message(s) for you follow this result.${host.footer(MAIN, mark)}`);
+			if (finished) return text(`Returned early: ${finished} finished; its result is in that call's result.${host.footer(MAIN, mark)}`);
+			return text(`No messages for you within ${ms}ms.${host.footer(MAIN, mark, true)}`);
 		},
 	});
 

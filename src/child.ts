@@ -16,8 +16,8 @@ import {
 	SEEN_ENTRY,
 	seenIn,
 	TAG,
-	TEAM_DESCRIPTION,
 	TEAM_MESSAGE,
+	teamDescription,
 	teamParameters,
 } from "./protocol.ts";
 
@@ -74,7 +74,7 @@ export default function setupChild(pi: ExtensionAPI) {
 	pi.registerTool({
 		name: "team",
 		label: "Team",
-		description: TEAM_DESCRIPTION,
+		description: teamDescription(false),
 		parameters: teamParameters,
 		async execute(_toolCallId, params, signal, _onUpdate, ctx) {
 			if (params.action === "wait") {

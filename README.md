@@ -41,7 +41,8 @@ Example arguments for the main agent's `subagent` tool:
 }
 ```
 
-Use `status` to check progress, `team send` for more work, and `abort` with
+Use `status` to check a member's progress, `team wait` to wait for whichever
+member finishes first, `team send` for more work, and `abort` with
 `retire: true` to finish with the member.
 
 When something in the team changed since the caller last saw it, results of

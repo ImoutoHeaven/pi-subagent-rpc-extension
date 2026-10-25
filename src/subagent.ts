@@ -320,13 +320,15 @@ export default function setupParent(pi: ExtensionAPI) {
 	let inRun = false;
 	/** The poll for an idle parent, while messages are pending. */
 	let watch: ReturnType<typeof setTimeout> | undefined;
-	/** Ends every tool wait, so a new message does not sit behind a long wait. */
-	const waits = new Set<() => void>();
+	/** Ends every tool wait, so a new message does not sit behind a long wait; `finished` names a member whose result another call returns. */
+	const waits = new Set<(finished?: string) => void>();
 	/** Pending messages that wake the parent. */
 	const loud = () => unreceived().filter((message) => !message.quiet).length;
 
 	/** A running member, or one in a compaction run. */
 	const busy = (agent: Agent) => agent.status === "running" || agent.status === "compacting";
+	/** A compaction run's result is information only, unless a message waited on the compaction that failed. */
+	const quiet = (agent: Agent) => agent.compactOnly && agent.next === undefined && !(agent.keep !== undefined && !agent.kept);
 
 	/** How an ended run ended: who aborted it, or its error and Pi's retries of a failed model request. */
 	const outcome = (agent: Agent) => {
@@ -397,7 +399,11 @@ export default function setupParent(pi: ExtensionAPI) {
 	/** The model-facing report. */
 	const report = (agent: Agent) => {
 		if (busy(agent)) {
-			return [header(agent), ...agent.narration, noticeLine(agent), `Still ${agent.status}: wait with status, or abort.`].filter(Boolean).join("\n");
+			const others = [...agents.values()].some((other) => other !== agent && busy(other));
+			const hint = others
+				? `Still ${agent.status}: its result arrives as a message when you end your turn, or use team wait for whichever member finishes first; status waits for this one.`
+				: `Still ${agent.status}: wait with status, or abort.`;
+			return [header(agent), ...agent.narration, noticeLine(agent), hint].filter(Boolean).join("\n");
 		}
 		const text =
 			agent.lastText.length > MAX_RESULT_CHARS
@@ -411,12 +417,20 @@ export default function setupParent(pi: ExtensionAPI) {
 	/**
 	 * A tool result showing the final state delivers it; a delivered result is not repeated.
 	 * Pending messages reach the parent after the tool result, so the final result then goes out as a message
-	 * behind that subagent's own, keeping it the last word.
+	 * behind that subagent's own, keeping it the last word. `finished` names the member whose end cut the wait short.
+	 * A cancelled call, such as one inside a cancelled codemode script, may never show its result, so the result goes out as a message.
 	 */
-	const consume = (agent: Agent): { text: string; details?: object } => {
-		if (busy(agent)) return { text: report(agent) + (loud() ? "\nReturned early: subagent messages follow this result." : "") };
+	const consume = (agent: Agent, finished?: string, signal?: AbortSignal): { text: string; details?: object } => {
+		if (busy(agent)) {
+			const early = loud()
+				? "\nReturned early: subagent messages follow this result."
+				: finished
+					? `\nReturned early: ${finished} finished; its result is in that call's result.`
+					: "";
+			return { text: report(agent) + early };
+		}
 		if (agent.status === "stopped") return { text: header(agent) };
-		if (unreceived().some((message) => message.agentId === agent.id && !message.quiet)) deliver(agent);
+		if (signal?.aborted || unreceived().some((message) => message.agentId === agent.id && !message.quiet)) deliver(agent);
 		if (agent.delivered) return { text: `${header(agent)}\n\nIts result ${agent.delivered}. Full reply: ${join(agent.dir, "final.md")}` };
 		agent.delivered = RETURNED;
 		return { text: report(agent), details: runKey(agent) };
@@ -493,7 +507,7 @@ export default function setupParent(pi: ExtensionAPI) {
 
 	/**
 	 * What changed in the team since `viewer` last saw it, as lines after a blank line: a state, a context step, a member that went quiet,
-	 * or a new unread message. With `unchanged`, says so when nothing did; otherwise empty then.
+	 * or a new unread message. With `unchanged`, when nothing did, lists the busy members or says nothing changed; otherwise empty then.
 	 */
 	const teamFooter = (viewer: string, mark: string, unchanged = false) => {
 		const keys = seenBy(viewer, mark);
@@ -514,11 +528,19 @@ export default function setupParent(pi: ExtensionAPI) {
 				changes.push({ name, key, rank: kind * 2 + (state ? 0 : 1) });
 			}
 		}
-		if (!changes.length) return unchanged ? "\n\nTeam: no changes." : "";
+		const lines = (names: string[], total: number) => {
+			const more = total > names.length ? [`+${total - names.length} more: ${viewer === MAIN ? "subagent status" : "team members"}`] : [];
+			return `\n\nTeam:\n${[...names.map((name) => footerLine(viewer, name, now)), ...more].map((line) => `- ${line}`).join("\n")}`;
+		};
+		if (!changes.length) {
+			if (!unchanged) return "";
+			// A wait that timed out shows that the busy members are alive.
+			const live = covered(viewer).filter((name) => name !== MAIN && name !== viewer && busy(agents.get(name) as Agent));
+			return live.length ? lines(live.slice(0, TEAM_LINES), live.length) : "\n\nTeam: no changes.";
+		}
 		const shown = changes.sort((a, b) => a.rank - b.rank).slice(0, TEAM_LINES);
 		for (const { name, key } of shown) keys.set(name, key);
-		const more = changes.length > shown.length ? [`+${changes.length - shown.length} more: ${viewer === MAIN ? "subagent status" : "team members"}`] : [];
-		return `\n\nTeam:\n${[...shown.map(({ name }) => footerLine(viewer, name, now)), ...more].map((line) => `- ${line}`).join("\n")}`;
+		return lines(shown.map(({ name }) => name), changes.length);
 	};
 
 	/** The main agent's footer after a subagent result about `shown`, which that result shows in full. */
@@ -617,12 +639,10 @@ export default function setupParent(pi: ExtensionAPI) {
 		suspended = false;
 	});
 
-	// A compaction run's result is information only, unless a message waited on the compaction that failed.
 	const deliver = (agent: Agent) => {
 		if (agent.delivered || shuttingDown) return;
 		agent.delivered = SENT;
-		const lost = agent.keep !== undefined && !agent.kept;
-		notify("subagent-result", agent.id, report(agent), { ...runKey(agent), status: agent.status }, agent.compactOnly && agent.next === undefined && !lost);
+		notify("subagent-result", agent.id, report(agent), { ...runKey(agent), status: agent.status }, quiet(agent));
 		// The result's header shows the member, so the main agent's footers need not.
 		markSeen(MAIN, mainMark(), [agent.id]);
 	};
@@ -635,20 +655,22 @@ export default function setupParent(pi: ExtensionAPI) {
 
 	/**
 	 * Resolves once `agent` (if given) stops running, `ms` pass, or `signal` aborts.
-	 * A tool wait (`forTool`) also ends on any message pending for the parent.
+	 * A tool wait (`forTool`) also ends on any message pending for the parent, and on another member's end whose result another call
+	 * returns, resolving with that member's name.
 	 */
 	const waitFor = (agent: Agent | undefined, ms: number, signal?: AbortSignal, forTool = false) =>
-		new Promise<void>((done) => {
-			if ((agent && !busy(agent)) || ms <= 0 || signal?.aborted || (forTool && loud())) return done();
-			const end = () => {
+		new Promise<string | undefined>((done) => {
+			if ((agent && !busy(agent)) || ms <= 0 || signal?.aborted || (forTool && loud())) return done(undefined);
+			const end = (finished?: string) => {
 				clearTimeout(timer);
-				signal?.removeEventListener("abort", end);
+				signal?.removeEventListener("abort", stop);
 				agent?.waiters.delete(end);
 				waits.delete(end);
-				done();
+				done(finished);
 			};
-			const timer = setTimeout(end, ms);
-			signal?.addEventListener("abort", end, { once: true });
+			const stop = () => end();
+			const timer = setTimeout(stop, ms);
+			signal?.addEventListener("abort", stop, { once: true });
 			agent?.waiters.add(end);
 			if (forTool) waits.add(end);
 		});
@@ -684,8 +706,8 @@ export default function setupParent(pi: ExtensionAPI) {
 		},
 		notify,
 		waitForMain: async (ms, signal) => {
-			await waitFor(undefined, ms, signal, true);
-			return loud();
+			const finished = await waitFor(undefined, ms, signal, true);
+			return { count: loud(), finished };
 		},
 		interrupted: (name) => {
 			const agent = agents.get(name);
@@ -975,6 +997,8 @@ export default function setupParent(pi: ExtensionAPI) {
 		const waiting = agent.waiters.size > 0;
 		for (const wake of [...agent.waiters]) wake();
 		if (!waiting) deliver(agent);
+		// Another call returns the result; the main agent's other waits return to act on it.
+		else if (!quiet(agent)) for (const wake of [...waits]) wake(agent.id);
 	};
 
 	/**
@@ -1182,7 +1206,12 @@ export default function setupParent(pi: ExtensionAPI) {
 
 	const parameters = Type.Object({
 		action: StringEnum(["run", "status", "abort", "compact", "switch"] as const),
-		id: Type.Optional(Type.String({ description: "status, abort, compact, switch: the subagent id, which is the member's name." })),
+		name: Type.Optional(
+			Type.String({
+				description:
+					"The member's name. run (required): the new member's name, 2-24 lowercase letters, digits, or hyphens, starting with a letter; each name is used once. status (optional), abort, compact, switch: the member to act on.",
+			}),
+		),
 		message: Type.Optional(
 			Type.String({
 				description:
@@ -1199,9 +1228,6 @@ export default function setupParent(pi: ExtensionAPI) {
 				description:
 					"compact: true (default) runs the member on message once compacted. false, which requires message, writes message into its context after the summary and leaves it stopped; it reads message when it next runs.",
 			}),
-		),
-		name: Type.Optional(
-			Type.String({ description: "run (required): the new member's name, 2-24 lowercase letters, digits, or hyphens, starting with a letter. Each name is used once." }),
 		),
 		description: Type.Optional(
 			Type.String({
@@ -1229,16 +1255,15 @@ export default function setupParent(pi: ExtensionAPI) {
 			Type.Integer({
 				minimum: 0,
 				maximum: MAX_WAIT_MS,
-				description: `run, status, compact, switch with message: wait up to this long; 0 returns at once while the member keeps running. Default ${DEFAULT_WAIT_MS}.`,
+				description: `run, status with name, compact, switch with message: wait up to this long; 0 returns at once while the member keeps running. Default ${DEFAULT_WAIT_MS}.`,
 			}),
 		),
-	});
+	}, { additionalProperties: false });
 	type Params = {
 		action: "run" | "status" | "abort" | "compact" | "switch";
-		id?: string;
+		name?: string;
 		message?: string;
 		instructions?: string;
-		name?: string;
 		description?: string;
 		model?: string;
 		thinking?: string;
@@ -1255,12 +1280,12 @@ export default function setupParent(pi: ExtensionAPI) {
 		label: "Subagent",
 		description: [
 			"Delegate work to a Pi subagent: a separate Pi process with its own session that loads tools, extensions, skills, and MCP servers like a normal Pi launch.",
-			`run hires a named team member, announces it on the board, and starts it on message; its name is its id, and its description is the role the team roster shows, at most ${DESCRIPTION_CHARS} characters (a longer one fails). status reports progress or the result (without id: lists subagents). abort stops a member's run or compaction, if any, and cancels a queued compaction; a member you aborted wakes only for your direct message, and its status says so. retire (required with abort): true also removes the member from the team, whether it runs or not; retire members you will not use again. A retired member's name is not reused, and status with its id still shows its last result.`,
+			`run hires a named team member, announces it on the board, and starts it on message; its description is the role the team roster shows, at most ${DESCRIPTION_CHARS} characters (a longer one fails). The other actions name the member with name. status with name reports progress or the result; without name it lists subagents at once (to wait for whichever member finishes first, use team wait). abort stops a member's run or compaction, if any, and cancels a queued compaction; a member you aborted wakes only for your direct message, and its status says so. retire (required with abort): true also removes the member from the team, whether it runs or not; retire members you will not use again. A retired member's name is not reused, and status with its name still shows its last result.`,
 			"A running member's safe point comes once its current tool calls finish, before its next model request. abort, compact, and switch act on a running member at its next safe point and return at once; when: now interrupts it at once instead, even in the middle of a tool call. A member waiting in team wait returns from it early to reach its safe point.",
 			"Two ways to give work: a fresh member with a self-contained message suits a different domain or a new task; a stopped member, compacted with instructions that keep what helps and then messaged, suits continuing its work, or similar work its earlier context helps with.",
 			"compact compacts a member's context; instructions go to the compaction that runs as Pi's custom instructions, and how they shape the summary depends on that compaction. Pi compacts a running member by itself at its compact point, a Pi setting; status lines show ctx: the member's context tokens against that point, and a notice tells you each time a member passes another 10% of it. Compact a member yourself when it is past about 60% of its compact point and is about to take a new or unrelated task, or holds much that the next task does not need. A running member compacts at its next safe point and then continues its run, reading message if you give one; if its run ends first, it compacts afterwards as a stopped member does. A stopped member compacts at once: with message and wake true (the default), it then runs on message as if you sent it; with wake false, message is written word for word into its context after the summary, marked as yours, and the member stays stopped until something wakes it; use it for what the member's next task needs word for word, without starting that task. Without message or with wake false, a result you did not wait for arrives without starting a turn, unless your message could not be written. when: now stops a running member at once and compacts it as a stopped member.",
 			"switch moves a member to another model or thinking level; it keeps its name, session, and context. A running member switches at its next safe point and continues its run; a member in a compaction run, and a stopped one, use the new settings from their next run, and a stopped member with message runs on them at once. With message, a busy member needs when: now, which stops it at once and runs it on message with the new settings in the same call. A new model starts without the prompt cache, so its next request pays full input price for the whole context; compact first when the context is large.",
-			`run, status, compact, and switch with message wait up to waitMs (default ${DEFAULT_WAIT_MS}, max ${MAX_WAIT_MS}) and return the result if it finishes in time, otherwise its progress while it keeps running. To wait longer, call status again; each wait of up to ${MAX_WAIT_MS / 60_000} minutes keeps the prompt cache warm. Or end your turn: every result and message for you starts your next turn, and notices that start none arrive with it. When members changed since you last saw them, results end with a Team footer about it.`,
+			`run, status with name, compact, and switch with message wait up to waitMs (default ${DEFAULT_WAIT_MS}, max ${MAX_WAIT_MS}) and return the result if it finishes in time, otherwise its progress while it keeps running. To wait longer, call status again; each wait of up to ${MAX_WAIT_MS / 60_000} minutes keeps the prompt cache warm. Or end your turn: every result and message for you starts your next turn, and notices that start none arrive with it. When members changed since you last saw them, results end with a Team footer about it.`,
 			"Members talk with you and each other through the team tool. A member starts with an empty conversation, so put the context it needs in message. A direct team message to a stopped member wakes it in its own session. A run woken by a member's message sends its final reply to that member, or to you when that member has stopped.",
 			"args are Pi command-line options: read docs/cli.md in the Pi documentation listed in your system prompt, or run `pi --help`. Session, mode, model, provider, and thinking flags are set by this tool.",
 			"Progress showing no active tool and an old last event suggests a stall. Subagents cannot delegate further and end with this session.",
@@ -1270,7 +1295,8 @@ export default function setupParent(pi: ExtensionAPI) {
 			parent = ctx;
 			const waitMs = Math.min(params.waitMs ?? DEFAULT_WAIT_MS, MAX_WAIT_MS);
 			if (params.wake !== undefined && params.action !== "compact") throw new Error("wake applies to compact only");
-			if (params.action === "status" && !params.id) {
+			if (params.action === "status" && !params.name) {
+				if (params.waitMs !== undefined) throw new Error("status without name returns at once; to wait for any member use team wait");
 				const listed = [...agents.values()].filter((agent) => !team.isRetired(agent.id));
 				markSeen(MAIN, mainMark(), listed.map((agent) => agent.id));
 				return { content: [{ type: "text", text: listed.length ? listed.map(header).join("\n") : "No subagents." }], details: undefined };
@@ -1279,8 +1305,8 @@ export default function setupParent(pi: ExtensionAPI) {
 			 * The state of `agent`, with the other running members; `details` mark what the result shows seen, in an entry of its own,
 			 * since a call made through another tool, such as codemode, returns no details.
 			 */
-			const result = (agent: Agent, details?: object, lead = "") => {
-				const state = consume(agent);
+			const result = (agent: Agent, details?: object, lead = "", finished?: string) => {
+				const state = consume(agent, finished, signal);
 				if (details || state.details) pi.appendEntry(SEEN_ENTRY, { ...details, ...state.details });
 				return { content: [{ type: "text" as const, text: lead + state.text + footer(agent) }], details: undefined };
 			};
@@ -1289,16 +1315,12 @@ export default function setupParent(pi: ExtensionAPI) {
 			if (params.action === "run") {
 				const { agent, joined } = create(params, ctx);
 				launch(agent, { type: "prompt", message: params.message as string }, MAIN);
-				await waitFor(agent, waitMs, signal, true);
-				return result(agent, joined);
+				return result(agent, joined, "", await waitFor(agent, waitMs, signal, true));
 			}
-			const agent = agents.get(params.id ?? "");
-			if (!agent) throw new Error(`Unknown subagent id: ${params.id}. Known: ${[...agents.keys()].join(", ") || "none"}`);
+			const agent = agents.get(params.name ?? "");
+			if (!agent) throw new Error(`Unknown subagent name: ${params.name}. Known: ${[...agents.keys()].join(", ") || "none"}`);
 			if (params.action !== "status" && team.isRetired(agent.id)) throw new Error(`${agent.id} is retired`);
-			if (params.action === "status") {
-				await waitFor(agent, waitMs, signal, true);
-				return result(agent);
-			}
+			if (params.action === "status") return result(agent, undefined, "", await waitFor(agent, waitMs, signal, true));
 			if (params.action === "compact") {
 				const instructions = params.instructions?.trim();
 				if (instructions && instructions.length > INSTRUCTIONS_CHARS) {
@@ -1324,8 +1346,7 @@ export default function setupParent(pi: ExtensionAPI) {
 					stopped = state;
 				}
 				compact(agent, request);
-				await waitFor(agent, waitMs, signal, true);
-				return result(agent, undefined, stopped);
+				return result(agent, undefined, stopped, await waitFor(agent, waitMs, signal, true));
 			}
 			if (params.action === "switch") {
 				const pattern = params.model?.trim() || undefined;
@@ -1377,8 +1398,7 @@ export default function setupParent(pi: ExtensionAPI) {
 				// As the main agent's task, the run unlocks the member.
 				agent.locked = false;
 				launch(agent, { type: "prompt", message: params.message }, MAIN);
-				await waitFor(agent, waitMs, signal, true);
-				return result(agent, undefined, line + stopped);
+				return result(agent, undefined, line + stopped, await waitFor(agent, waitMs, signal, true));
 			}
 			if (typeof params.retire !== "boolean") throw new Error("abort requires retire: true or false");
 			// Retired before its run stops, so nothing wakes the member in between.

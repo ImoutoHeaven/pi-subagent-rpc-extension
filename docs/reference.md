@@ -25,10 +25,14 @@ Authoritative tool schemas and RPC contracts live in
     remove the `team` tool or unload this extension.
   - `waitMs`: `0–240000` (default `30000`). Waits up to `waitMs` for completion
     or an incoming message for `main`.
-- **`status`**: Without `id`, lists non-retired members. With `id`, waits up to
-  `waitMs` (`0–240000`, default `30000`) while busy and returns the progress
-  report or final result (also works on retired members).
-- **`abort`**: Requires `id` and `retire: true | false`, plus optional
+- **`status`**: Without `name`, lists non-retired members at once and rejects
+  `waitMs`; `team wait` waits for whichever member finishes first. With `name`,
+  waits up to `waitMs` (`0–240000`, default `30000`) while busy and returns the
+  progress report or final result (also works on retired members).
+- **Waits**: A `run`, `status`, `compact`, or `switch` wait also ends early
+  when a message for `main` is pending, or when another member ends whose
+  result another call returns; the progress report then names that member.
+- **`abort`**: Requires `name` and `retire: true | false`, plus optional
   `when: "next" | "now"`.
   - Stops the run or compaction, cancels any queued compaction, and sets the
     abort lock (`stopped (only main wakes it)`). New work from `main` lifts it:
@@ -39,7 +43,7 @@ Authoritative tool schemas and RPC contracts live in
     `compact`, or `switch` calls targeting it fail. Its session directory,
     `final.md`, and `team.jsonl` records remain on disk, and the result lists
     unread direct messages left in its inbox.
-- **`compact`**: Requires `id`; accepts `instructions` (`<= 8000` chars),
+- **`compact`**: Requires `name`; accepts `instructions` (`<= 8000` chars),
   `message`, `wake` (default `true`; `false` requires `message`), `when`
   (`"next"` or `"now"`), and `waitMs`.
   - **Stopped member**: Runs a compaction process immediately; direct messages
@@ -60,7 +64,7 @@ Authoritative tool schemas and RPC contracts live in
     for example because the member just compacted itself, the run continues;
     the member's prompt and `main`'s notice both say so, and when
     `instructions` were given, the notice adds that they were not applied.
-- **`switch`**: Requires `id` and `model` and/or `thinking` (`off`, `minimal`,
+- **`switch`**: Requires `name` and `model` and/or `thinking` (`off`, `minimal`,
   `low`, `medium`, `high`, `xhigh`, `max`), plus optional `when`, `message`, and
   `waitMs`.
   - Updates `launchArgs` in `team.jsonl`. When the model changes and
@@ -113,7 +117,9 @@ or `compact` / `switch` with `when: "now"`):
     to `16000` chars), oldest first in tree order; continue with
     `after=<highest seq on page>` (`with`, `query`, and `before` are rejected).
 - **`wait`**: Waits up to `ms` (`0–240000`, default `30000`) for a pending
-  message (or safe-point request from `main`).
+  message (or safe-point request from `main`). For `main`, a member result is
+  such a message, and the wait returns early, naming the member, when another
+  call returns a member's result.
 - **`members`**: Lists `main`, active members with state, context use, and
   role, and the topic.
 - **`topic`**: Sets the team topic (`1–2000` chars, `main` only).
@@ -171,7 +177,8 @@ or `compact` / `switch` with `when: "now"`):
   - Lines start with the caller's own context and `main`'s, then errors,
     stopped members, and busy ones, up to `10` lines and a `+N more` line;
     the lines left out follow in the next footer.
-  - A `wait` that times out with no change ends with `Team: no changes.`
+  - A `wait` that times out with no change lists the running and compacting
+    members, or ends with `Team: no changes.` when none is busy.
   - After the caller's context is compacted, the session starts again, or
     `main` moves in the session tree, the next footer lists everyone again.
 

@@ -14,6 +14,7 @@
 //   "CALLS <ms> <a> || <b>"           → a `subagent` call with <a>
 //   "TEAM <json>"                     → a `team` tool call with those arguments
 //   "TEAMS <a> || <b> ..."            → a `team` call with <a>
+//   "PAR [[<tool>, <args>], ...]"     → those tool calls in one reply, which Pi runs in parallel
 //   "RELOAD"                         → a `reload_now` tool call
 //   "BASH <command>"                 → a `bash` tool call running <command>
 //   "TOOL <name> <json>"             → a call of tool <name> with those arguments
@@ -64,7 +65,7 @@ async function reply(body) {
 	const last = messages.at(-1);
 	if (last.role === "assistant") return { content: "notified" };
 	if (last.role === "tool") {
-		const start = messages.findLastIndex((m) => m.role === "user" && /^(CALLS?|TEAMS?) |^RELOAD$/.test(callOf(m)));
+		const start = messages.findLastIndex((m) => m.role === "user" && /^(CALLS?|TEAMS?|PAR) |^RELOAD$/.test(callOf(m)));
 		const call = start === -1 ? "" : callOf(messages[start]);
 		if (call.startsWith("TEAM ")) return { content: `team: ${text(last)}` };
 		if (call === "RELOAD") return { content: `tools: ${(body.tools || []).map((t) => t.function.name).join(",")}` };
@@ -98,6 +99,7 @@ async function reply(body) {
 	if (said.startsWith("FAIL ")) return { fail: said.slice(5) };
 	if (said.startsWith("TEAM ")) return { call: said.slice(5), name: "team" };
 	if (said.startsWith("TEAMS ")) return { call: said.slice(6).split(" || ")[0], name: "team" };
+	if (said.startsWith("PAR ")) return { calls: JSON.parse(said.slice(4)).map(([name, args]) => ({ name, call: JSON.stringify(args) })) };
 	if (said === "RELOAD") return { call: "{}", name: "reload_now" };
 	if (said.startsWith("BASH ")) return { call: JSON.stringify({ command: said.slice(5) }), name: "bash" };
 	const tool = said.match(/^TOOL (\S+) ([\s\S]*)$/);
@@ -125,11 +127,16 @@ http
 			if (answer.fail) return res.end(`data: ${JSON.stringify({ error: { message: answer.fail } })}\n\n`);
 			const chunk = (choices, extra = {}) =>
 				res.write(`data: ${JSON.stringify({ id: "c", object: "chat.completion.chunk", created: 0, model: "fake-model", choices, ...extra })}\n\n`);
-			const delta = answer.call
-				? { role: "assistant", content: null, tool_calls: [{ index: 0, id: `call_${Date.now()}`, type: "function", function: { name: answer.name ?? "subagent", arguments: answer.call } }] }
+			const calls = answer.calls ?? (answer.call ? [{ name: answer.name ?? "subagent", call: answer.call }] : undefined);
+			const delta = calls
+				? {
+						role: "assistant",
+						content: null,
+						tool_calls: calls.map(({ name, call }, index) => ({ index, id: `call_${Date.now()}_${index}`, type: "function", function: { name, arguments: call } })),
+					}
 				: { role: "assistant", content: answer.content };
 			chunk([{ index: 0, delta, finish_reason: null }]);
-			chunk([{ index: 0, delta: {}, finish_reason: answer.call ? "tool_calls" : "stop" }]);
+			chunk([{ index: 0, delta: {}, finish_reason: calls ? "tool_calls" : "stop" }]);
 			const prompt = promptTokens(body.messages);
 			chunk([], { usage: { prompt_tokens: prompt, completion_tokens: 200, total_tokens: prompt + 200, prompt_tokens_details: { cached_tokens: 1000 } } });
 			res.end("data: [DONE]\n\n");
