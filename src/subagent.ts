@@ -6,7 +6,6 @@ import { randomUUID } from "node:crypto";
 import { existsSync, mkdirSync, statSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
-import { StringEnum } from "@earendil-works/pi-ai";
 import {
 	type BoundaryState,
 	calculateContextTokens,
@@ -19,7 +18,7 @@ import {
 	SettingsManager,
 } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
-import { BODY_CHARS, compactionMark, DEFAULT_WAIT_MS, type Details, detailsOf, MAX_WAIT_MS, type Reply, type Request, SEEN_ENTRY } from "./protocol.ts";
+import { BODY_CHARS, compactionMark, DEFAULT_WAIT_MS, type Details, detailsOf, MAX_WAIT_MS, type Reply, type Request, SEEN_ENTRY, StringEnum } from "./protocol.ts";
 import { type AbortedBy, type Launch, type Run, type RunStatus, startRun } from "./rpc.ts";
 import { createTeam, DESCRIPTION_CHARS } from "./team.ts";
 

@@ -6,7 +6,7 @@ messages.
 
 ## Requirements and Quickstart
 
-Requires Pi (tested on `1.3.0` and `1.4.0`).
+Requires Pi (tested on `1.3.0`, `1.4.0` and `1.5.0`).
 
 Install into Pi settings so child processes load the extension automatically:
 
@@ -80,7 +80,7 @@ npm test
 ```
 
 Requires Docker and network access. The script runs typechecks, POSIX process
-checks, and E2E tests on Pi `1.3.0` and `1.4.0` in temporary containers with
+checks, and E2E tests on Pi `1.3.0`, `1.4.0` and `1.5.0` in temporary containers with
 source mounted read-only.
 
 See [`docs/reference.md`](docs/reference.md), [`src/protocol.ts`](src/protocol.ts),

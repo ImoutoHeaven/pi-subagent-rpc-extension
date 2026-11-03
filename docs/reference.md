@@ -200,6 +200,6 @@ or `compact` / `switch` with `when: "now"`):
 
 ## 5. Development Checks
 
-`npm test` runs both supported Pi versions in Docker. Select one with
-`PI_VERSION=1.4.0 npm test`. For an existing local development installation,
+`npm test` runs all supported Pi versions in Docker. Select one with
+`PI_VERSION=1.5.0 npm test`. For an existing local development installation,
 `PI_CLI=/path/to/cli.js bash test/local.sh` drives that CLI directly.

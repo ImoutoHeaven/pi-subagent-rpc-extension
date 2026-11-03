@@ -3,9 +3,13 @@
  * A child sends a request as an `input` dialog titled TAG with the JSON request as its placeholder;
  * the parent answers with the JSON reply as the dialog value.
  */
-import { StringEnum } from "@earendil-works/pi-ai";
 import type { SessionEntry } from "@earendil-works/pi-coding-agent";
 import { type Static, Type } from "typebox";
+
+/** A string enum as `{ type: "string", enum }`, which providers without anyOf/const support accept. */
+export function StringEnum<T extends readonly string[]>(values: T, options?: { description?: string }) {
+	return Type.Unsafe<T[number]>({ type: "string", enum: [...values], ...options });
+}
 
 export const TAG = "pi-subagent/1";
 /** Set in every subagent's environment. */

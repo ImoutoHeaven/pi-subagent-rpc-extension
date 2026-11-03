@@ -15,7 +15,6 @@ const resolvePi = createJiti(join(piDir, "package.json"));
 const jiti = createJiti(import.meta.url, {
 	alias: {
 		"@earendil-works/pi-coding-agent": join(piDir, "dist/bundle/index.js"),
-		"@earendil-works/pi-ai": fileURLToPath(resolvePi.esmResolve("@earendil-works/pi-ai")),
 		typebox: fileURLToPath(resolvePi.esmResolve("typebox")),
 	},
 });
